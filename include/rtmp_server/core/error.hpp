@@ -19,6 +19,8 @@ enum class ErrorCode : std::uint32_t {
     // Generic
     None = 0,
     Unknown,
+    NotFound,
+    Conflict,
 
     // Network
     ConnectionClosed,

@@ -1,0 +1,58 @@
+# Phase 9 "systemd" deliverable (docs/rtmp_promot.md). Hardened per
+# systemd.exec(5)/systemd.resource-control(5); the sandboxing directives
+# below are the standard "server process that only needs network + one
+# data directory" set. NOT VERIFIED ON THIS HOST: the development
+# environment this phase was implemented on (macOS) has no systemd — see
+# docs/phase9-checklist.md "Known limitations" ("systemd deployment works"
+# is consequently unverified here). Install with:
+#   sudo cp deploy/systemd/rtmp-server.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now rtmp-server
+
+[Unit]
+Description=rtmp_server - C++23 io_uring RTMP streaming server
+Documentation=https://github.com/ (see repository docs/deployment.md)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/rtmp_server --config /etc/rtmp_server/server.yaml
+Restart=on-failure
+RestartSec=2s
+
+# Runs as a dedicated, unprivileged system user/group — create with:
+#   sudo useradd --system --no-create-home --shell /usr/sbin/nologin rtmp_server
+User=rtmp_server
+Group=rtmp_server
+
+# Filesystem/process sandboxing: only /var/lib/rtmp_server (recordings +
+# SQLite database) is writable; everything else is read-only or hidden.
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/rtmp_server
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RemoveIPC=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+
+# io_uring needs these capabilities/syscalls beyond the very restrictive
+# systemd default; do not add more than this without re-reviewing why.
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+SystemCallFilter=@system-service io_uring
+SystemCallErrorNumber=EPERM
+
+# Resource limits — tune alongside ServerConfig::maximum_connections
+# (core/config.hpp); this default assumes maximum_connections <= 10000.
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

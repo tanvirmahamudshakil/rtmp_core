@@ -1,0 +1,7 @@
+build/
+build-*/
+.git/
+.cache/
+*.db
+*.db-journal
+recordings/

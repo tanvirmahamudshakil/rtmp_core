@@ -2,8 +2,11 @@ find_package(OpenSSL REQUIRED COMPONENTS Crypto)
 
 add_library(rtmp_server_core STATIC
     random.cpp
+    hmac.cpp
     config.cpp
     ${CMAKE_SOURCE_DIR}/src/observability/logger.cpp
+    ${CMAKE_SOURCE_DIR}/src/observability/audit_log.cpp
+    ${CMAKE_SOURCE_DIR}/src/observability/metrics.cpp
 )
 
 target_include_directories(rtmp_server_core PUBLIC

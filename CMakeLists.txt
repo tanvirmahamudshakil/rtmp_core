@@ -47,6 +47,15 @@ add_subdirectory(src/protocol)
 add_subdirectory(src/media)
 # flv_inspector is a plain file reader (no io_uring), so it builds everywhere.
 add_subdirectory(apps/flv_inspector)
+# load_bench is a synthetic in-process load generator (Phase 9), also pure
+# protocol-layer code — builds everywhere.
+add_subdirectory(apps/load_bench)
+# SQLite-backed persistence (Phase 9): system libsqlite3, no io_uring, builds
+# everywhere.
+add_subdirectory(src/persistence)
+# Management API domain logic (Phase 8): pure logic over StreamRegistry/
+# LiveFanout, no HTTP server/socket dependency, builds everywhere too.
+add_subdirectory(src/management)
 
 if(NOT RTMP_SERVER_CORE_ONLY AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
     add_subdirectory(src/io/io_uring)
@@ -55,8 +64,13 @@ endif()
 
 if(RTMP_SERVER_BUILD_TESTS)
     enable_testing()
+    # Fuzz harnesses (Phase 9): always buildable as corpus-replay tools;
+    # -DRTMP_SERVER_ENABLE_FUZZING=ON additionally links libFuzzer (Clang only).
+    add_subdirectory(fuzz)
     add_subdirectory(tests/unit)
     add_subdirectory(tests/protocol)
     add_subdirectory(tests/media)
     add_subdirectory(tests/recording)
+    add_subdirectory(tests/management)
+    add_subdirectory(tests/persistence)
 endif()
