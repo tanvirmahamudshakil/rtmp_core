@@ -1,0 +1,246 @@
+#include "rtmp_server/core/config.hpp"
+
+#include <cctype>
+#include <cstdlib>
+#include <fstream>
+#include <optional>
+#include <sstream>
+#include <unordered_map>
+
+namespace rtmp_server::core {
+
+namespace {
+
+// Minimal flat "key: value" line parser — intentionally not a general YAML
+// parser. Our config (config/server.example.yaml) is a single flat mapping
+// with no nesting, lists, or anchors, so this covers 100% of it while
+// avoiding a third-party YAML dependency for Phase 1. Comments start with
+// '#'; values may be quoted or bare; duration values keep their unit suffix
+// (e.g. "5s") and are parsed by the caller field-by-field below.
+std::unordered_map<std::string, std::string> parse_flat_mapping(std::istream& in) {
+    std::unordered_map<std::string, std::string> out;
+    std::string line;
+    while (std::getline(in, line)) {
+        auto hash = line.find('#');
+        if (hash != std::string::npos) line.erase(hash);
+
+        auto colon = line.find(':');
+        if (colon == std::string::npos) continue;
+
+        std::string key = line.substr(0, colon);
+        std::string value = line.substr(colon + 1);
+
+        auto trim = [](std::string& s) {
+            const char* ws = " \t\r\n\"";
+            auto first = s.find_first_not_of(ws);
+            if (first == std::string::npos) {
+                s.clear();
+                return;
+            }
+            auto last = s.find_last_not_of(ws);
+            s = s.substr(first, last - first + 1);
+        };
+        trim(key);
+        trim(value);
+        if (key.empty()) continue;
+
+        out.emplace(std::move(key), std::move(value));
+    }
+    return out;
+}
+
+[[nodiscard]] std::optional<std::uint32_t> parse_u32(const std::string& s) {
+    try {
+        return static_cast<std::uint32_t>(std::stoul(s));
+    } catch (...) {
+        return std::nullopt;
+    }
+}
+
+[[nodiscard]] std::optional<std::uint64_t> parse_u64(const std::string& s) {
+    try {
+        return static_cast<std::uint64_t>(std::stoull(s));
+    } catch (...) {
+        return std::nullopt;
+    }
+}
+
+[[nodiscard]] std::optional<bool> parse_bool(const std::string& s) {
+    if (s == "true") return true;
+    if (s == "false") return false;
+    return std::nullopt;
+}
+
+// Parses durations of the form "<number><unit>" where unit is one of
+// ms|s|m|h, matching the style used in config/server.example.yaml.
+[[nodiscard]] std::optional<std::chrono::milliseconds> parse_duration(const std::string& s) {
+    if (s.empty()) return std::nullopt;
+    std::size_t i = 0;
+    while (i < s.size() && (std::isdigit(static_cast<unsigned char>(s[i])) != 0)) ++i;
+    if (i == 0) return std::nullopt;
+
+    std::uint64_t number = 0;
+    try {
+        number = std::stoull(s.substr(0, i));
+    } catch (...) {
+        return std::nullopt;
+    }
+    std::string unit = s.substr(i);
+
+    if (unit == "ms") return std::chrono::milliseconds(number);
+    if (unit == "s") return std::chrono::milliseconds(number * 1000);
+    if (unit == "m") return std::chrono::milliseconds(number * 60'000);
+    if (unit == "h") return std::chrono::milliseconds(number * 3'600'000);
+    return std::nullopt;
+}
+
+void apply_env_overrides(std::unordered_map<std::string, std::string>& values) {
+    // Any key present in the config may be overridden via
+    // RTMP_SERVER_<UPPER_SNAKE_KEY>, e.g. RTMP_SERVER_RTMP_PORT=1936.
+    for (auto& [key, value] : values) {
+        std::string env_name = "RTMP_SERVER_";
+        for (char c : key) env_name.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(c))));
+        if (const char* env_value = std::getenv(env_name.c_str())) {
+            value = env_value;
+        }
+    }
+}
+
+} // namespace
+
+Result<void> ServerConfig::validate() const {
+    if (rtmp_port == 0 || api_port == 0) {
+        return Error(ErrorCode::InvalidConfiguration, ErrorCategory::Configuration,
+                      "rtmp_port and api_port must be non-zero");
+    }
+    if (rtmp_port == api_port && rtmp_bind_address == api_bind_address) {
+        return Error(ErrorCode::InvalidConfiguration, ErrorCategory::Configuration,
+                      "rtmp_port and api_port must differ when bind addresses match");
+    }
+    if (ring_queue_depth == 0 || worker_ring_count == 0) {
+        return Error(ErrorCode::InvalidConfiguration, ErrorCategory::Configuration,
+                      "ring_queue_depth and worker_ring_count must be positive");
+    }
+    if (maximum_connections == 0 || maximum_connections_per_ip == 0) {
+        return Error(ErrorCode::InvalidConfiguration, ErrorCategory::Configuration,
+                      "connection limits must be positive");
+    }
+    if (input_chunk_size == 0 || output_chunk_size == 0) {
+        return Error(ErrorCode::InvalidConfiguration, ErrorCategory::Configuration,
+                      "chunk sizes must be positive");
+    }
+    if (token_signing_secret.empty() || token_signing_secret == "CHANGE_ME") {
+        return Error(ErrorCode::InvalidConfiguration, ErrorCategory::Configuration,
+                      "token_signing_secret must be set to a real secret");
+    }
+    if (api_authentication_secret.empty() || api_authentication_secret == "CHANGE_ME") {
+        return Error(ErrorCode::InvalidConfiguration, ErrorCategory::Configuration,
+                      "api_authentication_secret must be set to a real secret");
+    }
+    return {};
+}
+
+Result<ServerConfig> load_config(const std::string& path) {
+    std::ifstream file(path);
+    if (!file.is_open()) {
+        return Error(ErrorCode::MissingConfiguration, ErrorCategory::Configuration,
+                      "config file not found: " + path);
+    }
+
+    auto values = parse_flat_mapping(file);
+    apply_env_overrides(values);
+
+    ServerConfig cfg;
+    auto str = [&](const char* key, std::string& field) {
+        if (auto it = values.find(key); it != values.end()) field = it->second;
+    };
+    auto u32 = [&](const char* key, std::uint32_t& field) {
+        if (auto it = values.find(key); it != values.end()) {
+            if (auto v = parse_u32(it->second)) field = *v;
+        }
+    };
+    auto u64 = [&](const char* key, std::uint64_t& field) {
+        if (auto it = values.find(key); it != values.end()) {
+            if (auto v = parse_u64(it->second)) field = *v;
+        }
+    };
+    auto boolean = [&](const char* key, bool& field) {
+        if (auto it = values.find(key); it != values.end()) {
+            if (auto v = parse_bool(it->second)) field = *v;
+        }
+    };
+    auto duration = [&](const char* key, std::chrono::milliseconds& field) {
+        if (auto it = values.find(key); it != values.end()) {
+            if (auto v = parse_duration(it->second)) field = *v;
+        }
+    };
+
+    str("rtmp_bind_address", cfg.rtmp_bind_address);
+    str("api_bind_address", cfg.api_bind_address);
+    str("public_rtmp_hostname", cfg.public_rtmp_hostname);
+
+    if (auto it = values.find("rtmp_port"); it != values.end()) {
+        if (auto v = parse_u32(it->second)) cfg.rtmp_port = static_cast<std::uint16_t>(*v);
+    }
+    if (auto it = values.find("api_port"); it != values.end()) {
+        if (auto v = parse_u32(it->second)) cfg.api_port = static_cast<std::uint16_t>(*v);
+    }
+
+    u32("ring_queue_depth", cfg.ring_queue_depth);
+    u32("completion_batch_size", cfg.completion_batch_size);
+    u32("submission_batch_size", cfg.submission_batch_size);
+    u32("worker_ring_count", cfg.worker_ring_count);
+
+    boolean("enable_multishot_accept", cfg.enable_multishot_accept);
+    boolean("enable_multishot_recv", cfg.enable_multishot_recv);
+    boolean("enable_registered_buffers", cfg.enable_registered_buffers);
+    boolean("enable_provided_buffer_ring", cfg.enable_provided_buffer_ring);
+    boolean("enable_send_zero_copy", cfg.enable_send_zero_copy);
+    boolean("enable_sqpoll", cfg.enable_sqpoll);
+    u32("sqpoll_idle_ms", cfg.sqpoll_idle_ms);
+
+    u32("registered_buffer_count", cfg.registered_buffer_count);
+    u32("registered_buffer_size", cfg.registered_buffer_size);
+    u32("provided_buffer_count", cfg.provided_buffer_count);
+    u32("provided_buffer_size", cfg.provided_buffer_size);
+
+    u32("maximum_connections", cfg.maximum_connections);
+    u32("maximum_connections_per_ip", cfg.maximum_connections_per_ip);
+    u32("maximum_publishers", cfg.maximum_publishers);
+    u32("maximum_viewers_per_stream", cfg.maximum_viewers_per_stream);
+
+    u32("input_chunk_size", cfg.input_chunk_size);
+    u32("output_chunk_size", cfg.output_chunk_size);
+    u32("maximum_rtmp_message_size", cfg.maximum_rtmp_message_size);
+
+    duration("handshake_timeout", cfg.handshake_timeout);
+    duration("authentication_timeout", cfg.authentication_timeout);
+    duration("idle_timeout", cfg.idle_timeout);
+    duration("write_timeout", cfg.write_timeout);
+    duration("publisher_inactivity_timeout", cfg.publisher_inactivity_timeout);
+    duration("gop_cache_max_duration", cfg.gop_cache_max_duration);
+
+    u64("gop_cache_max_bytes", cfg.gop_cache_max_bytes);
+    u32("gop_cache_max_packets", cfg.gop_cache_max_packets);
+    u64("subscriber_queue_max_bytes", cfg.subscriber_queue_max_bytes);
+    u32("subscriber_queue_max_packets", cfg.subscriber_queue_max_packets);
+
+    str("recording_directory", cfg.recording_directory);
+    boolean("recording_enabled", cfg.recording_enabled);
+    u64("recording_max_size", cfg.recording_max_size);
+    u64("recording_queue_max_bytes", cfg.recording_queue_max_bytes);
+
+    str("database_type", cfg.database_type);
+    str("database_connection", cfg.database_connection);
+    str("token_signing_secret", cfg.token_signing_secret);
+    str("api_authentication_secret", cfg.api_authentication_secret);
+    str("log_level", cfg.log_level);
+    boolean("metrics_enabled", cfg.metrics_enabled);
+
+    if (auto result = cfg.validate(); !result) {
+        return result.error();
+    }
+    return cfg;
+}
+
+} // namespace rtmp_server::core

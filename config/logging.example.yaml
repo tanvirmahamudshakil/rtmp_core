@@ -1,0 +1,7 @@
+# Example structured logging configuration.
+level: "info"          # trace|debug|info|warn|error
+format: "json"          # json|text
+output: "stdout"        # stdout|file
+file_path: "./logs/rtmp_server.log"
+rotate_max_size_mb: 100
+rotate_max_files: 10

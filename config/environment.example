@@ -1,0 +1,11 @@
+# Example environment file. Copy to .env and fill in real values. Do not commit .env.
+RTMP_BIND_ADDRESS=0.0.0.0
+RTMP_PORT=1935
+API_BIND_ADDRESS=127.0.0.1
+API_PORT=8080
+PUBLIC_RTMP_HOSTNAME=stream.example.com
+DATABASE_TYPE=sqlite
+DATABASE_CONNECTION=./data/rtmp.db
+TOKEN_SIGNING_SECRET=
+API_AUTHENTICATION_SECRET=
+LOG_LEVEL=info
