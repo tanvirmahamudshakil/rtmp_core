@@ -5,9 +5,14 @@
 #include <string>
 #include <unordered_map>
 
+#include <memory>
+
 #include "rtmp_server/protocol/amf0/amf0_value.hpp"
 #include "rtmp_server/protocol/chunk/chunk_types.hpp"
+#include "rtmp_server/protocol/commands/live_fanout.hpp"
+#include "rtmp_server/protocol/commands/recorder_sink.hpp"
 #include "rtmp_server/protocol/commands/stream_registry.hpp"
+#include "rtmp_server/protocol/media/media_ingest.hpp"
 
 namespace rtmp_server::protocol::commands {
 
@@ -69,15 +74,64 @@ public:
     using PublishStopHandler = std::function<void(std::string_view stream_key, std::uint64_t connection_id)>;
 
     CommandSession(std::uint64_t connection_id, StreamRegistry& registry, StreamKeyValidator key_validator);
+    // Out-of-line so PlaybackRelay (only forward-declared here) is a
+    // complete type where playback_relays_'s unique_ptr destructors run.
+    ~CommandSession();
+    CommandSession(CommandSession&&) noexcept;
+    CommandSession& operator=(CommandSession&&) = delete; // StreamRegistry& member is not reassignable
+    CommandSession(const CommandSession&) = delete;
+    CommandSession& operator=(const CommandSession&) = delete;
 
     void set_outgoing_handler(OutgoingHandler handler) { outgoing_handler_ = std::move(handler); }
     void set_publish_start_handler(PublishStartHandler handler) { publish_start_handler_ = std::move(handler); }
     void set_publish_stop_handler(PublishStopHandler handler) { publish_stop_handler_ = std::move(handler); }
 
-    // Feeds one fully-reassembled RTMP message from ChunkDecoder. Messages
-    // other than Amf0Command (type 20) are ignored by this phase (AMF0 Data
-    // / media / protocol-control messages are handled by ChunkDecoder or
-    // later phases) — see docs/rtmp-commands.md "Known limitations".
+    // Injects the Media Ingest component (Phase 5). Optional: if never set,
+    // audio/video/metadata messages on a Publishing stream are simply
+    // dropped, same as before Phase 5 existed. Not owned — lifetime is the
+    // caller's responsibility, matching how `registry_` is a reference, not
+    // a value, member.
+    void set_media_ingest(media::MediaIngest* media_ingest) { media_ingest_ = media_ingest; }
+
+    // Injects the FLV Recorder (Phase 6). Optional and non-owning, exactly
+    // like set_media_ingest: if never set, publishing media is not recorded.
+    // Audio/Video/metadata on a Publishing stream are forwarded here (in
+    // addition to MediaIngest); the recorder is finalized when the publishing
+    // stream is torn down (deleteStream or connection close), including on an
+    // abrupt disconnect. See docs/flv-recording.md.
+    void set_recorder(RecorderSink* recorder) { recorder_ = recorder; }
+
+    // Injects the Live Fanout hub (Phase 7). Optional and non-owning, same
+    // pattern as set_recorder. If never set: `play` still succeeds (status
+    // NetStream.Play.Start is sent) but the viewer receives no media, and
+    // publishing media is never fanned out — matches the "if never set"
+    // no-op convention every other optional collaborator here follows. See
+    // docs/rtmp-playback.md.
+    void set_live_fanout(LiveFanout* live_fanout) { live_fanout_ = live_fanout; }
+
+    // Reports this connection's current outbound byte backlog (e.g. a
+    // TcpConnection's queued-but-unsent bytes). Optional: if never set,
+    // playback backpressure treats the backlog as always empty, i.e. never
+    // drops. Used only to decide whether to drop a playback frame for a slow
+    // viewer (docs/rtmp_promot.md Phase 7 "viewer backpressure"); publishing
+    // and command traffic are unaffected.
+    using PendingBytesProvider = std::function<std::size_t()>;
+    void set_pending_bytes_provider(PendingBytesProvider provider) { pending_bytes_provider_ = std::move(provider); }
+
+    // Byte budget for this connection's playback backlog: a playback frame
+    // is dropped (not written, PlaybackSink::on_* returns false) rather than
+    // queued once pending_bytes_provider_() + frame size would exceed this.
+    // Mirrors recording::RecorderConfig::max_queued_bytes's bounded-queue,
+    // drop-newest policy.
+    void set_max_queued_playback_bytes(std::size_t bytes) { max_queued_playback_bytes_ = bytes; }
+
+    // Feeds one fully-reassembled RTMP message from ChunkDecoder. Amf0Command
+    // (type 20) messages are dispatched to the connect/publish/play command
+    // handlers below. Audio (8), Video (9), and Amf0Data (18, metadata) are
+    // routed to the injected MediaIngest for any stream currently in
+    // NetStreamState::Publishing (Phase 5) — see docs/media-ingest.md. Any
+    // other message type (protocol control, AMF3, ...) is ignored, see
+    // docs/rtmp-commands.md "Known limitations".
     void handle_message(const chunk::RtmpMessage& message);
 
     // To be called by the connection owner on disconnect, so any stream
@@ -93,11 +147,24 @@ public:
     [[nodiscard]] std::uint32_t last_created_stream_id() const noexcept { return last_created_stream_id_; }
 
 private:
+    class PlaybackRelay; // implements PlaybackSink, forwards into this session
+
     struct StreamSlot {
         NetStreamState state = NetStreamState::Idle;
         std::string stream_key; // set once publish()/play() names it
     };
 
+    // Called by PlaybackRelay to actually emit an audio/video/metadata
+    // message to this connection's outgoing_handler_, applying the
+    // backpressure byte-budget check. Returns false (message dropped) if the
+    // budget is exceeded or there is no outgoing_handler_.
+    bool deliver_playback_message(std::uint32_t message_stream_id, const chunk::RtmpMessage& message);
+    // PlaybackRelay callbacks: the subscription in live_fanout_ is already
+    // gone by the time these run (see PlaybackSink contract).
+    void handle_playback_publisher_stopped(std::uint32_t message_stream_id);
+    void handle_playback_evicted(std::uint32_t message_stream_id);
+
+    void route_media_message(const chunk::RtmpMessage& message);
     void dispatch(const Amf0Command& command, std::uint32_t message_stream_id);
     void handle_connect(const Amf0Command& command);
     void handle_release_stream(const Amf0Command& command);
@@ -119,12 +186,18 @@ private:
     OutgoingHandler outgoing_handler_;
     PublishStartHandler publish_start_handler_;
     PublishStopHandler publish_stop_handler_;
+    media::MediaIngest* media_ingest_ = nullptr;
+    RecorderSink* recorder_ = nullptr;
+    LiveFanout* live_fanout_ = nullptr;
+    PendingBytesProvider pending_bytes_provider_;
+    std::size_t max_queued_playback_bytes_ = 4 * 1024 * 1024;
 
     bool connected_ = false;
     std::string app_name_;
     std::uint32_t next_stream_id_ = 1;
     std::uint32_t last_created_stream_id_ = 0;
     std::unordered_map<std::uint32_t, StreamSlot> streams_;
+    std::unordered_map<std::uint32_t, std::unique_ptr<PlaybackRelay>> playback_relays_;
 };
 
 } // namespace rtmp_server::protocol::commands

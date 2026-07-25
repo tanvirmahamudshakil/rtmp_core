@@ -42,6 +42,11 @@ rtmp_server_set_sanitizers(rtmp_server_sanitizers)
 
 add_subdirectory(src/core)
 add_subdirectory(src/protocol)
+# FLV encoding + recording orchestration (Phase 6): pure byte-format/bookkeeping
+# code, builds on every platform including core-only, same as src/protocol.
+add_subdirectory(src/media)
+# flv_inspector is a plain file reader (no io_uring), so it builds everywhere.
+add_subdirectory(apps/flv_inspector)
 
 if(NOT RTMP_SERVER_CORE_ONLY AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
     add_subdirectory(src/io/io_uring)
@@ -52,4 +57,6 @@ if(RTMP_SERVER_BUILD_TESTS)
     enable_testing()
     add_subdirectory(tests/unit)
     add_subdirectory(tests/protocol)
+    add_subdirectory(tests/media)
+    add_subdirectory(tests/recording)
 endif()

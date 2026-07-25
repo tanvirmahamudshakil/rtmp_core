@@ -16,6 +16,13 @@ namespace {
 // server/client. ChunkEncoder itself does not care what csid is used, this
 // is purely a session-layer convention.
 constexpr std::uint32_t kCommandChunkStreamId = 3;
+// Distinct chunk stream IDs for relayed playback media, kept apart from
+// kCommandChunkStreamId so ChunkEncoder's per-csid delta-header state
+// doesn't mix command traffic with audio/video, matching how real
+// encoders/servers keep media on its own chunk streams.
+constexpr std::uint32_t kAudioChunkStreamId = 4;
+constexpr std::uint32_t kVideoChunkStreamId = 5;
+constexpr std::uint32_t kDataChunkStreamId = 6;
 
 std::string string_arg(const Amf0Value& v, std::string fallback = {}) {
     return v.is_string() ? v.as_string() : std::move(fallback);
@@ -27,15 +34,51 @@ CommandSession::CommandSession(std::uint64_t connection_id, StreamRegistry& regi
                                  StreamKeyValidator key_validator)
     : connection_id_(connection_id), registry_(registry), key_validator_(std::move(key_validator)) {}
 
+// Adapts one Playing StreamSlot's subscription to LiveFanout's PlaybackSink
+// interface, forwarding every callback back into the owning CommandSession.
+// One instance per message_stream_id currently playing, owned by
+// playback_relays_; lives exactly as long as the subscription does.
+class CommandSession::PlaybackRelay : public PlaybackSink {
+public:
+    PlaybackRelay(CommandSession& owner, std::uint32_t message_stream_id)
+        : owner_(owner), message_stream_id_(message_stream_id) {}
+
+    bool on_audio(const RtmpMessage& message) override {
+        return owner_.deliver_playback_message(message_stream_id_, message);
+    }
+    bool on_video(const RtmpMessage& message) override {
+        return owner_.deliver_playback_message(message_stream_id_, message);
+    }
+    bool on_metadata(const RtmpMessage& message) override {
+        return owner_.deliver_playback_message(message_stream_id_, message);
+    }
+    void on_publisher_stopped() override { owner_.handle_playback_publisher_stopped(message_stream_id_); }
+    void on_slow_client_evicted() override { owner_.handle_playback_evicted(message_stream_id_); }
+
+private:
+    CommandSession& owner_;
+    std::uint32_t message_stream_id_;
+};
+
+CommandSession::~CommandSession() = default;
+CommandSession::CommandSession(CommandSession&&) noexcept = default;
+
 NetStreamState CommandSession::stream_state(std::uint32_t stream_id) const {
     auto it = streams_.find(stream_id);
     return it == streams_.end() ? NetStreamState::Idle : it->second.state;
 }
 
 void CommandSession::handle_message(const RtmpMessage& message) {
+    if (message.message_type_id == static_cast<std::uint8_t>(MessageTypeId::Audio) ||
+        message.message_type_id == static_cast<std::uint8_t>(MessageTypeId::Video) ||
+        message.message_type_id == static_cast<std::uint8_t>(MessageTypeId::Amf0Data)) {
+        route_media_message(message);
+        return;
+    }
+
     if (message.message_type_id != static_cast<std::uint8_t>(MessageTypeId::Amf0Command)) {
-        // AMF0 Data (18) and everything else is out of scope for command
-        // dispatch in this phase (see class doc "Known limitations").
+        // Everything else (protocol control, AMF3, ...) is out of scope for
+        // command dispatch in this phase (see class doc "Known limitations").
         return;
     }
 
@@ -56,6 +99,81 @@ void CommandSession::handle_message(const RtmpMessage& message) {
     for (std::size_t i = 3; i < values.size(); ++i) command.arguments.push_back(values[i]);
 
     dispatch(command, message.message_stream_id);
+}
+
+bool CommandSession::deliver_playback_message(std::uint32_t message_stream_id, const RtmpMessage& message) {
+    if (!outgoing_handler_) return false;
+
+    std::size_t pending = pending_bytes_provider_ ? pending_bytes_provider_() : 0;
+    if (pending + message.payload.size() > max_queued_playback_bytes_) return false;
+
+    RtmpMessage out = message;
+    out.message_stream_id = message_stream_id;
+    switch (static_cast<MessageTypeId>(message.message_type_id)) {
+        case MessageTypeId::Audio:
+            out.chunk_stream_id = kAudioChunkStreamId;
+            break;
+        case MessageTypeId::Video:
+            out.chunk_stream_id = kVideoChunkStreamId;
+            break;
+        default:
+            out.chunk_stream_id = kDataChunkStreamId;
+            break;
+    }
+    outgoing_handler_(std::move(out));
+    return true;
+}
+
+void CommandSession::handle_playback_publisher_stopped(std::uint32_t message_stream_id) {
+    auto it = streams_.find(message_stream_id);
+    if (it != streams_.end()) {
+        it->second.state = NetStreamState::Idle;
+        send_status(message_stream_id, "status", "NetStream.Play.UnpublishNotify", "Stream unpublished.");
+    }
+    playback_relays_.erase(message_stream_id);
+}
+
+void CommandSession::handle_playback_evicted(std::uint32_t message_stream_id) {
+    auto it = streams_.find(message_stream_id);
+    if (it != streams_.end()) {
+        it->second.state = NetStreamState::Idle;
+        send_status(message_stream_id, "error", "NetStream.Play.InsufficientBW", "Viewer fell too far behind.");
+    }
+    playback_relays_.erase(message_stream_id);
+}
+
+void CommandSession::route_media_message(const RtmpMessage& message) {
+    if (media_ingest_ == nullptr && recorder_ == nullptr && live_fanout_ == nullptr) return;
+
+    auto it = streams_.find(message.message_stream_id);
+    if (it == streams_.end() || it->second.state != NetStreamState::Publishing || it->second.stream_key.empty()) {
+        // Media arriving before publish() completed, or on a non-publishing
+        // stream ID, is not this component's concern (Phase 4 already
+        // rejects/ignores commands on such streams); silently drop, same
+        // policy as the pre-Phase-5 default of dropping type 8/9/18.
+        return;
+    }
+
+    const std::string& stream_key = it->second.stream_key;
+    switch (static_cast<MessageTypeId>(message.message_type_id)) {
+        case MessageTypeId::Audio:
+            if (media_ingest_ != nullptr) media_ingest_->on_audio_message(stream_key, message);
+            if (recorder_ != nullptr) recorder_->on_audio(message);
+            if (live_fanout_ != nullptr) live_fanout_->on_audio(stream_key, message);
+            break;
+        case MessageTypeId::Video:
+            if (media_ingest_ != nullptr) media_ingest_->on_video_message(stream_key, message);
+            if (recorder_ != nullptr) recorder_->on_video(message);
+            if (live_fanout_ != nullptr) live_fanout_->on_video(stream_key, message);
+            break;
+        case MessageTypeId::Amf0Data:
+            if (media_ingest_ != nullptr) media_ingest_->on_metadata_message(stream_key, message);
+            if (recorder_ != nullptr) recorder_->on_metadata(message);
+            if (live_fanout_ != nullptr) live_fanout_->on_metadata(stream_key, message);
+            break;
+        default:
+            break;
+    }
 }
 
 void CommandSession::dispatch(const Amf0Command& command, std::uint32_t message_stream_id) {
@@ -162,6 +280,16 @@ void CommandSession::handle_play(const Amf0Command& command, std::uint32_t messa
     slot.stream_key = stream_key;
 
     send_status(message_stream_id, "status", "NetStream.Play.Start", "Started playing " + stream_key + ".");
+
+    if (live_fanout_ != nullptr && !stream_key.empty()) {
+        auto relay = std::make_unique<PlaybackRelay>(*this, message_stream_id);
+        // Address of the relay is unique for as long as it lives (one per
+        // subscription), so it doubles as a globally-unique subscriber ID
+        // without needing a separate ID allocator shared across sessions.
+        auto subscriber_id = reinterpret_cast<std::uint64_t>(relay.get());
+        playback_relays_[message_stream_id] = std::move(relay);
+        live_fanout_->subscribe(stream_key, subscriber_id, playback_relays_[message_stream_id].get());
+    }
 }
 
 void CommandSession::handle_delete_stream(const Amf0Command& command) {
@@ -173,7 +301,15 @@ void CommandSession::handle_delete_stream(const Amf0Command& command) {
 
     if (it->second.state == NetStreamState::Publishing && !it->second.stream_key.empty()) {
         registry_.unregister_publisher(it->second.stream_key, connection_id_);
+        if (recorder_ != nullptr) recorder_->finalize();
+        if (live_fanout_ != nullptr) live_fanout_->publisher_stopped(it->second.stream_key);
         if (publish_stop_handler_) publish_stop_handler_(it->second.stream_key, connection_id_);
+    } else if (it->second.state == NetStreamState::Playing && !it->second.stream_key.empty()) {
+        auto relay_it = playback_relays_.find(stream_id);
+        if (live_fanout_ != nullptr && relay_it != playback_relays_.end()) {
+            live_fanout_->unsubscribe(it->second.stream_key, reinterpret_cast<std::uint64_t>(relay_it->second.get()));
+        }
+        playback_relays_.erase(stream_id);
     }
     streams_.erase(it);
 }
@@ -182,10 +318,18 @@ void CommandSession::on_connection_closed() {
     for (auto& [stream_id, slot] : streams_) {
         if (slot.state == NetStreamState::Publishing && !slot.stream_key.empty()) {
             registry_.unregister_publisher(slot.stream_key, connection_id_);
+            if (recorder_ != nullptr) recorder_->finalize();
+            if (live_fanout_ != nullptr) live_fanout_->publisher_stopped(slot.stream_key);
             if (publish_stop_handler_) publish_stop_handler_(slot.stream_key, connection_id_);
+        } else if (slot.state == NetStreamState::Playing && !slot.stream_key.empty()) {
+            auto relay_it = playback_relays_.find(stream_id);
+            if (live_fanout_ != nullptr && relay_it != playback_relays_.end()) {
+                live_fanout_->unsubscribe(slot.stream_key, reinterpret_cast<std::uint64_t>(relay_it->second.get()));
+            }
         }
     }
     streams_.clear();
+    playback_relays_.clear();
     registry_.unregister_all_for_connection(connection_id_); // belt-and-suspenders
 }
 

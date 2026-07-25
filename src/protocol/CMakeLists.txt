@@ -10,6 +10,8 @@ add_library(rtmp_server_protocol STATIC
     amf0/amf0_encoder.cpp
     amf0/amf0_decoder.cpp
     commands/command_session.cpp
+    commands/live_fanout.cpp
+    media/media_ingest.cpp
 )
 
 target_include_directories(rtmp_server_protocol PUBLIC

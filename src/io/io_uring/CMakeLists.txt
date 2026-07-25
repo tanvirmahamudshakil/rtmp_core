@@ -9,6 +9,7 @@ add_library(rtmp_server_io_uring STATIC
     capabilities.cpp
     context.cpp
     event_loop.cpp
+    file_sink.cpp
     ${CMAKE_SOURCE_DIR}/src/network/tcp_connection.cpp
 )
 

@@ -10,6 +10,7 @@ add_executable(rtmp_server_protocol_tests
     chunk/chunk_encoder_test.cpp
     amf0/amf0_codec_test.cpp
     commands/command_session_test.cpp
+    media/media_ingest_test.cpp
 )
 
 target_link_libraries(rtmp_server_protocol_tests PRIVATE
