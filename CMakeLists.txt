@@ -56,6 +56,15 @@ add_subdirectory(src/persistence)
 # Management API domain logic (Phase 8): pure logic over StreamRegistry/
 # LiveFanout, no HTTP server/socket dependency, builds everywhere too.
 add_subdirectory(src/management)
+# Phase 5 authentication glue (StreamManager -> CommandSession hooks +
+# per-IP/per-stream resource bounds): same "builds everywhere" posture as
+# src/management, no HTTP server/socket dependency.
+add_subdirectory(src/authentication)
+# Phase 5 management HTTP API: hand-rolled bounded HTTP/1.1 server over
+# plain POSIX sockets (see docs/management-api.md for why no vendored
+# library was used) plus JSON (de)serialization for the endpoint set.
+# Builds everywhere — POSIX sockets, not io_uring.
+add_subdirectory(src/control)
 
 if(NOT RTMP_SERVER_CORE_ONLY AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
     add_subdirectory(src/io/io_uring)
@@ -73,4 +82,6 @@ if(RTMP_SERVER_BUILD_TESTS)
     add_subdirectory(tests/recording)
     add_subdirectory(tests/management)
     add_subdirectory(tests/persistence)
+    add_subdirectory(tests/authentication)
+    add_subdirectory(tests/control)
 endif()
