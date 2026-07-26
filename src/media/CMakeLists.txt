@@ -4,9 +4,19 @@
 # RTMP_SERVER_CORE_ONLY — same as rtmp_server_protocol. The io_uring-backed
 # FileSink implementation is the only piece that needs Linux; it lives in the
 # io_uring target (src/io/io_uring) behind the Linux gate, not here.
+# Phase 6 adds: the codec helpers HLS passthrough needs (h264 AVCC->Annex B,
+# aac ADTS framing), the MPEG-TS muxer, the portable async recording sink
+# (dedicated writer thread + bounded queue — POSIX only, no io_uring) and
+# recording retention. All are platform-independent, so recording and HLS
+# packaging are fully available under RTMP_SERVER_CORE_ONLY.
 add_library(rtmp_server_media STATIC
     flv/flv_writer.cpp
+    h264/avc.cpp
+    aac/adts.cpp
+    ts/ts_muxer.cpp
     ${CMAKE_SOURCE_DIR}/src/recording/recorder.cpp
+    ${CMAKE_SOURCE_DIR}/src/recording/async_file_sink.cpp
+    ${CMAKE_SOURCE_DIR}/src/recording/retention.cpp
 )
 
 target_include_directories(rtmp_server_media PUBLIC

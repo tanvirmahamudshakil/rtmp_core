@@ -4,9 +4,14 @@
 # io_uring, so this builds on every platform including RTMP_SERVER_CORE_ONLY
 # (macOS dev/test builds), the same posture as src/persistence's SQLite
 # usage.
+#
+# Phase 6 adds hls_http_handler.cpp: HLS playlist/segment delivery served by
+# this same bounded HttpServer (chained in front of the management handler),
+# deliberately not a second HTTP stack.
 add_library(rtmp_server_control STATIC
     http_server.cpp
     management_api.cpp
+    hls_http_handler.cpp
 )
 
 target_include_directories(rtmp_server_control PUBLIC
@@ -19,6 +24,7 @@ target_link_libraries(rtmp_server_control
         rtmp_server_protocol
         rtmp_server_management
         rtmp_server_persistence
+        rtmp_server_hls
         rtmp_server_warnings
         rtmp_server_sanitizers
 )
