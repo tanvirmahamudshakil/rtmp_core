@@ -62,6 +62,18 @@ public:
         return !write_queue_.empty();
     }
 
+    // Total bytes currently queued but not yet confirmed sent — used by the
+    // RTMP session layer (CommandSession::set_pending_bytes_provider) to
+    // decide whether a slow playback viewer's next frame should be dropped
+    // rather than grown into an unbounded backlog (Phase 1 wiring; the
+    // queue itself becoming byte/packet bounded is a Phase 2/3 concern).
+    [[nodiscard]] std::size_t pending_write_bytes() const noexcept {
+        std::lock_guard<std::mutex> lock(write_mutex_);
+        std::size_t total = 0;
+        for (const auto& buffer : write_queue_) total += buffer.size();
+        return total;
+    }
+
     // Pops the next queued buffer for submission, or an empty SharedBuffer
     // if the queue is empty. The event loop drives one send at a time per
     // connection to preserve RTMP message/chunk order.

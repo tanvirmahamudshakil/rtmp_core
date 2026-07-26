@@ -14,7 +14,10 @@
 #include "rtmp_server/io/io_uring/context.hpp"
 #include "rtmp_server/io/io_uring/operation_registry.hpp"
 #include "rtmp_server/network/tcp_connection.hpp"
+#include "rtmp_server/protocol/commands/live_fanout.hpp"
+#include "rtmp_server/protocol/commands/stream_registry.hpp"
 #include "rtmp_server/protocol/handshake/handshake_session.hpp"
+#include "rtmp_server/protocol/session/rtmp_connection_session.hpp"
 #include "rtmp_server/server/connection/connection_registry.hpp"
 
 namespace rtmp_server::io::io_uring {
@@ -87,6 +90,17 @@ private:
     // connection.
     void cleanup_handshake_state(std::uint64_t connection_id);
 
+    // Post-handshake wiring point (Phase 1, docs/v2_promot.md "PHASE 1"):
+    // constructs the RtmpConnectionSession for a connection whose handshake
+    // just completed, hands it any bytes the handshake buffered alongside
+    // C2 (HandshakeSession::take_trailing_bytes — production-gap-analysis
+    // item #3), and replaces the connection's receive handler so every
+    // subsequent byte reaches the chunk/command pipeline instead of being
+    // silently dropped (production-gap-analysis items #1/#2).
+    void start_rtmp_session(const std::shared_ptr<network::TcpConnection>& connection,
+                             std::vector<std::byte> trailing_bytes);
+    void cleanup_rtmp_session_state(std::uint64_t connection_id);
+
     // Submits IORING_OP_ASYNC_CANCEL targeting `target_operation_id`. Fire
     // and forget: the cancellation's own completion (a Cancel-type op) is
     // processed and discarded; the *target* operation's own completion
@@ -113,6 +127,16 @@ private:
         handshake_sessions_;
     std::unordered_map<std::uint64_t, std::uint64_t> handshake_timeout_operation_ids_;
     server::ConnectionRegistry connections_;
+
+    // Process-wide RTMP stream state (Phase 1): one registry/fanout shared
+    // by every connection's RtmpConnectionSession, mirroring how
+    // ConnectionRegistry is the single shared table of TcpConnections.
+    // Fan-out sharding across workers is a Phase 4 concern, not Phase 1's.
+    protocol::commands::StreamRegistry stream_registry_;
+    protocol::commands::LiveFanout live_fanout_;
+    std::mutex rtmp_sessions_mutex_;
+    std::unordered_map<std::uint64_t, std::unique_ptr<protocol::session::RtmpConnectionSession>>
+        rtmp_sessions_;
     std::atomic<bool> stopping_{false};
     bool shutdown_initiated_ = false;
     std::chrono::steady_clock::time_point shutdown_deadline_{};

@@ -74,6 +74,18 @@ public:
                state_ == HandshakeState::TimedOut;
     }
 
+    // Bytes that arrived after C2 completed in the same on_bytes_received()
+    // call (e.g. the client's `connect` command pipelined onto the same TCP
+    // write as C2 — real clients, including OBS, routinely do this). Only
+    // meaningful once state() == Completed; empty otherwise. The caller
+    // (session-owner layer, e.g. IoUringEventLoop::start_handshake) must
+    // read this immediately inside/after the complete handler and feed it
+    // into ChunkDecoder before installing the post-handshake receive
+    // handler — otherwise these bytes would be silently lost, since
+    // HandshakeSession itself no-ops on further on_bytes_received() calls
+    // once terminal (docs/production-gap-analysis.md item #3).
+    [[nodiscard]] std::vector<std::byte> take_trailing_bytes() noexcept { return std::move(buffer_); }
+
 private:
     void fail(core::ErrorCode code, core::ErrorCategory category, std::string_view message);
     void try_consume_c0();

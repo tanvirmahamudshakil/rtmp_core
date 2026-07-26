@@ -266,6 +266,7 @@ void IoUringEventLoop::close_connection(const std::shared_ptr<TcpConnection>& co
     connection->set_state(ConnectionState::Closing);
     cancel_all_operations_for_connection(connection->connection_id());
     cleanup_handshake_state(connection->connection_id());
+    cleanup_rtmp_session_state(connection->connection_id());
 
     connection->set_state(ConnectionState::Closed);
     connections_.remove(connection->connection_id());
@@ -361,16 +362,27 @@ void IoUringEventLoop::start_handshake(const std::shared_ptr<TcpConnection>& con
         if (auto conn = weak_connection.lock()) conn->async_write(std::move(buffer));
     });
 
-    session->set_complete_handler([this, weak_connection]() {
+    session->set_complete_handler([this, weak_connection, session]() {
         auto conn = weak_connection.lock();
         if (!conn) return;
         RTMP_LOG(LogLevel::Info, "event_loop", "handshake_completed",
                  {{"connection_id", std::to_string(conn->connection_id())}});
         conn->set_state(ConnectionState::Connected);
+
+        // Bytes the peer sent alongside C2 in the same TCP read (e.g. OBS
+        // pipelining `connect` right after the handshake) live in the
+        // HandshakeSession's buffer until we take them here — must happen
+        // before cleanup_handshake_state() drops the session
+        // (production-gap-analysis item #3).
+        std::vector<std::byte> trailing = session->take_trailing_bytes();
+
         cleanup_handshake_state(conn->connection_id());
-        // Post-handshake, the connection reverts to the ordinary idle
-        // timeout; the RTMP chunk engine (Phase 3) will replace the
-        // receive_handler installed above with real message parsing.
+        // Wires ChunkDecoder/ChunkEncoder/CommandSession to this
+        // connection's socket I/O and installs the post-handshake receive
+        // handler (Phase 1 tasks 1-8) — replaces the handshake's receive
+        // handler so bytes actually reach the RTMP protocol layer instead
+        // of being silently discarded (production-gap-analysis items #1/#2).
+        start_rtmp_session(conn, std::move(trailing));
         arm_idle_timeout(conn);
     });
 
@@ -430,6 +442,79 @@ void IoUringEventLoop::arm_handshake_timeout(const std::shared_ptr<TcpConnection
         std::lock_guard<std::mutex> lock(timeout_specs_mutex_);
         timeout_specs_.emplace(id, std::move(ts));
     }
+}
+
+void IoUringEventLoop::start_rtmp_session(const std::shared_ptr<TcpConnection>& connection,
+                                           std::vector<std::byte> trailing_bytes) {
+    protocol::session::RtmpConnectionSession::Dependencies deps;
+    deps.registry = &stream_registry_;
+    deps.live_fanout = &live_fanout_;
+
+    auto session = std::make_unique<protocol::session::RtmpConnectionSession>(
+        connection->connection_id(), deps, config_.maximum_rtmp_message_size, config_.output_chunk_size);
+
+    std::weak_ptr<TcpConnection> weak_connection = connection;
+    auto connection_id = connection->connection_id();
+
+    // Encoded outgoing RTMP bytes (command responses, control messages,
+    // playback media) reach the socket through TcpConnection::async_write,
+    // which itself queues and honours partial-send semantics (Phase 1 task
+    // 7 / Phase 2 concern for partial-send correctness itself).
+    session->set_outgoing_handler([weak_connection](std::vector<std::byte> bytes) {
+        if (auto conn = weak_connection.lock()) {
+            conn->async_write(core::SharedBuffer::adopt(std::move(bytes)));
+        }
+    });
+
+    // A malformed chunk stream / decode failure closes the connection
+    // deterministically (Phase 1 task 11) rather than leaving it half-open.
+    session->set_close_handler([this, weak_connection]() {
+        if (auto conn = weak_connection.lock()) close_connection(conn);
+    });
+
+    // Playback backpressure (CommandSession::set_pending_bytes_provider)
+    // reads this connection's actual queued-but-unsent byte count so a slow
+    // viewer's queue growth is visible to the drop decision.
+    session->set_pending_bytes_provider([weak_connection]() -> std::size_t {
+        auto conn = weak_connection.lock();
+        return conn ? conn->pending_write_bytes() : 0;
+    });
+
+    protocol::session::RtmpConnectionSession* raw_session = session.get();
+    // Must run after every handler above is wired (start() may emit a Set
+    // Chunk Size control message immediately) and before the receive
+    // handler swap below, so nothing the peer sends can race ahead of it.
+    raw_session->start();
+    connection->set_receive_handler([raw_session](std::span<const std::byte> data) {
+        raw_session->on_bytes_received(data);
+    });
+
+    {
+        std::lock_guard<std::mutex> lock(rtmp_sessions_mutex_);
+        rtmp_sessions_[connection_id] = std::move(session);
+    }
+
+    // Feed the C2-adjacent bytes (if any) through the exact same code path
+    // as any other received bytes, now that the pipeline is fully wired.
+    if (!trailing_bytes.empty()) {
+        raw_session->on_bytes_received(trailing_bytes);
+    }
+}
+
+void IoUringEventLoop::cleanup_rtmp_session_state(std::uint64_t connection_id) {
+    std::unique_ptr<protocol::session::RtmpConnectionSession> session;
+    {
+        std::lock_guard<std::mutex> lock(rtmp_sessions_mutex_);
+        auto it = rtmp_sessions_.find(connection_id);
+        if (it != rtmp_sessions_.end()) {
+            session = std::move(it->second);
+            rtmp_sessions_.erase(it);
+        }
+    }
+    // Deterministic teardown (Phase 1 task 12): drops any publisher/viewer
+    // registration this connection held before the session object itself is
+    // destroyed, regardless of what state the connection was in.
+    if (session) session->on_connection_closed();
 }
 
 void IoUringEventLoop::cleanup_handshake_state(std::uint64_t connection_id) {

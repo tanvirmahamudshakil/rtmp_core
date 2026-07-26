@@ -12,6 +12,7 @@ add_library(rtmp_server_protocol STATIC
     commands/command_session.cpp
     commands/live_fanout.cpp
     media/media_ingest.cpp
+    session/rtmp_connection_session.cpp
 )
 
 target_include_directories(rtmp_server_protocol PUBLIC
