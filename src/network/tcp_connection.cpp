@@ -40,6 +40,7 @@ core::SharedBuffer TcpConnection::next_write_buffer() {
 void TcpConnection::pop_write_buffer() {
     std::lock_guard<std::mutex> lock(write_mutex_);
     if (!write_queue_.empty()) write_queue_.pop_front();
+    front_offset_ = 0;
 }
 
 void TcpConnection::close() {
@@ -54,10 +55,25 @@ void TcpConnection::on_receive_completion(std::span<const std::byte> data) {
 }
 
 void TcpConnection::on_send_completion(std::size_t bytes_sent, bool success) {
-    (void)bytes_sent;
     std::lock_guard<std::mutex> lock(write_mutex_);
-    if (success) {
-        if (!write_queue_.empty()) write_queue_.pop_front();
+    if (success && !write_queue_.empty()) {
+        // A send completion reports the bytes the kernel actually accepted,
+        // which may be fewer than requested. Advance into the front buffer
+        // and only pop it once every byte has been transmitted; popping on
+        // any success (the pre-Phase-7 behaviour) silently dropped the
+        // remainder and desynchronised the peer's chunk decoder.
+        front_offset_ += bytes_sent;
+        const std::size_t front_size = write_queue_.front().size();
+        if (front_offset_ >= front_size) {
+            write_queue_.pop_front();
+            front_offset_ = 0;
+        } else {
+            partial_send_count_.fetch_add(1, std::memory_order_relaxed);
+        }
+    } else if (!success) {
+        // Failed send: the connection is being torn down by the event loop;
+        // leave the queue intact for close() to discard.
+        front_offset_ = 0;
     }
     send_in_flight_ = !write_queue_.empty();
     if (send_in_flight_) {

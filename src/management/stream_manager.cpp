@@ -45,7 +45,12 @@ void StreamManager::audit_locked(std::string_view action, std::string_view appli
 
 void StreamManager::count_locked(std::string_view action) {
     if (metrics_ == nullptr) return;
-    metrics_->increment_counter("management." + std::string(action) + "_total");
+    // Underscore, not dot: a '.' is not a legal character in a Prometheus
+    // metric name, so the pre-Phase-7 "management.<action>_total" names were
+    // rejected by any scraper reading this process's /metrics endpoint (which
+    // advertises text/plain; version=0.0.4). Metrics::is_valid_dynamic_name
+    // now enforces this mechanically.
+    metrics_->increment_counter("management_" + std::string(action) + "_total");
 }
 
 core::Result<void> StreamManager::load_from_store() {

@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "rtmp_server/core/clock.hpp"
+#include "rtmp_server/observability/metrics.hpp"
 
 namespace rtmp_server::protocol::commands {
 
@@ -53,7 +54,12 @@ public:
         reg.connection_id = connection_id;
         reg.stream_id = stream_id;
         reg.start_time = start_time;
+        const bool is_new = it == streams_.end();
         streams_[std::move(stream_key)] = std::move(reg);
+        // active_publishers counts distinct published keys, so a republish by
+        // the same connection (which refreshes an existing entry) must not
+        // double-count.
+        if (is_new) publish_metric(+1);
         return true;
     }
 
@@ -65,6 +71,7 @@ public:
         auto it = streams_.find(std::string(stream_key));
         if (it != streams_.end() && it->second.connection_id == connection_id) {
             streams_.erase(it);
+            publish_metric(-1);
         }
     }
 
@@ -73,8 +80,12 @@ public:
     void unregister_all_for_connection(std::uint64_t connection_id) {
         std::lock_guard<std::mutex> lock(mutex_);
         for (auto it = streams_.begin(); it != streams_.end();) {
-            if (it->second.connection_id == connection_id) it = streams_.erase(it);
-            else ++it;
+            if (it->second.connection_id == connection_id) {
+                it = streams_.erase(it);
+                publish_metric(-1);
+            } else {
+                ++it;
+            }
         }
     }
 
@@ -103,9 +114,24 @@ public:
         return out;
     }
 
+    // Phase 7 observability: feeds active_publishers and publisher_disconnects.
+    // Non-owning and optional; must outlive this registry. No per-stream
+    // label is ever recorded — stream keys are publish secrets and their
+    // count is unbounded (docs/observability.md "Cardinality policy").
+    void set_metrics(observability::Metrics* metrics) noexcept { metrics_ = metrics; }
+
 private:
+    // Called with the per-stream mutex held: a plain atomic add, no callback
+    // and no reentrancy, so this cannot deadlock.
+    void publish_metric(int delta) {
+        if (metrics_ == nullptr) return;
+        metrics_->add(observability::MetricId::ActivePublishers, delta);
+        if (delta < 0) metrics_->increment(observability::MetricId::PublisherDisconnects);
+    }
+
     mutable std::mutex mutex_;
     std::unordered_map<std::string, StreamRegistration> streams_;
+    observability::Metrics* metrics_ = nullptr;
 };
 
 } // namespace rtmp_server::protocol::commands

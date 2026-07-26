@@ -11,6 +11,7 @@
 #include "rtmp_server/core/clock.hpp"
 #include "rtmp_server/management/authorization_cache.hpp"
 #include "rtmp_server/management/stream_manager.hpp"
+#include "rtmp_server/observability/metrics.hpp"
 #include "rtmp_server/protocol/commands/command_session.hpp"
 
 namespace rtmp_server::authentication {
@@ -81,6 +82,14 @@ public:
 
     [[nodiscard]] std::size_t auth_failure_count(std::string_view client_ip) const;
 
+    // Phase 7 observability. Non-owning, optional; when set, every rejected
+    // publish/play credential bumps authentication_failures, and admitted/
+    // released connections move the active_connections gauge. Deliberately
+    // records NO per-IP label — client IP is attacker-controlled and would be
+    // unbounded cardinality (docs/observability.md "Cardinality policy").
+    // The per-IP failure counts remain in-process only, for lockout.
+    void set_metrics(observability::Metrics* metrics) noexcept { metrics_ = metrics; }
+
 private:
     struct FailureWindow {
         std::size_t count = 0;
@@ -98,6 +107,7 @@ private:
     std::unordered_map<std::string, FailureWindow> auth_failures_per_ip_;
     // Keyed by "application/name".
     std::unordered_map<std::string, std::size_t> viewers_per_stream_;
+    observability::Metrics* metrics_ = nullptr; // not owned, may be null
 };
 
 } // namespace rtmp_server::authentication

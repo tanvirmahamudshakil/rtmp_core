@@ -99,9 +99,15 @@ TEST(StreamManagerPersistenceTest, MutationsIncrementMatchingMetricsCounters) {
     ASSERT_TRUE(manager.create_stream("live", "a").ok());
     ASSERT_TRUE(manager.create_stream("live", "b").ok());
 
-    EXPECT_EQ(metrics.counter("management.create_application_total"), 1u);
-    EXPECT_EQ(metrics.counter("management.create_stream_total"), 2u);
-    EXPECT_EQ(metrics.counter("management.rotate_key_total"), 0u);
+    EXPECT_EQ(metrics.counter("management_create_application_total"), 1u);
+    EXPECT_EQ(metrics.counter("management_create_stream_total"), 2u);
+    EXPECT_EQ(metrics.counter("management_rotate_key_total"), 0u);
+
+    // Phase 7: the old "management.<action>_total" spelling used a '.', which
+    // is not a legal Prometheus metric name character. The registry now
+    // rejects such names outright rather than exporting an unscrapeable
+    // series, so the old spelling must read back as absent.
+    EXPECT_EQ(metrics.counter("management.create_stream_total"), 0u);
 }
 
 } // namespace

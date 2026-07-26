@@ -15,6 +15,7 @@
 #include "rtmp_server/io/io_uring/cross_worker_router.hpp"
 #include "rtmp_server/io/io_uring/operation_registry.hpp"
 #include "rtmp_server/network/tcp_connection.hpp"
+#include "rtmp_server/observability/metrics.hpp"
 #include "rtmp_server/protocol/commands/live_fanout.hpp"
 #include "rtmp_server/protocol/commands/stream_ids.hpp"
 #include "rtmp_server/protocol/commands/stream_registry.hpp"
@@ -61,6 +62,14 @@ public:
     // thread on its next completion-processing iteration.
     void stop() noexcept { stopping_.store(true); }
     [[nodiscard]] bool is_stopping() const noexcept { return stopping_.load(); }
+
+    // Phase 7: installs the shared metrics registry for this worker. Must be
+    // called before run(); the registry must outlive the loop. Also forwards
+    // it to this worker's LiveFanout so fan-out counters are recorded.
+    void set_metrics(observability::Metrics* metrics) noexcept {
+        metrics_ = metrics;
+        live_fanout_.set_metrics(metrics);
+    }
 
     [[nodiscard]] server::ConnectionRegistry& connections() noexcept { return connections_; }
     [[nodiscard]] const IoUringCapabilities& capabilities() const noexcept { return context_.capabilities(); }
@@ -170,6 +179,16 @@ private:
     // ingesting a given stream are reached via router_ instead (see class
     // doc comment).
     protocol::commands::LiveFanout live_fanout_;
+
+    // Phase 7 observability (docs/v2_promot.md PHASE 7 "Metrics"). Non-owning
+    // and optional; when set, this worker feeds the transport-level metrics
+    // that only the io_uring layer can observe — io_uring_sq_full,
+    // io_uring_cq_overflow, provided_buffer_exhaustion, partial_send_count,
+    // connection_timeouts and connections_per_worker — plus forwards the
+    // registry to live_fanout_ so fan-out metrics are attributed too.
+    // set_metrics() must be called before run(); it is not safe to change
+    // once the worker thread is running.
+    observability::Metrics* metrics_ = nullptr;
     CrossWorkerRouter::WorkerId worker_id_;
     CrossWorkerRouter* router_;
     bool enable_reuseport_;

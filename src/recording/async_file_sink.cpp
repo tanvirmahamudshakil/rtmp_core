@@ -91,6 +91,7 @@ core::Result<void> AsyncFileSink::append(std::span<const std::byte> data) {
             // a write failure so the Recorder can treat it as backpressure
             // (drop this frame, keep recording) rather than abort.
             stats_.overflow_events += 1;
+            if (metrics_ != nullptr) metrics_->increment(observability::MetricId::RecordingFailures);
             return core::Error(core::ErrorCode::ResourceExhausted, core::ErrorCategory::Storage,
                                "recording queue full");
         }
@@ -102,6 +103,12 @@ core::Result<void> AsyncFileSink::append(std::span<const std::byte> data) {
         const std::size_t now = queued + data.size();
         queued_bytes_.store(now, std::memory_order_release);
         if (now > stats_.queue_high_water) stats_.queue_high_water = now;
+        // recording_queue_depth is a live gauge of queued-but-unwritten
+        // bytes: one relaxed atomic store, no allocation, so it is safe to
+        // publish from the producer (RTMP) thread.
+        if (metrics_ != nullptr) {
+            metrics_->set(observability::MetricId::RecordingQueueDepth, static_cast<std::int64_t>(now));
+        }
     }
     writer_cv_.notify_one();
     return {};
@@ -118,6 +125,7 @@ core::Result<void> AsyncFileSink::patch(std::uint64_t offset, std::span<const st
         const std::size_t queued = queued_bytes_.load(std::memory_order_relaxed);
         if (queued + data.size() > options_.max_queue_bytes) {
             stats_.overflow_events += 1;
+            if (metrics_ != nullptr) metrics_->increment(observability::MetricId::RecordingFailures);
             return core::Error(core::ErrorCode::ResourceExhausted, core::ErrorCategory::Storage,
                                "recording queue full (patch)");
         }
@@ -127,6 +135,10 @@ core::Result<void> AsyncFileSink::patch(std::uint64_t offset, std::span<const st
         op.data.assign(data.begin(), data.end());
         queue_.push_back(std::move(op));
         queued_bytes_.store(queued + data.size(), std::memory_order_release);
+        if (metrics_ != nullptr) {
+            metrics_->set(observability::MetricId::RecordingQueueDepth,
+                          static_cast<std::int64_t>(queued + data.size()));
+        }
     }
     writer_cv_.notify_one();
     return {};
@@ -169,6 +181,7 @@ void AsyncFileSink::mark_failed(core::Error error) {
         failure_ = error;
     }
     healthy_.store(false, std::memory_order_release);
+    if (metrics_ != nullptr) metrics_->increment(observability::MetricId::RecordingFailures);
     RTMP_LOG(LogLevel::Error, "recording", "sink_failed",
              {LogField{"path", temp_path_}, LogField{"error", error.message()}});
 }
@@ -291,7 +304,11 @@ void AsyncFileSink::writer_loop() {
             op = std::move(queue_.front());
             queue_.pop_front();
             const std::size_t queued = queued_bytes_.load(std::memory_order_relaxed);
-            queued_bytes_.store(queued - op.data.size(), std::memory_order_release);
+            const std::size_t remaining = queued - op.data.size();
+            queued_bytes_.store(remaining, std::memory_order_release);
+            if (metrics_ != nullptr) {
+                metrics_->set(observability::MetricId::RecordingQueueDepth, static_cast<std::int64_t>(remaining));
+            }
         }
 
         if (!healthy_.load(std::memory_order_acquire)) {

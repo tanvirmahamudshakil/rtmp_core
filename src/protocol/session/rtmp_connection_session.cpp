@@ -180,6 +180,12 @@ void RtmpConnectionSession::handle_decode_error(core::Error /*error*/) {
 
 void RtmpConnectionSession::on_bytes_received(std::span<const std::byte> data) {
     if (failed_ || closed_ || data.empty()) return;
+    // Every RTMP byte the server accepts from a peer passes through here, so
+    // this is the single correct place to account ingress. One relaxed atomic
+    // add per read, not per message.
+    if (metrics_ != nullptr) {
+        metrics_->increment(observability::MetricId::IngressBytesTotal, data.size());
+    }
     decoder_.on_bytes_received(data);
     if (decoder_.failed() && !failed_) fail("chunk decoder failed");
 }

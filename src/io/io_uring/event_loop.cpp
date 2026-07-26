@@ -167,6 +167,7 @@ void IoUringEventLoop::begin_shutdown() {
 void IoUringEventLoop::submit_accept() {
     io_uring_sqe* sqe = ::io_uring_get_sqe(&context_.ring());
     if (sqe == nullptr) {
+        if (metrics_ != nullptr) metrics_->increment(observability::MetricId::IoUringSqFull);
         RTMP_LOG(LogLevel::Error, "event_loop", "sqe_exhausted_accept", {});
         return;
     }
@@ -181,6 +182,7 @@ void IoUringEventLoop::submit_accept() {
 void IoUringEventLoop::submit_router_poll() {
     io_uring_sqe* sqe = ::io_uring_get_sqe(&context_.ring());
     if (sqe == nullptr) {
+        if (metrics_ != nullptr) metrics_->increment(observability::MetricId::IoUringSqFull);
         RTMP_LOG(LogLevel::Error, "event_loop", "sqe_exhausted_router_poll", {});
         return;
     }
@@ -230,6 +232,7 @@ void IoUringEventLoop::submit_receive(std::shared_ptr<TcpConnection> connection)
     if (!connection->is_open()) return;
     auto buffer = receive_pool_.acquire();
     if (!buffer) {
+        if (metrics_ != nullptr) metrics_->increment(observability::MetricId::ProvidedBufferExhaustion);
         RTMP_LOG(LogLevel::Warn, "event_loop", "receive_pool_exhausted",
                  {{"connection_id", std::to_string(connection->connection_id())}});
         return;
@@ -238,6 +241,7 @@ void IoUringEventLoop::submit_receive(std::shared_ptr<TcpConnection> connection)
     io_uring_sqe* sqe = ::io_uring_get_sqe(&context_.ring());
     if (sqe == nullptr) {
         receive_pool_.release(std::move(buffer));
+        if (metrics_ != nullptr) metrics_->increment(observability::MetricId::IoUringSqFull);
         RTMP_LOG(LogLevel::Error, "event_loop", "sqe_exhausted_recv", {});
         return;
     }
@@ -267,11 +271,20 @@ void IoUringEventLoop::submit_send(std::shared_ptr<TcpConnection> connection) {
 
     io_uring_sqe* sqe = ::io_uring_get_sqe(&context_.ring());
     if (sqe == nullptr) {
+        if (metrics_ != nullptr) metrics_->increment(observability::MetricId::IoUringSqFull);
         RTMP_LOG(LogLevel::Error, "event_loop", "sqe_exhausted_send", {});
         return;
     }
 
+    // Resume from the offset a previous partial send reached, never from the
+    // start of the buffer — see TcpConnection::next_write_offset().
     auto view = buffer.view();
+    const std::size_t offset = connection->next_write_offset();
+    if (offset >= view.size()) {
+        connection->pop_write_buffer();
+        return;
+    }
+    view = view.subspan(offset);
     ::io_uring_prep_send(sqe, connection->fd(), view.data(), view.size(), 0);
 
     OperationContext ctx{OperationType::Send, 0, connection->connection_id(),
@@ -291,6 +304,7 @@ void IoUringEventLoop::arm_idle_timeout(const std::shared_ptr<TcpConnection>& co
 
     io_uring_sqe* sqe = ::io_uring_get_sqe(&context_.ring());
     if (sqe == nullptr) {
+        if (metrics_ != nullptr) metrics_->increment(observability::MetricId::IoUringSqFull);
         RTMP_LOG(LogLevel::Error, "event_loop", "sqe_exhausted_timeout", {});
         return;
     }
@@ -319,6 +333,7 @@ void IoUringEventLoop::arm_idle_timeout(const std::shared_ptr<TcpConnection>& co
 void IoUringEventLoop::cancel_operation(std::uint64_t target_operation_id) {
     io_uring_sqe* sqe = ::io_uring_get_sqe(&context_.ring());
     if (sqe == nullptr) {
+        if (metrics_ != nullptr) metrics_->increment(observability::MetricId::IoUringSqFull);
         RTMP_LOG(LogLevel::Error, "event_loop", "sqe_exhausted_cancel", {});
         return;
     }
@@ -360,6 +375,10 @@ void IoUringEventLoop::close_connection(const std::shared_ptr<TcpConnection>& co
     connection->set_state(ConnectionState::Closed);
     connections_.remove(connection->connection_id());
     connection->on_peer_closed();
+    if (metrics_ != nullptr) {
+        metrics_->add(observability::MetricId::ActiveConnections, -1);
+        metrics_->set_connections_for_worker(worker_id_, static_cast<std::int64_t>(connections_.size()));
+    }
     RTMP_LOG(LogLevel::Info, "event_loop", "connection_closed",
              {{"connection_id", std::to_string(connection->connection_id())}});
 }
@@ -438,6 +457,12 @@ void IoUringEventLoop::handle_accept_completion(const OperationContext& /*op*/, 
     auto connection = std::make_shared<TcpConnection>(*this, core::FileDescriptor(client_fd),
                                                         connection_id, generation);
     connections_.add(connection);
+    if (metrics_ != nullptr) {
+        metrics_->add(observability::MetricId::ActiveConnections, +1);
+        // Bounded-cardinality per-worker series: worker count comes from
+        // configuration, never from client behaviour.
+        metrics_->set_connections_for_worker(worker_id_, static_cast<std::int64_t>(connections_.size()));
+    }
 
     RTMP_LOG(LogLevel::Info, "event_loop", "connection_accepted",
              {{"connection_id", std::to_string(connection_id)}});
@@ -514,6 +539,7 @@ void IoUringEventLoop::arm_handshake_timeout(const std::shared_ptr<TcpConnection
 
     io_uring_sqe* sqe = ::io_uring_get_sqe(&context_.ring());
     if (sqe == nullptr) {
+        if (metrics_ != nullptr) metrics_->increment(observability::MetricId::IoUringSqFull);
         RTMP_LOG(LogLevel::Error, "event_loop", "sqe_exhausted_handshake_timeout", {});
         return;
     }
@@ -676,7 +702,14 @@ void IoUringEventLoop::handle_send_completion(const OperationContext& op, int re
     if (!connection) return;
 
     bool success = result > 0;
+    const std::uint64_t partials_before = connection->partial_send_count();
     connection->on_send_completion(success ? static_cast<std::size_t>(result) : 0, success);
+    if (metrics_ != nullptr) {
+        if (success) metrics_->increment(observability::MetricId::EgressBytesTotal,
+                                         static_cast<std::uint64_t>(result));
+        const std::uint64_t delta = connection->partial_send_count() - partials_before;
+        if (delta > 0) metrics_->increment(observability::MetricId::PartialSendCount, delta);
+    }
 
     if (connection->is_open() && connection->has_pending_write()) {
         submit_send(connection);
@@ -717,11 +750,13 @@ void IoUringEventLoop::handle_timeout_completion(const OperationContext& op, int
     // result == -ETIME (fired) or 0 (fired with count semantics on some
     // kernels) both mean the timeout period elapsed with no re-arm.
     if (op.timeout_purpose == TimeoutPurpose::IdleConnection && connection->is_open()) {
+        if (metrics_ != nullptr) metrics_->increment(observability::MetricId::ConnectionTimeouts);
         RTMP_LOG(LogLevel::Info, "event_loop", "idle_timeout",
                  {{"connection_id", std::to_string(connection->connection_id())}});
         close_connection(connection);
     } else if (op.timeout_purpose == TimeoutPurpose::Handshake && handshake_session &&
                connection->is_open()) {
+        if (metrics_ != nullptr) metrics_->increment(observability::MetricId::ConnectionTimeouts);
         RTMP_LOG(LogLevel::Warn, "event_loop", "handshake_timeout",
                  {{"connection_id", std::to_string(connection->connection_id())}});
         // Drives the session into TimedOut and invokes its fail handler,
