@@ -115,6 +115,17 @@ void Recorder::write_tag(std::uint8_t tag_type, std::span<const std::byte> paylo
 
     auto res = sink_.append(std::span<const std::byte>(framed.data(), framed.size()));
     if (!res.ok()) {
+        // A sink may enforce its own hard queue bound (AsyncFileSink does).
+        // ResourceExhausted means "this frame did not fit", which is
+        // backpressure, not a broken file: count it as a drop and keep
+        // recording, exactly as the pending_bytes() check above does. Any
+        // other error means the file itself is compromised and recording
+        // must stop. Neither path is silent (both are counted/logged).
+        if (res.error().code() == core::ErrorCode::ResourceExhausted) {
+            stats_.dropped_frames += 1;
+            stats_.dropped_bytes += framed.size();
+            return;
+        }
         mark_failed("tag", res.error());
         return;
     }

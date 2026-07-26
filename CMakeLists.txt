@@ -63,6 +63,9 @@ add_subdirectory(src/authentication)
 # Phase 5 management HTTP API: hand-rolled bounded HTTP/1.1 server over
 # plain POSIX sockets (see docs/management-api.md for why no vendored
 # library was used) plus JSON (de)serialization for the endpoint set.
+# Phase 6 HLS packaging (playlists, segmenter, bounded segment store). Must
+# come before src/control, which links it for HLS HTTP delivery.
+add_subdirectory(src/hls)
 # Builds everywhere — POSIX sockets, not io_uring.
 add_subdirectory(src/control)
 
@@ -80,6 +83,7 @@ if(RTMP_SERVER_BUILD_TESTS)
     add_subdirectory(tests/protocol)
     add_subdirectory(tests/media)
     add_subdirectory(tests/recording)
+    add_subdirectory(tests/hls)
     add_subdirectory(tests/management)
     add_subdirectory(tests/persistence)
     add_subdirectory(tests/integration)

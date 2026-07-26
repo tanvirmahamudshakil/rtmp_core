@@ -109,12 +109,44 @@ bool read_request(int fd, const HttpServerOptions& options, HttpRequest& out, in
     return true;
 }
 
+// Reason phrases for the statuses this server actually emits. HLS clients
+// and CDNs key retry/caching behaviour off the status line, and a 206 or 416
+// labelled "Error"/"OK" is confusing to intermediaries even though the code
+// is what is normative.
+const char* reason_phrase(int status) {
+    switch (status) {
+        case 200: return "OK";
+        case 201: return "Created";
+        case 204: return "No Content";
+        case 206: return "Partial Content";
+        case 304: return "Not Modified";
+        case 400: return "Bad Request";
+        case 401: return "Unauthorized";
+        case 403: return "Forbidden";
+        case 404: return "Not Found";
+        case 405: return "Method Not Allowed";
+        case 409: return "Conflict";
+        case 413: return "Payload Too Large";
+        case 416: return "Range Not Satisfiable";
+        case 429: return "Too Many Requests";
+        case 500: return "Internal Server Error";
+        case 503: return "Service Unavailable";
+        default: return status < 400 ? "OK" : "Error";
+    }
+}
+
 void write_response(int fd, const HttpResponse& response) {
     std::string out = "HTTP/1.1 " + std::to_string(response.status) + " ";
-    out += (response.status < 400 ? "OK" : "Error");
+    out += reason_phrase(response.status);
     out += "\r\n";
     out += "Content-Type: " + response.content_type + "\r\n";
-    out += "Content-Length: " + std::to_string(response.body.size()) + "\r\n";
+    // A handler may set Content-Length itself (a HEAD response describes the
+    // body it would have sent while carrying none). Emitting our own too
+    // would produce a duplicate header, which is a request-smuggling hazard,
+    // so the handler's value wins.
+    if (!response.headers.contains("Content-Length")) {
+        out += "Content-Length: " + std::to_string(response.body.size()) + "\r\n";
+    }
     out += "Connection: close\r\n";
     for (const auto& [k, v] : response.headers) out += k + ": " + v + "\r\n";
     out += "\r\n";
