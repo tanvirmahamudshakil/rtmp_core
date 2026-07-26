@@ -11,6 +11,7 @@
 #include "rtmp_server/protocol/chunk/chunk_types.hpp"
 #include "rtmp_server/protocol/commands/live_fanout.hpp"
 #include "rtmp_server/protocol/commands/recorder_sink.hpp"
+#include "rtmp_server/protocol/commands/stream_ids.hpp"
 #include "rtmp_server/protocol/commands/stream_registry.hpp"
 #include "rtmp_server/protocol/media/media_ingest.hpp"
 
@@ -73,7 +74,8 @@ public:
     // owner's level, e.g. a later phase's media pipeline).
     using PublishStopHandler = std::function<void(std::string_view stream_key, std::uint64_t connection_id)>;
 
-    CommandSession(std::uint64_t connection_id, StreamRegistry& registry, StreamKeyValidator key_validator);
+    CommandSession(std::uint64_t connection_id, StreamRegistry& registry, StreamKeyValidator key_validator,
+                   StreamIdRegistry* stream_id_registry = nullptr);
     // Out-of-line so PlaybackRelay (only forward-declared here) is a
     // complete type where playback_relays_'s unique_ptr destructors run.
     ~CommandSession();
@@ -118,12 +120,13 @@ public:
     using PendingBytesProvider = std::function<std::size_t()>;
     void set_pending_bytes_provider(PendingBytesProvider provider) { pending_bytes_provider_ = std::move(provider); }
 
-    // Byte budget for this connection's playback backlog: a playback frame
-    // is dropped (not written, PlaybackSink::on_* returns false) rather than
-    // queued once pending_bytes_provider_() + frame size would exceed this.
-    // Mirrors recording::RecorderConfig::max_queued_bytes's bounded-queue,
-    // drop-newest policy.
-    void set_max_queued_playback_bytes(std::size_t bytes) { max_queued_playback_bytes_ = bytes; }
+    // Byte/packet budget for this connection's playback backlog, folded
+    // into pending_bytes_provider_()'s real transport backlog via a
+    // ViewerQueue (docs/v2_promot.md PHASE 3 "Implement bounded per-viewer
+    // queues" — this replaces the old flat byte-cap check). A playback
+    // frame is dropped (not written, PlaybackSink::on_* returns false)
+    // whenever the staged policy says to wait for the next keyframe.
+    void set_playback_queue_limits(QueueLimits limits) { playback_queue_limits_ = limits; }
 
     // Feeds one fully-reassembled RTMP message from ChunkDecoder. Amf0Command
     // (type 20) messages are dispatched to the connect/publish/play command
@@ -152,13 +155,15 @@ private:
     struct StreamSlot {
         NetStreamState state = NetStreamState::Idle;
         std::string stream_key; // set once publish()/play() names it
+        StreamId stream_id;     // resolved at publish()/play() time via stream_id_registry_
     };
 
     // Called by PlaybackRelay to actually emit an audio/video/metadata
     // message to this connection's outgoing_handler_, applying the
     // backpressure byte-budget check. Returns false (message dropped) if the
     // budget is exceeded or there is no outgoing_handler_.
-    bool deliver_playback_message(std::uint32_t message_stream_id, const chunk::RtmpMessage& message);
+    bool deliver_playback_message(std::uint32_t message_stream_id, const SharedMediaFrame& frame, ViewerQueue& queue,
+                                   bool is_video);
     // PlaybackRelay callbacks: the subscription in live_fanout_ is already
     // gone by the time these run (see PlaybackSink contract).
     void handle_playback_publisher_stopped(std::uint32_t message_stream_id);
@@ -183,6 +188,7 @@ private:
     std::uint64_t connection_id_;
     StreamRegistry& registry_;
     StreamKeyValidator key_validator_;
+    StreamIdRegistry* stream_id_registry_ = nullptr; // never null after construction; see .cpp fallback
     OutgoingHandler outgoing_handler_;
     PublishStartHandler publish_start_handler_;
     PublishStopHandler publish_stop_handler_;
@@ -190,7 +196,7 @@ private:
     RecorderSink* recorder_ = nullptr;
     LiveFanout* live_fanout_ = nullptr;
     PendingBytesProvider pending_bytes_provider_;
-    std::size_t max_queued_playback_bytes_ = 4 * 1024 * 1024;
+    QueueLimits playback_queue_limits_;
 
     bool connected_ = false;
     std::string app_name_;

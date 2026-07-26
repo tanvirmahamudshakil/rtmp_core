@@ -1,153 +1,240 @@
 #include "rtmp_server/protocol/commands/live_fanout.hpp"
 
+#include "rtmp_server/protocol/media/media_ingest.hpp"
+
 namespace rtmp_server::protocol::commands {
 
-using chunk::MessageTypeId;
-using chunk::RtmpMessage;
+using media::AacPacketType;
+using media::AudioCodec;
+using media::AvcPacketType;
+using media::VideoCodec;
+using media::VideoFrameType;
 
 namespace {
 
-// FLV video tag byte 0: high nibble = frame type (1 = keyframe), low nibble
-// = codec ID (7 = AVC). Byte 1, present only for codec ID 7, is the
-// AVCPacketType (0 = sequence header / AVCDecoderConfigurationRecord).
-bool is_video_keyframe(const RtmpMessage& m) { return !m.payload.empty() && (std::to_integer<int>(m.payload[0]) >> 4) == 1; }
-
-bool is_avc(const RtmpMessage& m) { return !m.payload.empty() && (std::to_integer<int>(m.payload[0]) & 0x0F) == 7; }
-
-bool is_video_sequence_header(const RtmpMessage& m) {
-    return is_avc(m) && m.payload.size() > 1 && std::to_integer<int>(m.payload[1]) == 0;
+bool classify_is_video_keyframe(const SharedMediaFrame& frame) {
+    auto info = media::classify_video_tag(frame.payload.view());
+    if (!info) return false;
+    return info->frame_type == VideoFrameType::KeyFrame || info->frame_type == VideoFrameType::GeneratedKeyFrame;
 }
 
-// FLV audio tag byte 0: high nibble = sound format (10 = AAC). Byte 1,
-// present only for AAC, is the AACPacketType (0 = sequence header /
-// AudioSpecificConfig).
-bool is_aac(const RtmpMessage& m) { return !m.payload.empty() && (std::to_integer<int>(m.payload[0]) >> 4) == 10; }
+bool classify_is_video_sequence_header(const SharedMediaFrame& frame) {
+    auto info = media::classify_video_tag(frame.payload.view());
+    return info && info->codec == VideoCodec::Avc && info->avc_packet_type == AvcPacketType::SequenceHeader;
+}
 
-bool is_audio_sequence_header(const RtmpMessage& m) {
-    return is_aac(m) && m.payload.size() > 1 && std::to_integer<int>(m.payload[1]) == 0;
+bool classify_is_audio_sequence_header(const SharedMediaFrame& frame) {
+    auto info = media::classify_audio_tag(frame.payload.view());
+    return info && info->codec == AudioCodec::Aac && info->aac_packet_type == AacPacketType::SequenceHeader;
 }
 
 } // namespace
 
-std::vector<PlaybackSink*> LiveFanout::dispatch_locked(StreamState& state, const RtmpMessage& message,
-                                                        bool (PlaybackSink::*method)(const RtmpMessage&)) {
+LiveFanout::StreamState& LiveFanout::state_for(StreamId id) {
+    std::lock_guard<std::mutex> lock(streams_mutex_);
+    auto it = streams_.find(id.raw());
+    if (it == streams_.end()) {
+        it = streams_.emplace(id.raw(), std::make_unique<StreamState>(gop_limits_)).first;
+    }
+    return *it->second;
+}
+
+std::vector<LiveFanout::PendingDelivery> LiveFanout::dispatch_locked(StreamState& state, const SharedMediaFrame& frame,
+                                                                      bool is_video, bool is_audio, bool is_keyframe) {
+    std::vector<PendingDelivery> deliveries;
     std::vector<std::uint64_t> evict_ids;
+    deliveries.reserve(state.subscribers.size());
+
+    PendingDelivery::Kind kind = is_video   ? PendingDelivery::Kind::Video
+                                  : is_audio ? PendingDelivery::Kind::Audio
+                                             : PendingDelivery::Kind::Metadata;
+
     for (auto& [id, sub] : state.subscribers) {
-        bool delivered = (sub.sink->*method)(message);
-        if (delivered) {
-            sub.consecutive_drops = 0;
-        } else if (++sub.consecutive_drops >= max_consecutive_drops_) {
-            evict_ids.push_back(id);
+        auto decision = sub.queue.offer(0, frame.payload.size(), is_video, is_keyframe);
+        switch (decision) {
+            case ViewerQueue::Decision::Deliver:
+                deliveries.push_back(PendingDelivery{sub.sink, kind, std::nullopt, std::nullopt, frame});
+                break;
+            case ViewerQueue::Decision::DeliverResumed: {
+                PendingDelivery delivery{sub.sink, kind, std::nullopt, std::nullopt, frame};
+                if (state.video_sequence_header) delivery.resend_video_seq_header = state.video_sequence_header;
+                if (state.audio_sequence_header) delivery.resend_audio_seq_header = state.audio_sequence_header;
+                deliveries.push_back(std::move(delivery));
+                break;
+            }
+            case ViewerQueue::Decision::DropAndWait:
+                break;
+            case ViewerQueue::Decision::Evict:
+                evict_ids.push_back(id);
+                break;
         }
     }
 
-    std::vector<PlaybackSink*> evicted_sinks;
-    evicted_sinks.reserve(evict_ids.size());
     for (auto id : evict_ids) {
         auto it = state.subscribers.find(id);
         if (it == state.subscribers.end()) continue;
-        evicted_sinks.push_back(it->second.sink);
+        deliveries.push_back(PendingDelivery{it->second.sink, PendingDelivery::Kind::Evict, std::nullopt,
+                                              std::nullopt, SharedMediaFrame{}});
         state.subscribers.erase(it);
     }
-    return evicted_sinks;
+
+    return deliveries;
 }
 
-void LiveFanout::on_video(const std::string& stream_key, const RtmpMessage& message) {
-    std::vector<PlaybackSink*> evicted;
+void LiveFanout::run_deliveries(std::vector<PendingDelivery> deliveries) {
+    for (auto& delivery : deliveries) {
+        if (delivery.resend_video_seq_header) delivery.sink->on_video(*delivery.resend_video_seq_header);
+        if (delivery.resend_audio_seq_header) delivery.sink->on_audio(*delivery.resend_audio_seq_header);
+        switch (delivery.kind) {
+            case PendingDelivery::Kind::Audio:
+                delivery.sink->on_audio(delivery.frame);
+                break;
+            case PendingDelivery::Kind::Video:
+                delivery.sink->on_video(delivery.frame);
+                break;
+            case PendingDelivery::Kind::Metadata:
+                delivery.sink->on_metadata(delivery.frame);
+                break;
+            case PendingDelivery::Kind::Evict:
+                delivery.sink->on_slow_client_evicted();
+                break;
+        }
+    }
+}
+
+void LiveFanout::on_video(StreamId stream_id, const SharedMediaFrame& frame) {
+    StreamState& state = state_for(stream_id);
+    std::vector<PendingDelivery> deliveries;
+    bool is_keyframe = false;
     {
-        std::lock_guard<std::mutex> lock(mutex_);
-        auto& state = streams_[stream_key];
-        if (is_video_sequence_header(message)) {
-            state.video_sequence_header = message;
+        std::lock_guard<std::mutex> lock(state.mutex);
+        if (classify_is_video_sequence_header(frame)) {
+            state.video_sequence_header = frame;
         } else {
-            if (is_video_keyframe(message)) state.gop_cache.clear();
-            if (!state.gop_cache.empty() || is_video_keyframe(message)) state.gop_cache.push_back(message);
+            is_keyframe = classify_is_video_keyframe(frame);
+            if (is_keyframe) {
+                state.gop_cache.begin_new_gop(frame);
+            } else {
+                state.gop_cache.push(frame); // no-op until the first keyframe arrives
+            }
         }
-        evicted = dispatch_locked(state, message, &PlaybackSink::on_video);
+        deliveries = dispatch_locked(state, frame, /*is_video=*/true, /*is_audio=*/false, is_keyframe);
     }
-    for (auto* sink : evicted) sink->on_slow_client_evicted();
+    run_deliveries(std::move(deliveries));
 }
 
-void LiveFanout::on_audio(const std::string& stream_key, const RtmpMessage& message) {
-    std::vector<PlaybackSink*> evicted;
+void LiveFanout::on_audio(StreamId stream_id, const SharedMediaFrame& frame) {
+    StreamState& state = state_for(stream_id);
+    std::vector<PendingDelivery> deliveries;
     {
-        std::lock_guard<std::mutex> lock(mutex_);
-        auto& state = streams_[stream_key];
-        if (is_audio_sequence_header(message)) {
-            state.audio_sequence_header = message;
-        } else if (!state.gop_cache.empty()) {
-            state.gop_cache.push_back(message);
+        std::lock_guard<std::mutex> lock(state.mutex);
+        if (classify_is_audio_sequence_header(frame)) {
+            state.audio_sequence_header = frame;
+        } else {
+            state.gop_cache.push(frame); // no-op until a video keyframe has started a GOP
         }
-        evicted = dispatch_locked(state, message, &PlaybackSink::on_audio);
+        deliveries = dispatch_locked(state, frame, /*is_video=*/false, /*is_audio=*/true, /*is_keyframe=*/false);
     }
-    for (auto* sink : evicted) sink->on_slow_client_evicted();
+    run_deliveries(std::move(deliveries));
 }
 
-void LiveFanout::on_metadata(const std::string& stream_key, const RtmpMessage& message) {
-    std::vector<PlaybackSink*> evicted;
+void LiveFanout::on_metadata(StreamId stream_id, const SharedMediaFrame& frame) {
+    StreamState& state = state_for(stream_id);
+    std::vector<PendingDelivery> deliveries;
     {
-        std::lock_guard<std::mutex> lock(mutex_);
-        auto& state = streams_[stream_key];
-        state.metadata = message;
-        evicted = dispatch_locked(state, message, &PlaybackSink::on_metadata);
+        std::lock_guard<std::mutex> lock(state.mutex);
+        state.metadata = frame;
+        deliveries = dispatch_locked(state, frame, /*is_video=*/false, /*is_audio=*/false, /*is_keyframe=*/false);
     }
-    for (auto* sink : evicted) sink->on_slow_client_evicted();
+    run_deliveries(std::move(deliveries));
 }
 
-void LiveFanout::subscribe(const std::string& stream_key, std::uint64_t subscriber_id, PlaybackSink* sink) {
-    std::vector<RtmpMessage> startup;
+void LiveFanout::subscribe(StreamId stream_id, SubscriberId subscriber_id, PlaybackSink* sink) {
+    StreamState& state = state_for(stream_id);
+    std::vector<SharedMediaFrame> startup_metadata_and_headers;
+    std::vector<SharedMediaFrame> startup_gop;
+    bool have_video_header = false;
+    bool have_audio_header = false;
     {
-        std::lock_guard<std::mutex> lock(mutex_);
-        auto& state = streams_[stream_key];
-        state.subscribers[subscriber_id] = Subscriber{sink, 0};
+        std::lock_guard<std::mutex> lock(state.mutex);
+        state.subscribers.emplace(subscriber_id.raw(), Subscriber{sink, ViewerQueue(queue_limits_, max_frames_waiting_for_keyframe_)});
 
-        if (state.metadata) startup.push_back(*state.metadata);
-        if (state.video_sequence_header) startup.push_back(*state.video_sequence_header);
-        if (state.audio_sequence_header) startup.push_back(*state.audio_sequence_header);
-        for (const auto& m : state.gop_cache) startup.push_back(m);
+        if (state.metadata) startup_metadata_and_headers.push_back(*state.metadata);
+        if (state.video_sequence_header) {
+            startup_metadata_and_headers.push_back(*state.video_sequence_header);
+            have_video_header = true;
+        }
+        if (state.audio_sequence_header) {
+            startup_metadata_and_headers.push_back(*state.audio_sequence_header);
+            have_audio_header = true;
+        }
+        for (const auto& frame : state.gop_cache.frames()) startup_gop.push_back(frame);
     }
+    (void)have_video_header;
+    (void)have_audio_header;
 
-    for (const auto& m : startup) {
-        switch (static_cast<MessageTypeId>(m.message_type_id)) {
-            case MessageTypeId::Audio:
-                sink->on_audio(m);
-                break;
-            case MessageTypeId::Video:
-                sink->on_video(m);
-                break;
-            case MessageTypeId::Amf0Data:
-                sink->on_metadata(m);
-                break;
-            default:
-                break;
+    // Deliver outside the lock: metadata + sequence headers first, then the
+    // cached GOP (which always starts at a keyframe by GopCache's
+    // invariant), in the order a fresh decoder needs them.
+    for (const auto& frame : startup_metadata_and_headers) {
+        if (classify_is_video_sequence_header(frame)) {
+            sink->on_video(frame);
+        } else if (classify_is_audio_sequence_header(frame)) {
+            sink->on_audio(frame);
+        } else {
+            sink->on_metadata(frame);
+        }
+    }
+    for (const auto& frame : startup_gop) {
+        if (frame.message_type_id == static_cast<std::uint8_t>(chunk::MessageTypeId::Video)) {
+            sink->on_video(frame);
+        } else {
+            sink->on_audio(frame);
         }
     }
 }
 
-void LiveFanout::unsubscribe(const std::string& stream_key, std::uint64_t subscriber_id) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    auto it = streams_.find(stream_key);
+void LiveFanout::unsubscribe(StreamId stream_id, SubscriberId subscriber_id) {
+    std::unique_lock<std::mutex> structural_lock(streams_mutex_);
+    auto it = streams_.find(stream_id.raw());
     if (it == streams_.end()) return;
-    it->second.subscribers.erase(subscriber_id);
+    StreamState& state = *it->second;
+    structural_lock.unlock();
+
+    std::lock_guard<std::mutex> lock(state.mutex);
+    state.subscribers.erase(subscriber_id.raw()); // erase() on a missing key is a no-op: idempotent
 }
 
-void LiveFanout::publisher_stopped(const std::string& stream_key) {
-    std::vector<PlaybackSink*> sinks;
+void LiveFanout::publisher_stopped(StreamId stream_id) {
+    std::unique_ptr<StreamState> removed;
     {
-        std::lock_guard<std::mutex> lock(mutex_);
-        auto it = streams_.find(stream_key);
+        std::lock_guard<std::mutex> lock(streams_mutex_);
+        auto it = streams_.find(stream_id.raw());
         if (it == streams_.end()) return;
-        sinks.reserve(it->second.subscribers.size());
-        for (auto& [id, sub] : it->second.subscribers) sinks.push_back(sub.sink);
+        removed = std::move(it->second);
         streams_.erase(it);
     }
+
+    // `removed` is no longer reachable from streams_, so no other thread can
+    // observe or lock it concurrently — safe to read/iterate its subscribers
+    // without removed->mutex, and safe to call back into sinks here (outside
+    // any LiveFanout-owned lock).
+    std::vector<PlaybackSink*> sinks;
+    sinks.reserve(removed->subscribers.size());
+    for (auto& [id, sub] : removed->subscribers) sinks.push_back(sub.sink);
     for (auto* sink : sinks) sink->on_publisher_stopped();
 }
 
-std::size_t LiveFanout::subscriber_count(const std::string& stream_key) const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    auto it = streams_.find(stream_key);
-    return it == streams_.end() ? 0 : it->second.subscribers.size();
+std::size_t LiveFanout::subscriber_count(StreamId stream_id) const {
+    std::lock_guard<std::mutex> lock(streams_mutex_);
+    auto it = streams_.find(stream_id.raw());
+    if (it == streams_.end()) return 0;
+    // Reading subscribers.size() without the per-stream mutex here would
+    // race with a concurrent subscribe()/unsubscribe(); acquire it too.
+    // streams_mutex_ is already held, but that only protects the map
+    // structure, not StreamState's own fields.
+    std::lock_guard<std::mutex> stream_lock(it->second->mutex);
+    return it->second->subscribers.size();
 }
 
 } // namespace rtmp_server::protocol::commands

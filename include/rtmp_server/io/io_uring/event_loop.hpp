@@ -15,6 +15,7 @@
 #include "rtmp_server/io/io_uring/operation_registry.hpp"
 #include "rtmp_server/network/tcp_connection.hpp"
 #include "rtmp_server/protocol/commands/live_fanout.hpp"
+#include "rtmp_server/protocol/commands/stream_ids.hpp"
 #include "rtmp_server/protocol/commands/stream_registry.hpp"
 #include "rtmp_server/protocol/handshake/handshake_session.hpp"
 #include "rtmp_server/protocol/session/rtmp_connection_session.hpp"
@@ -133,6 +134,7 @@ private:
     // ConnectionRegistry is the single shared table of TcpConnections.
     // Fan-out sharding across workers is a Phase 4 concern, not Phase 1's.
     protocol::commands::StreamRegistry stream_registry_;
+    protocol::commands::StreamIdRegistry stream_id_registry_;
     protocol::commands::LiveFanout live_fanout_;
     std::mutex rtmp_sessions_mutex_;
     std::unordered_map<std::uint64_t, std::unique_ptr<protocol::session::RtmpConnectionSession>>

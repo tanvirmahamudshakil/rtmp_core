@@ -30,9 +30,27 @@ std::string string_arg(const Amf0Value& v, std::string fallback = {}) {
 
 } // namespace
 
+namespace {
+
+// Fallback used only when a caller (typically a test, or a component that
+// genuinely has no per-server StreamIdRegistry available) does not supply
+// one explicitly. A single process-wide instance keeps CommandSession
+// itself movable (a member StreamIdRegistry would not be, since it embeds
+// a std::mutex) while still giving every CommandSession that doesn't care
+// a working, if not globally deduplicated-with-others, registry.
+StreamIdRegistry& default_stream_id_registry() {
+    static StreamIdRegistry registry;
+    return registry;
+}
+
+} // namespace
+
 CommandSession::CommandSession(std::uint64_t connection_id, StreamRegistry& registry,
-                                 StreamKeyValidator key_validator)
-    : connection_id_(connection_id), registry_(registry), key_validator_(std::move(key_validator)) {}
+                                 StreamKeyValidator key_validator, StreamIdRegistry* stream_id_registry)
+    : connection_id_(connection_id),
+      registry_(registry),
+      key_validator_(std::move(key_validator)),
+      stream_id_registry_(stream_id_registry != nullptr ? stream_id_registry : &default_stream_id_registry()) {}
 
 // Adapts one Playing StreamSlot's subscription to LiveFanout's PlaybackSink
 // interface, forwarding every callback back into the owning CommandSession.
@@ -40,17 +58,19 @@ CommandSession::CommandSession(std::uint64_t connection_id, StreamRegistry& regi
 // playback_relays_; lives exactly as long as the subscription does.
 class CommandSession::PlaybackRelay : public PlaybackSink {
 public:
-    PlaybackRelay(CommandSession& owner, std::uint32_t message_stream_id)
-        : owner_(owner), message_stream_id_(message_stream_id) {}
+    PlaybackRelay(CommandSession& owner, std::uint32_t message_stream_id, QueueLimits limits, SubscriberId subscriber_id)
+        : owner_(owner), message_stream_id_(message_stream_id), queue_(limits), subscriber_id_(subscriber_id) {}
 
-    bool on_audio(const RtmpMessage& message) override {
-        return owner_.deliver_playback_message(message_stream_id_, message);
+    [[nodiscard]] SubscriberId subscriber_id() const noexcept { return subscriber_id_; }
+
+    bool on_audio(const SharedMediaFrame& frame) override {
+        return owner_.deliver_playback_message(message_stream_id_, frame, queue_, /*is_video=*/false);
     }
-    bool on_video(const RtmpMessage& message) override {
-        return owner_.deliver_playback_message(message_stream_id_, message);
+    bool on_video(const SharedMediaFrame& frame) override {
+        return owner_.deliver_playback_message(message_stream_id_, frame, queue_, /*is_video=*/true);
     }
-    bool on_metadata(const RtmpMessage& message) override {
-        return owner_.deliver_playback_message(message_stream_id_, message);
+    bool on_metadata(const SharedMediaFrame& frame) override {
+        return owner_.deliver_playback_message(message_stream_id_, frame, queue_, /*is_video=*/false);
     }
     void on_publisher_stopped() override { owner_.handle_playback_publisher_stopped(message_stream_id_); }
     void on_slow_client_evicted() override { owner_.handle_playback_evicted(message_stream_id_); }
@@ -58,6 +78,8 @@ public:
 private:
     CommandSession& owner_;
     std::uint32_t message_stream_id_;
+    ViewerQueue queue_;
+    SubscriberId subscriber_id_;
 };
 
 CommandSession::~CommandSession() = default;
@@ -101,15 +123,31 @@ void CommandSession::handle_message(const RtmpMessage& message) {
     dispatch(command, message.message_stream_id);
 }
 
-bool CommandSession::deliver_playback_message(std::uint32_t message_stream_id, const RtmpMessage& message) {
+bool CommandSession::deliver_playback_message(std::uint32_t message_stream_id, const SharedMediaFrame& frame,
+                                               ViewerQueue& queue, bool is_video) {
     if (!outgoing_handler_) return false;
 
-    std::size_t pending = pending_bytes_provider_ ? pending_bytes_provider_() : 0;
-    if (pending + message.payload.size() > max_queued_playback_bytes_) return false;
+    bool is_keyframe = false;
+    if (is_video) {
+        auto info = media::classify_video_tag(frame.payload.view());
+        is_keyframe = info && (info->frame_type == media::VideoFrameType::KeyFrame ||
+                                info->frame_type == media::VideoFrameType::GeneratedKeyFrame);
+    }
 
-    RtmpMessage out = message;
-    out.message_stream_id = message_stream_id;
-    switch (static_cast<MessageTypeId>(message.message_type_id)) {
+    std::size_t pending = pending_bytes_provider_ ? pending_bytes_provider_() : 0;
+    auto decision = queue.offer(pending, frame.payload.size(), is_video, is_keyframe);
+    // Evict is treated as a drop here rather than a hard disconnect: the
+    // authoritative slow-viewer eviction lifecycle lives in LiveFanout
+    // (which already forces this subscriber off via on_slow_client_evicted
+    // once its own ViewerQueue gives up). This connection-local ViewerQueue
+    // only folds the *real* transport backlog (pending_bytes_provider_) into
+    // the same staged policy so a viewer whose socket alone is slow (even
+    // if LiveFanout's own queue would still accept it) also degrades
+    // gracefully instead of an unbounded flat-byte cliff.
+    if (decision == ViewerQueue::Decision::DropAndWait || decision == ViewerQueue::Decision::Evict) return false;
+
+    RtmpMessage out = frame.to_message(kCommandChunkStreamId, message_stream_id);
+    switch (static_cast<MessageTypeId>(frame.message_type_id)) {
         case MessageTypeId::Audio:
             out.chunk_stream_id = kAudioChunkStreamId;
             break;
@@ -121,6 +159,7 @@ bool CommandSession::deliver_playback_message(std::uint32_t message_stream_id, c
             break;
     }
     outgoing_handler_(std::move(out));
+    queue.note_flushed(frame.payload.size());
     return true;
 }
 
@@ -155,21 +194,26 @@ void CommandSession::route_media_message(const RtmpMessage& message) {
     }
 
     const std::string& stream_key = it->second.stream_key;
+    // One SharedMediaFrame construction per message (one copy out of the
+    // decoder's buffer, same cost as constructing RtmpMessage today) shared
+    // by value (refcounted, no further copies) with LiveFanout — see
+    // shared_media_frame.hpp.
+    SharedMediaFrame frame = live_fanout_ != nullptr ? SharedMediaFrame::from_message(message) : SharedMediaFrame{};
     switch (static_cast<MessageTypeId>(message.message_type_id)) {
         case MessageTypeId::Audio:
             if (media_ingest_ != nullptr) media_ingest_->on_audio_message(stream_key, message);
             if (recorder_ != nullptr) recorder_->on_audio(message);
-            if (live_fanout_ != nullptr) live_fanout_->on_audio(stream_key, message);
+            if (live_fanout_ != nullptr) live_fanout_->on_audio(it->second.stream_id, frame);
             break;
         case MessageTypeId::Video:
             if (media_ingest_ != nullptr) media_ingest_->on_video_message(stream_key, message);
             if (recorder_ != nullptr) recorder_->on_video(message);
-            if (live_fanout_ != nullptr) live_fanout_->on_video(stream_key, message);
+            if (live_fanout_ != nullptr) live_fanout_->on_video(it->second.stream_id, frame);
             break;
         case MessageTypeId::Amf0Data:
             if (media_ingest_ != nullptr) media_ingest_->on_metadata_message(stream_key, message);
             if (recorder_ != nullptr) recorder_->on_metadata(message);
-            if (live_fanout_ != nullptr) live_fanout_->on_metadata(stream_key, message);
+            if (live_fanout_ != nullptr) live_fanout_->on_metadata(it->second.stream_id, frame);
             break;
         default:
             break;
@@ -262,6 +306,7 @@ void CommandSession::handle_publish(const Amf0Command& command, std::uint32_t me
     auto& slot = streams_[message_stream_id];
     slot.state = NetStreamState::Publishing;
     slot.stream_key = stream_key;
+    slot.stream_id = stream_id_registry_->resolve(app_name_, stream_key);
 
     send_status(message_stream_id, "status", "NetStream.Publish.Start",
                  "Publishing " + stream_key + ".");
@@ -278,17 +323,15 @@ void CommandSession::handle_play(const Amf0Command& command, std::uint32_t messa
     auto& slot = streams_[message_stream_id];
     slot.state = NetStreamState::Playing;
     slot.stream_key = stream_key;
+    slot.stream_id = stream_id_registry_->resolve(app_name_, stream_key);
 
     send_status(message_stream_id, "status", "NetStream.Play.Start", "Started playing " + stream_key + ".");
 
     if (live_fanout_ != nullptr && !stream_key.empty()) {
-        auto relay = std::make_unique<PlaybackRelay>(*this, message_stream_id);
-        // Address of the relay is unique for as long as it lives (one per
-        // subscription), so it doubles as a globally-unique subscriber ID
-        // without needing a separate ID allocator shared across sessions.
-        auto subscriber_id = reinterpret_cast<std::uint64_t>(relay.get());
+        auto subscriber_id = SubscriberId::next();
+        auto relay = std::make_unique<PlaybackRelay>(*this, message_stream_id, playback_queue_limits_, subscriber_id);
         playback_relays_[message_stream_id] = std::move(relay);
-        live_fanout_->subscribe(stream_key, subscriber_id, playback_relays_[message_stream_id].get());
+        live_fanout_->subscribe(slot.stream_id, subscriber_id, playback_relays_[message_stream_id].get());
     }
 }
 
@@ -302,12 +345,12 @@ void CommandSession::handle_delete_stream(const Amf0Command& command) {
     if (it->second.state == NetStreamState::Publishing && !it->second.stream_key.empty()) {
         registry_.unregister_publisher(it->second.stream_key, connection_id_);
         if (recorder_ != nullptr) recorder_->finalize();
-        if (live_fanout_ != nullptr) live_fanout_->publisher_stopped(it->second.stream_key);
+        if (live_fanout_ != nullptr) live_fanout_->publisher_stopped(it->second.stream_id);
         if (publish_stop_handler_) publish_stop_handler_(it->second.stream_key, connection_id_);
     } else if (it->second.state == NetStreamState::Playing && !it->second.stream_key.empty()) {
         auto relay_it = playback_relays_.find(stream_id);
         if (live_fanout_ != nullptr && relay_it != playback_relays_.end()) {
-            live_fanout_->unsubscribe(it->second.stream_key, reinterpret_cast<std::uint64_t>(relay_it->second.get()));
+            live_fanout_->unsubscribe(it->second.stream_id, relay_it->second->subscriber_id());
         }
         playback_relays_.erase(stream_id);
     }
@@ -319,12 +362,12 @@ void CommandSession::on_connection_closed() {
         if (slot.state == NetStreamState::Publishing && !slot.stream_key.empty()) {
             registry_.unregister_publisher(slot.stream_key, connection_id_);
             if (recorder_ != nullptr) recorder_->finalize();
-            if (live_fanout_ != nullptr) live_fanout_->publisher_stopped(slot.stream_key);
+            if (live_fanout_ != nullptr) live_fanout_->publisher_stopped(slot.stream_id);
             if (publish_stop_handler_) publish_stop_handler_(slot.stream_key, connection_id_);
         } else if (slot.state == NetStreamState::Playing && !slot.stream_key.empty()) {
             auto relay_it = playback_relays_.find(stream_id);
             if (live_fanout_ != nullptr && relay_it != playback_relays_.end()) {
-                live_fanout_->unsubscribe(slot.stream_key, reinterpret_cast<std::uint64_t>(relay_it->second.get()));
+                live_fanout_->unsubscribe(slot.stream_id, relay_it->second->subscriber_id());
             }
         }
     }

@@ -8,7 +8,10 @@ namespace rtmp_server::management {
 namespace {
 
 using protocol::commands::LiveFanout;
+using protocol::commands::StreamId;
+using protocol::commands::StreamIdRegistry;
 using protocol::commands::StreamRegistry;
+using protocol::commands::SubscriberId;
 
 StreamManager::Options test_options() {
     StreamManager::Options options;
@@ -160,10 +163,12 @@ TEST_F(StreamManagerTest, LiveStateReflectsPublishStatusAndViewerCount) {
 
     StreamRegistry registry;
     LiveFanout fanout;
+    StreamIdRegistry stream_ids;
     ASSERT_TRUE(registry.register_publisher("live", live_created.stream_key, 42, 1));
-    fanout.subscribe(live_created.stream_key, /*subscriber_id=*/1, nullptr);
+    StreamId id = stream_ids.resolve("live", live_created.stream_key);
+    fanout.subscribe(id, SubscriberId::next(), nullptr);
 
-    auto states = manager.live_state(registry, fanout);
+    auto states = manager.live_state(registry, fanout, stream_ids);
     ASSERT_EQ(states.size(), 2u);
 
     for (const auto& state : states) {

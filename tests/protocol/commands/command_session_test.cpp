@@ -34,6 +34,7 @@ std::vector<Amf0Value> decode_outgoing(const RtmpMessage& msg) {
 class CommandSessionTest : public ::testing::Test {
 protected:
     StreamRegistry registry;
+    StreamIdRegistry stream_ids;
     std::vector<RtmpMessage> outgoing;
 
     // Default: only "good-key" is authorized. Individual tests may replace
@@ -41,7 +42,7 @@ protected:
     CommandSession make_session(StreamKeyValidator validator = [](std::string_view, std::string_view key) {
         return key == "good-key";
     }) {
-        CommandSession session(/*connection_id=*/42, registry, std::move(validator));
+        CommandSession session(/*connection_id=*/42, registry, std::move(validator), &stream_ids);
         session.set_outgoing_handler([this](RtmpMessage m) { outgoing.push_back(std::move(m)); });
         return session;
     }
@@ -165,7 +166,7 @@ TEST_F(CommandSessionTest, SecondPublisherForSameKeyIsRejected) {
 
     std::vector<RtmpMessage> outgoing2;
     CommandSession session2(/*connection_id=*/99, registry,
-                             [](std::string_view, std::string_view key) { return key == "good-key"; });
+                             [](std::string_view, std::string_view key) { return key == "good-key"; }, &stream_ids);
     session2.set_outgoing_handler([&outgoing2](RtmpMessage m) { outgoing2.push_back(std::move(m)); });
     session2.handle_message(make_command(0, {Amf0Value::string("connect"), Amf0Value::number(1),
                                               Amf0Value::object({{"app", Amf0Value::string("live")}})}));
@@ -393,7 +394,7 @@ TEST_F(CommandSessionTest, OneViewerReceivesFannedOutMedia) {
 
     std::vector<RtmpMessage> viewer_outgoing;
     CommandSession viewer(/*connection_id=*/7, registry,
-                           [](std::string_view, std::string_view) { return true; });
+                           [](std::string_view, std::string_view) { return true; }, &stream_ids);
     viewer.set_outgoing_handler([&viewer_outgoing](RtmpMessage m) { viewer_outgoing.push_back(std::move(m)); });
     viewer.set_live_fanout(&fanout);
     viewer.handle_message(make_command(0, {Amf0Value::string("connect"), Amf0Value::number(1),
@@ -430,7 +431,7 @@ TEST_F(CommandSessionTest, MultipleViewersEachReceiveFannedOutMedia) {
 
     auto subscribe_viewer = [&](std::uint64_t connection_id, std::vector<RtmpMessage>& outgoing_out) {
         auto* viewer = new CommandSession(connection_id, registry,
-                                           [](std::string_view, std::string_view) { return true; });
+                                           [](std::string_view, std::string_view) { return true; }, &stream_ids);
         viewer->set_outgoing_handler([&outgoing_out](RtmpMessage m) { outgoing_out.push_back(std::move(m)); });
         viewer->set_live_fanout(&fanout);
         viewer->handle_message(make_command(0, {Amf0Value::string("connect"), Amf0Value::number(1),
@@ -449,7 +450,7 @@ TEST_F(CommandSessionTest, MultipleViewersEachReceiveFannedOutMedia) {
     std::unique_ptr<CommandSession> viewer1(subscribe_viewer(7, viewer1_outgoing));
     std::unique_ptr<CommandSession> viewer2(subscribe_viewer(8, viewer2_outgoing));
     std::unique_ptr<CommandSession> viewer3(subscribe_viewer(9, viewer3_outgoing));
-    ASSERT_EQ(fanout.subscriber_count("good-key"), 3u);
+    ASSERT_EQ(fanout.subscriber_count(stream_ids.resolve("live", "good-key")), 3u);
 
     publisher.handle_message(make_media(pub_stream_id, MessageTypeId::Video,
                                          {static_cast<std::byte>(0x17), static_cast<std::byte>(0x01)}));
@@ -487,7 +488,7 @@ TEST_F(CommandSessionTest, NewViewerReceivesCachedGopAndSequenceHeaders) {
 
     std::vector<RtmpMessage> viewer_outgoing;
     CommandSession viewer(/*connection_id=*/7, registry,
-                           [](std::string_view, std::string_view) { return true; });
+                           [](std::string_view, std::string_view) { return true; }, &stream_ids);
     viewer.set_outgoing_handler([&viewer_outgoing](RtmpMessage m) { viewer_outgoing.push_back(std::move(m)); });
     viewer.set_live_fanout(&fanout);
     viewer.handle_message(make_command(0, {Amf0Value::string("connect"), Amf0Value::number(1),
@@ -525,7 +526,7 @@ TEST_F(CommandSessionTest, PublisherDisconnectEndsViewerSessionCleanly) {
 
     std::vector<RtmpMessage> viewer_outgoing;
     CommandSession viewer(/*connection_id=*/7, registry,
-                           [](std::string_view, std::string_view) { return true; });
+                           [](std::string_view, std::string_view) { return true; }, &stream_ids);
     viewer.set_outgoing_handler([&viewer_outgoing](RtmpMessage m) { viewer_outgoing.push_back(std::move(m)); });
     viewer.set_live_fanout(&fanout);
     viewer.handle_message(make_command(0, {Amf0Value::string("connect"), Amf0Value::number(1),
@@ -536,12 +537,12 @@ TEST_F(CommandSessionTest, PublisherDisconnectEndsViewerSessionCleanly) {
     viewer.handle_message(make_command(
         view_stream_id, {Amf0Value::string("play"), Amf0Value::number(0), Amf0Value::null(),
                           Amf0Value::string("good-key")}));
-    ASSERT_EQ(fanout.subscriber_count("good-key"), 1u);
+    ASSERT_EQ(fanout.subscriber_count(stream_ids.resolve("live", "good-key")), 1u);
     viewer_outgoing.clear();
 
     publisher.on_connection_closed();
 
-    EXPECT_EQ(fanout.subscriber_count("good-key"), 0u);
+    EXPECT_EQ(fanout.subscriber_count(stream_ids.resolve("live", "good-key")), 0u);
     EXPECT_NE(viewer.stream_state(view_stream_id), NetStreamState::Playing);
     ASSERT_EQ(viewer_outgoing.size(), 1u);
     auto values = decode_outgoing(viewer_outgoing[0]);
@@ -563,7 +564,7 @@ TEST_F(CommandSessionTest, ViewerDisconnectRemovesItFromFanoutSubscriberList) {
                                                             Amf0Value::string("live")}));
 
     CommandSession viewer(/*connection_id=*/7, registry,
-                           [](std::string_view, std::string_view) { return true; });
+                           [](std::string_view, std::string_view) { return true; }, &stream_ids);
     viewer.set_outgoing_handler([](RtmpMessage) {});
     viewer.set_live_fanout(&fanout);
     viewer.handle_message(make_command(0, {Amf0Value::string("connect"), Amf0Value::number(1),
@@ -574,40 +575,17 @@ TEST_F(CommandSessionTest, ViewerDisconnectRemovesItFromFanoutSubscriberList) {
     viewer.handle_message(make_command(
         view_stream_id, {Amf0Value::string("play"), Amf0Value::number(0), Amf0Value::null(),
                           Amf0Value::string("good-key")}));
-    ASSERT_EQ(fanout.subscriber_count("good-key"), 1u);
+    ASSERT_EQ(fanout.subscriber_count(stream_ids.resolve("live", "good-key")), 1u);
 
     viewer.on_connection_closed();
 
-    EXPECT_EQ(fanout.subscriber_count("good-key"), 0u);
+    EXPECT_EQ(fanout.subscriber_count(stream_ids.resolve("live", "good-key")), 0u);
 }
 
-// Sink that always reports failure, to exercise LiveFanout's slow-client
-// eviction independent of CommandSession's own byte-budget policy.
-class AlwaysDropsSink : public PlaybackSink {
-public:
-    int evicted = 0;
-    bool on_audio(const chunk::RtmpMessage&) override { return false; }
-    bool on_video(const chunk::RtmpMessage&) override { return false; }
-    bool on_metadata(const chunk::RtmpMessage&) override { return false; }
-    void on_publisher_stopped() override {}
-    void on_slow_client_evicted() override { ++evicted; }
-};
-
-TEST(LiveFanoutTest, SlowClientIsEvictedAfterMaxConsecutiveDrops) {
-    LiveFanout fanout(/*max_consecutive_drops=*/3);
-    AlwaysDropsSink sink;
-    fanout.subscribe("good-key", /*subscriber_id=*/1, &sink);
-
-    for (int i = 0; i < 3; ++i) {
-        RtmpMessage m;
-        m.message_type_id = static_cast<std::uint8_t>(MessageTypeId::Video);
-        m.payload = {static_cast<std::byte>(0x27), static_cast<std::byte>(0x01)};
-        fanout.on_video("good-key", m);
-    }
-
-    EXPECT_EQ(sink.evicted, 1);
-    EXPECT_EQ(fanout.subscriber_count("good-key"), 0u);
-}
+// Note: LiveFanout's own staged slow-viewer policy (eviction, GOP limits,
+// no-callbacks-under-lock, shared-payload sharing, ...) has a dedicated
+// suite in live_fanout_test.cpp; the tests above only cover CommandSession's
+// wiring into it.
 
 } // namespace
 } // namespace rtmp_server::protocol::commands

@@ -13,6 +13,7 @@
 #include "rtmp_server/protocol/commands/command_session.hpp"
 #include "rtmp_server/protocol/commands/live_fanout.hpp"
 #include "rtmp_server/protocol/commands/recorder_sink.hpp"
+#include "rtmp_server/protocol/commands/stream_ids.hpp"
 #include "rtmp_server/protocol/commands/stream_registry.hpp"
 #include "rtmp_server/protocol/media/media_ingest.hpp"
 
@@ -46,11 +47,13 @@ public:
     using CloseHandler = std::function<void()>; // fatal protocol error -> caller should close the socket
 
     struct Dependencies {
-        commands::StreamRegistry* registry = nullptr;   // required, not owned
-        commands::LiveFanout* live_fanout = nullptr;     // optional, not owned
-        media::MediaIngest* media_ingest = nullptr;      // optional, not owned
-        commands::RecorderSink* recorder = nullptr;      // optional, not owned
-        commands::StreamKeyValidator key_validator;      // optional; defaults to "always allow"
+        commands::StreamRegistry* registry = nullptr;         // required, not owned
+        commands::StreamIdRegistry* stream_id_registry = nullptr; // optional, not owned; falls back to a private one
+        commands::LiveFanout* live_fanout = nullptr;          // optional, not owned
+        media::MediaIngest* media_ingest = nullptr;           // optional, not owned
+        commands::RecorderSink* recorder = nullptr;           // optional, not owned
+        commands::StreamKeyValidator key_validator;           // optional; defaults to "always allow"
+        commands::QueueLimits playback_queue_limits;           // optional; defaults per viewer_queue.hpp
     };
 
     RtmpConnectionSession(std::uint64_t connection_id, Dependencies deps, std::uint32_t max_message_size,

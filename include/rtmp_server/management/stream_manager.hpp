@@ -15,6 +15,7 @@
 #include "rtmp_server/observability/metrics.hpp"
 #include "rtmp_server/persistence/store.hpp"
 #include "rtmp_server/protocol/commands/live_fanout.hpp"
+#include "rtmp_server/protocol/commands/stream_ids.hpp"
 #include "rtmp_server/protocol/commands/stream_registry.hpp"
 
 namespace rtmp_server::management {
@@ -163,9 +164,13 @@ public:
     // One row per known stream: whether it's currently being published
     // (cross-referenced against `registry` the same way disconnect_* is)
     // and its live viewer count (cross-referenced against `fanout`, by the
-    // resolved raw key).
+    // StreamId `stream_ids` resolves the raw key to — LiveFanout is keyed by
+    // StreamId, not the raw stream key string, per docs/v2_promot.md PHASE
+    // 3). If `stream_ids` has never seen this (app, raw key) pair (e.g. no
+    // publisher/viewer has resolved it yet), viewer_count is reported as 0.
     [[nodiscard]] std::vector<LiveState> live_state(const protocol::commands::StreamRegistry& registry,
-                                                     const protocol::commands::LiveFanout& fanout) const;
+                                                     const protocol::commands::LiveFanout& fanout,
+                                                     const protocol::commands::StreamIdRegistry& stream_ids) const;
 
 private:
     struct StreamRecord {

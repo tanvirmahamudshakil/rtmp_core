@@ -58,10 +58,12 @@ RtmpConnectionSession::RtmpConnectionSession(std::uint64_t connection_id, Depend
                         deps.key_validator ? std::move(deps.key_validator)
                                             : commands::StreamKeyValidator([](std::string_view, std::string_view) {
                                                   return true;
-                                              })) {
+                                              }),
+                        deps.stream_id_registry) {
     if (deps.media_ingest != nullptr) command_session_.set_media_ingest(deps.media_ingest);
     if (deps.recorder != nullptr) command_session_.set_recorder(deps.recorder);
     if (deps.live_fanout != nullptr) command_session_.set_live_fanout(deps.live_fanout);
+    command_session_.set_playback_queue_limits(deps.playback_queue_limits);
 
     // Every reply CommandSession decides to send (connect result, publish/
     // play onStatus, playback media, ...) flows out through here, so this is
@@ -98,7 +100,10 @@ void RtmpConnectionSession::set_pending_bytes_provider(std::function<std::size_t
 }
 
 void RtmpConnectionSession::set_max_queued_playback_bytes(std::size_t bytes) {
-    command_session_.set_max_queued_playback_bytes(bytes);
+    // Preserved for API compatibility: maps onto the new staged ViewerQueue
+    // policy's byte cap, leaving its packet cap at the default (see
+    // command_session.hpp set_playback_queue_limits / viewer_queue.hpp).
+    command_session_.set_playback_queue_limits(commands::QueueLimits{bytes, commands::QueueLimits{}.max_packets});
 }
 
 void RtmpConnectionSession::fail(std::string_view /*reason*/) {

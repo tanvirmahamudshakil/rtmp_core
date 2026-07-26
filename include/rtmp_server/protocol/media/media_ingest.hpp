@@ -168,4 +168,25 @@ private:
 [[nodiscard]] core::Result<AvcSequenceHeader> parse_avc_sequence_header(std::span<const std::byte> payload);
 [[nodiscard]] core::Result<AacSequenceHeader> parse_aac_sequence_header(std::span<const std::byte> payload);
 
+// Pure (no state mutation) classification of one raw FLV video/audio tag,
+// factored out of MediaIngest::on_video_message/on_audio_message so other
+// components (protocol::commands::LiveFanout's keyframe/sequence-header
+// detection, docs/v2_promot.md PHASE 3) reuse the exact same bit-parsing
+// instead of re-deriving it a second time. Returns std::nullopt for an
+// empty/too-short payload (the caller decides how to treat that — MediaIngest
+// counts it as rejected, LiveFanout simply treats it as "not a keyframe/not a
+// sequence header").
+struct VideoTagInfo {
+    VideoFrameType frame_type = VideoFrameType::Unknown;
+    VideoCodec codec = VideoCodec::Unknown;
+    std::optional<AvcPacketType> avc_packet_type; // set only when codec == Avc and payload carries the byte
+};
+struct AudioTagInfo {
+    AudioCodec codec = AudioCodec::Unknown;
+    std::optional<AacPacketType> aac_packet_type; // set only when codec == Aac and payload carries the byte
+};
+
+[[nodiscard]] std::optional<VideoTagInfo> classify_video_tag(std::span<const std::byte> payload);
+[[nodiscard]] std::optional<AudioTagInfo> classify_audio_tag(std::span<const std::byte> payload);
+
 } // namespace rtmp_server::protocol::media

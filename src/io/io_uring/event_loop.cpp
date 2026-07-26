@@ -22,7 +22,11 @@ using network::TcpConnection;
 IoUringEventLoop::IoUringEventLoop(IoUringContext context, core::ServerConfig config)
     : context_(std::move(context)),
       config_(std::move(config)),
-      receive_pool_(config_.provided_buffer_count, config_.provided_buffer_size) {}
+      receive_pool_(config_.provided_buffer_count, config_.provided_buffer_size),
+      live_fanout_(protocol::commands::GopLimits{config_.gop_cache_max_bytes, config_.gop_cache_max_packets,
+                                                  config_.gop_cache_max_duration},
+                   protocol::commands::QueueLimits{config_.subscriber_queue_max_bytes,
+                                                    config_.subscriber_queue_max_packets}) {}
 
 core::Result<void> IoUringEventLoop::run() {
     int fd = ::socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
@@ -448,7 +452,10 @@ void IoUringEventLoop::start_rtmp_session(const std::shared_ptr<TcpConnection>& 
                                            std::vector<std::byte> trailing_bytes) {
     protocol::session::RtmpConnectionSession::Dependencies deps;
     deps.registry = &stream_registry_;
+    deps.stream_id_registry = &stream_id_registry_;
     deps.live_fanout = &live_fanout_;
+    deps.playback_queue_limits =
+        protocol::commands::QueueLimits{config_.subscriber_queue_max_bytes, config_.subscriber_queue_max_packets};
 
     auto session = std::make_unique<protocol::session::RtmpConnectionSession>(
         connection->connection_id(), deps, config_.maximum_rtmp_message_size, config_.output_chunk_size);

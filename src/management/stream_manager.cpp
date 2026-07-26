@@ -410,7 +410,8 @@ core::Result<void> StreamManager::disconnect_viewers(std::string_view applicatio
 }
 
 std::vector<LiveState> StreamManager::live_state(const protocol::commands::StreamRegistry& registry,
-                                                  const protocol::commands::LiveFanout& fanout) const {
+                                                  const protocol::commands::LiveFanout& fanout,
+                                                  const protocol::commands::StreamIdRegistry& stream_ids) const {
     std::lock_guard<std::mutex> lock(mutex_);
     std::vector<LiveState> out;
     for (const auto& [app_name, app_record] : applications_) {
@@ -420,7 +421,11 @@ std::vector<LiveState> StreamManager::live_state(const protocol::commands::Strea
             state.name = stream_name;
             auto raw_key = resolve_live_key_locked(app_name, record, registry);
             state.is_live = raw_key.has_value();
-            state.viewer_count = raw_key ? fanout.subscriber_count(*raw_key) : 0;
+            state.viewer_count = 0;
+            if (raw_key) {
+                auto id = stream_ids.find(app_name, *raw_key);
+                if (id) state.viewer_count = fanout.subscriber_count(*id);
+            }
             out.push_back(std::move(state));
         }
     }

@@ -113,6 +113,29 @@ Result<AacSequenceHeader> parse_aac_sequence_header(std::span<const std::byte> p
     return header;
 }
 
+std::optional<VideoTagInfo> classify_video_tag(std::span<const std::byte> payload) {
+    if (payload.empty()) return std::nullopt;
+    auto tag = static_cast<std::uint8_t>(payload[0]);
+    VideoTagInfo info;
+    info.frame_type = static_cast<VideoFrameType>(tag >> 4);
+    info.codec = static_cast<VideoCodec>(tag & 0x0F);
+    if (info.codec == VideoCodec::Avc && payload.size() > 1) {
+        info.avc_packet_type = static_cast<AvcPacketType>(payload[1]);
+    }
+    return info;
+}
+
+std::optional<AudioTagInfo> classify_audio_tag(std::span<const std::byte> payload) {
+    if (payload.empty()) return std::nullopt;
+    auto tag = static_cast<std::uint8_t>(payload[0]);
+    AudioTagInfo info;
+    info.codec = static_cast<AudioCodec>(tag >> 4);
+    if (info.codec == AudioCodec::Aac && payload.size() > 1) {
+        info.aac_packet_type = static_cast<AacPacketType>(payload[1]);
+    }
+    return info;
+}
+
 StreamMediaState& MediaIngest::state_for(std::string_view stream_key) {
     auto [it, inserted] = streams_.try_emplace(std::string(stream_key));
     return it->second;
@@ -133,8 +156,8 @@ Result<void> MediaIngest::on_audio_message(std::string_view stream_key, const ch
         return malformed("audio message has an empty payload");
     }
 
-    auto tag = static_cast<std::uint8_t>(message.payload[0]);
-    auto codec = static_cast<AudioCodec>(tag >> 4);
+    auto info = classify_audio_tag(message.payload);
+    auto codec = info->codec;
     state.audio_codec = codec;
 
     state.stats.audio_message_count++;
@@ -152,7 +175,7 @@ Result<void> MediaIngest::on_audio_message(std::string_view stream_key, const ch
         return malformed("AAC audio tag missing the AACPacketType byte");
     }
 
-    auto packet_type = static_cast<AacPacketType>(message.payload[1]);
+    auto packet_type = *info->aac_packet_type;
     if (packet_type != AacPacketType::SequenceHeader) {
         return {}; // raw AAC frame, nothing to retain
     }
@@ -176,9 +199,9 @@ Result<void> MediaIngest::on_video_message(std::string_view stream_key, const ch
         return malformed("video message has an empty payload");
     }
 
-    auto tag = static_cast<std::uint8_t>(message.payload[0]);
-    auto frame_type = static_cast<VideoFrameType>(tag >> 4);
-    auto codec = static_cast<VideoCodec>(tag & 0x0F);
+    auto info = classify_video_tag(message.payload);
+    auto frame_type = info->frame_type;
+    auto codec = info->codec;
     state.video_codec = codec;
 
     state.stats.video_message_count++;
@@ -201,7 +224,7 @@ Result<void> MediaIngest::on_video_message(std::string_view stream_key, const ch
         return malformed("AVC video tag missing AVCPacketType/composition-time header");
     }
 
-    auto packet_type = static_cast<AvcPacketType>(message.payload[1]);
+    auto packet_type = *info->avc_packet_type;
     // Bytes [2,5) are the 24-bit composition time offset — not used by this
     // phase (Playback/timestamp reconciliation is a later concern) but its
     // presence is what the >=5 length check above validates.
