@@ -315,6 +315,20 @@ bool StreamManager::validate_publish_key(std::string_view application, std::stri
     return false;
 }
 
+std::optional<std::string> StreamManager::resolve_stream_name_for_key(std::string_view application,
+                                                                        std::string_view raw_key) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto app_it = applications_.find(std::string(application));
+    if (app_it == applications_.end() || !app_it->second.enabled) return std::nullopt;
+
+    std::string candidate_hash = core::sha256_hex(raw_key);
+    for (const auto& [name, record] : app_it->second.streams) {
+        if (!record.meta.enabled) continue;
+        if (core::constant_time_equals(record.key_hash, candidate_hash)) return name;
+    }
+    return std::nullopt;
+}
+
 std::string StreamManager::sign_playback_token(std::string_view application, std::string_view name,
                                                 std::int64_t expires_at_unix) const {
     std::lock_guard<std::mutex> lock(mutex_);

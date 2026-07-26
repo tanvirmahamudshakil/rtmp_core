@@ -587,5 +587,102 @@ TEST_F(CommandSessionTest, ViewerDisconnectRemovesItFromFanoutSubscriberList) {
 // suite in live_fanout_test.cpp; the tests above only cover CommandSession's
 // wiring into it.
 
+// --- Phase 5: publish-key -> canonical-name resolver and playback
+// authorizer wiring, exercised directly against CommandSession (the actual
+// RTMP command path), not just the authentication::RtmpAuthenticator unit
+// that builds these callbacks in production.
+
+TEST_F(CommandSessionTest, ResolverRewritesFanOutIdentityFromKeyToPublicName) {
+    auto session = make_session();
+    session.set_stream_id_resolver(
+        [](std::string_view, std::string_view key) -> std::optional<std::string> {
+            return key == "good-key" ? std::optional<std::string>("public-alpha") : std::nullopt;
+        });
+
+    session.handle_message(make_command(0, {Amf0Value::string("connect"), Amf0Value::number(1),
+                                              Amf0Value::object({{"app", Amf0Value::string("live")}})}));
+    session.handle_message(make_command(0, {Amf0Value::string("createStream"), Amf0Value::number(2),
+                                              Amf0Value::null()}));
+    session.handle_message(
+        make_command(1, {Amf0Value::string("publish"), Amf0Value::number(0), Amf0Value::null(),
+                          Amf0Value::string("good-key")}));
+
+    // The registry must know the stream under the resolved public name, not
+    // the raw secret key.
+    EXPECT_TRUE(registry.find("public-alpha").has_value());
+    EXPECT_FALSE(registry.find("good-key").has_value());
+}
+
+TEST_F(CommandSessionTest, ResolverRejectingAnAlreadyValidatedKeyFailsThePublish) {
+    auto session = make_session();
+    session.set_stream_id_resolver(
+        [](std::string_view, std::string_view) -> std::optional<std::string> { return std::nullopt; });
+
+    session.handle_message(make_command(0, {Amf0Value::string("connect"), Amf0Value::number(1),
+                                              Amf0Value::object({{"app", Amf0Value::string("live")}})}));
+    session.handle_message(make_command(0, {Amf0Value::string("createStream"), Amf0Value::number(2),
+                                              Amf0Value::null()}));
+    outgoing.clear();
+    session.handle_message(
+        make_command(1, {Amf0Value::string("publish"), Amf0Value::number(0), Amf0Value::null(),
+                          Amf0Value::string("good-key")}));
+
+    ASSERT_EQ(outgoing.size(), 1u);
+    auto values = decode_outgoing(outgoing.back());
+    ASSERT_GE(values.size(), 4u);
+    EXPECT_EQ(values[3].find("code")->as_string(), "NetStream.Publish.BadName");
+}
+
+TEST_F(CommandSessionTest, PlaybackAuthorizerCanRejectAPlayRequest) {
+    auto session = make_session();
+    bool authorizer_called = false;
+    session.set_playback_authorizer(
+        [&](std::string_view app, std::string_view name, std::string_view query, std::string_view ip) {
+            authorizer_called = true;
+            EXPECT_EQ(app, "live");
+            EXPECT_EQ(name, "alpha");
+            EXPECT_EQ(query, "token=abc&expires=123");
+            EXPECT_EQ(ip, "198.51.100.7");
+            return false;
+        });
+    session.set_client_ip("198.51.100.7");
+
+    session.handle_message(make_command(0, {Amf0Value::string("connect"), Amf0Value::number(1),
+                                              Amf0Value::object({{"app", Amf0Value::string("live")}})}));
+    session.handle_message(make_command(0, {Amf0Value::string("createStream"), Amf0Value::number(2),
+                                              Amf0Value::null()}));
+    outgoing.clear();
+    session.handle_message(make_command(
+        1, {Amf0Value::string("play"), Amf0Value::number(0), Amf0Value::null(),
+            Amf0Value::string("alpha?token=abc&expires=123")}));
+
+    EXPECT_TRUE(authorizer_called);
+    ASSERT_EQ(outgoing.size(), 1u);
+    auto values = decode_outgoing(outgoing.back());
+    ASSERT_GE(values.size(), 4u);
+    EXPECT_EQ(values[3].find("code")->as_string(), "NetStream.Play.Failed");
+}
+
+TEST_F(CommandSessionTest, PlaybackAuthorizerAllowingAPlayRequestStripsTheQueryFromTheStreamKey) {
+    auto session = make_session();
+    session.set_playback_authorizer(
+        [](std::string_view, std::string_view, std::string_view, std::string_view) { return true; });
+
+    session.handle_message(make_command(0, {Amf0Value::string("connect"), Amf0Value::number(1),
+                                              Amf0Value::object({{"app", Amf0Value::string("live")}})}));
+    session.handle_message(make_command(0, {Amf0Value::string("createStream"), Amf0Value::number(2),
+                                              Amf0Value::null()}));
+    outgoing.clear();
+    session.handle_message(make_command(
+        1, {Amf0Value::string("play"), Amf0Value::number(0), Amf0Value::null(),
+            Amf0Value::string("alpha?token=abc&expires=123")}));
+
+    ASSERT_EQ(outgoing.size(), 1u);
+    auto values = decode_outgoing(outgoing.back());
+    ASSERT_GE(values.size(), 4u);
+    EXPECT_EQ(values[3].find("code")->as_string(), "NetStream.Play.Start");
+    EXPECT_EQ(session.stream_state(1), NetStreamState::Playing);
+}
+
 } // namespace
 } // namespace rtmp_server::protocol::commands

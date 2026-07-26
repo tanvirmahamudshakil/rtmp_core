@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <optional>
 #include <string>
 #include <unordered_map>
 
@@ -35,6 +36,24 @@ enum class NetStreamState : std::uint8_t {
 // something CommandSession bakes in — mirrors how HandshakeSession and
 // ChunkDecoder take handlers instead of owning transport or timer logic.
 using StreamKeyValidator = std::function<bool(std::string_view app, std::string_view stream_key)>;
+
+// Phase 5 (authentication): resolves an already-`key_validator_`-approved
+// raw publish key to the canonical public stream name it should be
+// registered/fanned-out under, so publishers (secret key) and viewers
+// (public name) converge on one identity instead of the raw key leaking
+// into the fan-out registry. Optional — if unset, `handle_publish` keeps
+// using the raw stream key as the fan-out identity, i.e. pre-Phase-5
+// behaviour (also what every existing CommandSession test still exercises).
+using StreamIdResolver = std::function<std::optional<std::string>(std::string_view app, std::string_view raw_key)>;
+
+// Phase 5 (authentication): gates a `play` request. Called with the
+// application, the parsed public stream name (query string already split
+// off), the raw query string (e.g. "token=...&expires=..."), and the
+// connection's client IP (see set_client_ip). Returning false rejects the
+// play with NetStream.Play.Failed. Optional — if unset, `play` behaves as
+// before Phase 5 (always allowed), matching every existing test.
+using PlaybackAuthorizer =
+    std::function<bool(std::string_view app, std::string_view name, std::string_view query, std::string_view client_ip)>;
 
 // Parsed view of one decoded AMF0 command message (type 20). Exposed
 // mainly for tests; CommandSession::handle_message() does this parsing
@@ -110,6 +129,21 @@ public:
     // no-op convention every other optional collaborator here follows. See
     // docs/rtmp-playback.md.
     void set_live_fanout(LiveFanout* live_fanout) { live_fanout_ = live_fanout; }
+
+    // Injects the Phase 5 publish-key -> canonical-stream-name resolver.
+    // See StreamIdResolver's doc comment above.
+    void set_stream_id_resolver(StreamIdResolver resolver) { stream_id_resolver_ = std::move(resolver); }
+
+    // Injects the Phase 5 playback authorizer (signed-token validation,
+    // enabled-state checks, viewer/IP limits). See PlaybackAuthorizer's doc
+    // comment above.
+    void set_playback_authorizer(PlaybackAuthorizer authorizer) { playback_authorizer_ = std::move(authorizer); }
+
+    // The connection's peer IP, passed through to key_validator_-adjacent
+    // Phase 5 authorization hooks (rate limiting, per-IP limits, token IP
+    // claims). Optional: defaults to empty, which authorization callbacks
+    // should treat as "unknown/unrestricted".
+    void set_client_ip(std::string client_ip) { client_ip_ = std::move(client_ip); }
 
     // Reports this connection's current outbound byte backlog (e.g. a
     // TcpConnection's queued-but-unsent bytes). Optional: if never set,
@@ -195,6 +229,9 @@ private:
     media::MediaIngest* media_ingest_ = nullptr;
     RecorderSink* recorder_ = nullptr;
     LiveFanout* live_fanout_ = nullptr;
+    StreamIdResolver stream_id_resolver_;
+    PlaybackAuthorizer playback_authorizer_;
+    std::string client_ip_;
     PendingBytesProvider pending_bytes_provider_;
     QueueLimits playback_queue_limits_;
 

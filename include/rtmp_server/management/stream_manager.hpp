@@ -117,6 +117,18 @@ public:
     // by design (docs/rtmp_promot.md "do not allow key enumeration").
     [[nodiscard]] bool validate_publish_key(std::string_view application, std::string_view raw_key) const;
 
+    // Phase 5 (authentication): resolves a raw publish key to the public
+    // stream `name` it belongs to, iff `application`/`raw_key` are known and
+    // enabled — the canonical identifier both the publish path (via this
+    // resolver) and the playback path (the public name passed to `play`)
+    // converge on, so a stream is fanned out under one identity regardless
+    // of which credential a client used (docs/v2_promot.md Phase 5 item 4:
+    // "publish key and public stream name... map to the same internal
+    // stream ID"). Unknown/disabled key or application: std::nullopt —
+    // indistinguishable from "wrong key" by design (no key enumeration).
+    [[nodiscard]] std::optional<std::string> resolve_stream_name_for_key(std::string_view application,
+                                                                          std::string_view raw_key) const;
+
     [[nodiscard]] std::string sign_playback_token(std::string_view application, std::string_view name,
                                                    std::int64_t expires_at_unix) const;
     [[nodiscard]] core::Result<void> verify_playback_token(std::string_view application, std::string_view name,

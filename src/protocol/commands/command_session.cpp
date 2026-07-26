@@ -295,7 +295,25 @@ void CommandSession::handle_publish(const Amf0Command& command, std::uint32_t me
         return;
     }
 
-    bool registered = registry_.register_publisher(app_name_, stream_key, connection_id_, message_stream_id);
+    // Phase 5: converge the secret publish key and the public playback name
+    // on one fan-out identity. If a resolver is wired, register/fan out
+    // under the resolved public name instead of the raw secret key so a
+    // stream published with `key` and played back by public `name` are the
+    // same internal stream, and the secret key never appears in the live
+    // fan-out registry or subscriber-facing state. Without a resolver
+    // (unset in every pre-Phase-5 test), behaviour is unchanged.
+    std::string canonical_id = stream_key;
+    if (stream_id_resolver_) {
+        auto resolved = stream_id_resolver_(app_name_, stream_key);
+        if (!resolved) {
+            send_status(message_stream_id, "error", "NetStream.Publish.BadName",
+                         "Stream key rejected or missing.");
+            return;
+        }
+        canonical_id = *resolved;
+    }
+
+    bool registered = registry_.register_publisher(app_name_, canonical_id, connection_id_, message_stream_id);
     if (!registered) {
         // Someone else is already publishing this key.
         send_status(message_stream_id, "error", "NetStream.Publish.BadName",
@@ -305,20 +323,40 @@ void CommandSession::handle_publish(const Amf0Command& command, std::uint32_t me
 
     auto& slot = streams_[message_stream_id];
     slot.state = NetStreamState::Publishing;
-    slot.stream_key = stream_key;
-    slot.stream_id = stream_id_registry_->resolve(app_name_, stream_key);
+    slot.stream_key = canonical_id;
+    slot.stream_id = stream_id_registry_->resolve(app_name_, canonical_id);
 
     send_status(message_stream_id, "status", "NetStream.Publish.Start",
                  "Publishing " + stream_key + ".");
 
     if (publish_start_handler_) {
-        auto reg = registry_.find(stream_key);
+        auto reg = registry_.find(canonical_id);
         if (reg) publish_start_handler_(*reg);
     }
 }
 
 void CommandSession::handle_play(const Amf0Command& command, std::uint32_t message_stream_id) {
-    std::string stream_key = command.arguments.empty() ? std::string{} : string_arg(command.arguments[0]);
+    std::string raw_arg = command.arguments.empty() ? std::string{} : string_arg(command.arguments[0]);
+
+    // RTMP play names may carry a query string, e.g.
+    // "mystream?token=<sig>&expires=<unix>" (see docs/rtmp-playback.md /
+    // docs/management-api.md "Playback token"). Split it off before using
+    // the name as the fan-out identity — the query string is never part of
+    // the stream identity itself.
+    std::string stream_key = raw_arg;
+    std::string query;
+    if (auto qpos = raw_arg.find('?'); qpos != std::string::npos) {
+        stream_key = raw_arg.substr(0, qpos);
+        query = raw_arg.substr(qpos + 1);
+    }
+
+    // Phase 5: gate playback on the injected authorizer (signed playback
+    // token validation, stream/app enabled state, viewer/IP limits). Unset
+    // in every pre-Phase-5 test, so behaviour there is unchanged.
+    if (playback_authorizer_ && !playback_authorizer_(app_name_, stream_key, query, client_ip_)) {
+        send_status(message_stream_id, "error", "NetStream.Play.Failed", "Playback not authorized.");
+        return;
+    }
 
     auto& slot = streams_[message_stream_id];
     slot.state = NetStreamState::Playing;
