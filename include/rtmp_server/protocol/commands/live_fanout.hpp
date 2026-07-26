@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -76,9 +77,44 @@ public:
           queue_limits_(queue_limits),
           max_frames_waiting_for_keyframe_(max_frames_waiting_for_keyframe) {}
 
-    void on_audio(StreamId stream_id, const SharedMediaFrame& frame);
-    void on_video(StreamId stream_id, const SharedMediaFrame& frame);
-    void on_metadata(StreamId stream_id, const SharedMediaFrame& frame);
+    // `is_replayed` is true when this frame arrived via the Phase 4
+    // CrossWorkerRouter (i.e. it was ingested by a *different* worker's
+    // LiveFanout and forwarded here so this worker's local subscribers can
+    // see it). Replayed frames are dispatched through the exact same
+    // keyframe/backpressure/sequence-header-cache path as locally-ingested
+    // ones, but never re-invoke the forward hook — otherwise frames would
+    // bounce endlessly between workers.
+    void on_audio(StreamId stream_id, const SharedMediaFrame& frame, bool is_replayed = false);
+    void on_video(StreamId stream_id, const SharedMediaFrame& frame, bool is_replayed = false);
+    void on_metadata(StreamId stream_id, const SharedMediaFrame& frame, bool is_replayed = false);
+
+    // Phase 4 multi-worker hooks (docs/v2_promot.md PHASE 4). Both are
+    // optional; a single-worker embedder (or any existing Phase 1-3 test)
+    // that never calls these simply gets no forwarding/subscription
+    // notifications, unchanged behaviour otherwise.
+    //
+    // ForwardHook is invoked once per locally-ingested (non-replayed)
+    // on_audio/on_video/on_metadata call, after local delivery has already
+    // happened, with is_video/is_audio identifying the frame kind (both
+    // false means metadata). The owning worker's CrossWorkerRouter uses this
+    // to push the frame — once, not per-viewer — into every other worker's
+    // inbound queue that currently has a subscriber for the stream.
+    using ForwardHook =
+        std::function<void(StreamId stream_id, const SharedMediaFrame& frame, bool is_video, bool is_audio)>;
+    void set_forward_hook(ForwardHook hook) { forward_hook_ = std::move(hook); }
+
+    // SubscriptionHook is invoked with delta=+1 from subscribe() and
+    // delta=-1 from unsubscribe() (only when a subscription actually
+    // existed) and from eviction, so the router can maintain an accurate
+    // per-worker subscriber count per stream without polling.
+    using SubscriptionHook = std::function<void(StreamId stream_id, int delta)>;
+    void set_subscription_hook(SubscriptionHook hook) { subscription_hook_ = std::move(hook); }
+
+    // StreamEndHook is invoked from publisher_stopped() so the router can
+    // drop its per-stream subscriber-count bookkeeping for a stream whose
+    // cache was just discarded, rather than leaking stale entries.
+    using StreamEndHook = std::function<void(StreamId stream_id)>;
+    void set_stream_end_hook(StreamEndHook hook) { stream_end_hook_ = std::move(hook); }
 
     // Registers `sink` as a viewer of `stream_id` and immediately replays
     // cached startup state into it: metadata, then video sequence header,
@@ -143,8 +179,13 @@ private:
     // already-locked StreamState, decides per-subscriber delivery via each
     // ViewerQueue, evicts subscribers whose queue gives up on them, then
     // returns the deliveries to run outside the lock.
+    // `stream_id` is used only to notify subscription_hook_ on eviction; the
+    // hook is invoked while state.mutex is still held (it's a lightweight,
+    // non-reentrant counter update, not a PlaybackSink callback, so this
+    // doesn't violate the "never call subscriber code under lock" rule
+    // above — see PlaybackSink's own doc comment).
     std::vector<PendingDelivery> dispatch_locked(StreamState& state, const SharedMediaFrame& frame, bool is_video,
-                                                  bool is_audio, bool is_keyframe);
+                                                  bool is_audio, bool is_keyframe, StreamId stream_id);
 
     void run_deliveries(std::vector<PendingDelivery> deliveries);
 
@@ -153,6 +194,9 @@ private:
     GopLimits gop_limits_;
     QueueLimits queue_limits_;
     std::size_t max_frames_waiting_for_keyframe_;
+    ForwardHook forward_hook_;
+    SubscriptionHook subscription_hook_;
+    StreamEndHook stream_end_hook_;
 };
 
 } // namespace rtmp_server::protocol::commands

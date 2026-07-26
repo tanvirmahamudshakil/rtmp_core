@@ -10,7 +10,11 @@ public_rtmp_hostname: "stream.example.com"
 ring_queue_depth: 1024
 completion_batch_size: 64
 submission_batch_size: 64
-worker_ring_count: 1
+# 0 = auto-detect from hardware concurrency (clamped to max_worker_ring_count
+# below); set explicitly to pin the worker count instead.
+worker_ring_count: 0
+max_worker_ring_count: 64
+worker_cpu_pinning_enabled: false
 
 enable_multishot_accept: true
 enable_multishot_recv: true

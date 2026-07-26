@@ -4,7 +4,9 @@
 #include <liburing.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <poll.h>
 #include <sys/socket.h>
+#include <unistd.h>
 
 #include <cstdint>
 #include <cstdio>
@@ -19,14 +21,37 @@ using observability::LogLevel;
 using network::ConnectionState;
 using network::TcpConnection;
 
-IoUringEventLoop::IoUringEventLoop(IoUringContext context, core::ServerConfig config)
+IoUringEventLoop::IoUringEventLoop(IoUringContext context, core::ServerConfig config,
+                                    protocol::commands::StreamRegistry& stream_registry,
+                                    protocol::commands::StreamIdRegistry& stream_id_registry,
+                                    CrossWorkerRouter::WorkerId worker_id, CrossWorkerRouter* router,
+                                    bool enable_reuseport)
     : context_(std::move(context)),
       config_(std::move(config)),
       receive_pool_(config_.provided_buffer_count, config_.provided_buffer_size),
+      stream_registry_(stream_registry),
+      stream_id_registry_(stream_id_registry),
       live_fanout_(protocol::commands::GopLimits{config_.gop_cache_max_bytes, config_.gop_cache_max_packets,
                                                   config_.gop_cache_max_duration},
                    protocol::commands::QueueLimits{config_.subscriber_queue_max_bytes,
-                                                    config_.subscriber_queue_max_packets}) {}
+                                                    config_.subscriber_queue_max_packets}),
+      worker_id_(worker_id),
+      router_(router),
+      enable_reuseport_(enable_reuseport) {
+    if (router_ != nullptr) {
+        // Lightweight, non-reentrant hooks only — never call back into
+        // LiveFanout from inside them (see live_fanout.hpp's dispatch_locked
+        // comment: the subscription hook can run while state.mutex is held).
+        live_fanout_.set_forward_hook([this](protocol::commands::StreamId stream_id,
+                                              const protocol::commands::SharedMediaFrame& frame, bool is_video,
+                                              bool is_audio) { router_->forward(worker_id_, stream_id, frame, is_video, is_audio); });
+        live_fanout_.set_subscription_hook([this](protocol::commands::StreamId stream_id, int delta) {
+            router_->note_subscription(worker_id_, stream_id, delta);
+        });
+        live_fanout_.set_stream_end_hook(
+            [this](protocol::commands::StreamId stream_id) { router_->on_stream_end(stream_id); });
+    }
+}
 
 core::Result<void> IoUringEventLoop::run() {
     int fd = ::socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
@@ -38,6 +63,14 @@ core::Result<void> IoUringEventLoop::run() {
 
     int reuse = 1;
     ::setsockopt(listener_.get(), SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+    if (enable_reuseport_) {
+        // Phase 4 accept strategy (docs/v2_promot.md): every worker binds
+        // its own listener on the same port with SO_REUSEPORT so the kernel
+        // load-balances new connections across workers, instead of a
+        // central-accept-plus-dispatch design that would need an extra
+        // per-connection inter-worker handoff queue.
+        ::setsockopt(listener_.get(), SOL_SOCKET, SO_REUSEPORT, &reuse, sizeof(reuse));
+    }
 
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
@@ -59,6 +92,7 @@ core::Result<void> IoUringEventLoop::run() {
              {{"address", config_.rtmp_bind_address}, {"port", std::to_string(config_.rtmp_port)}});
 
     submit_accept();
+    if (router_ != nullptr) submit_router_poll();
 
     io_uring_cqe* cqes[64];
     while (true) {
@@ -119,6 +153,9 @@ void IoUringEventLoop::begin_shutdown() {
     if (pending_accept_operation_id_ != 0) {
         cancel_operation(pending_accept_operation_id_);
     }
+    if (pending_router_poll_operation_id_ != 0) {
+        cancel_operation(pending_router_poll_operation_id_);
+    }
 
     // Steps 4/5/8/9/10: close every connection, which cancels its pending
     // receive/send/timeout operations and removes it from the registry.
@@ -139,6 +176,54 @@ void IoUringEventLoop::submit_accept() {
     auto id = operations_.create(std::move(ctx));
     pending_accept_operation_id_ = id;
     ::io_uring_sqe_set_data64(sqe, id);
+}
+
+void IoUringEventLoop::submit_router_poll() {
+    io_uring_sqe* sqe = ::io_uring_get_sqe(&context_.ring());
+    if (sqe == nullptr) {
+        RTMP_LOG(LogLevel::Error, "event_loop", "sqe_exhausted_router_poll", {});
+        return;
+    }
+    ::io_uring_prep_poll_add(sqe, router_->wake_fd(worker_id_), POLLIN);
+
+    OperationContext ctx{OperationType::Wakeup, 0, 0, 0, {}, TimeoutPurpose::None};
+    auto id = operations_.create(std::move(ctx));
+    pending_router_poll_operation_id_ = id;
+    ::io_uring_sqe_set_data64(sqe, id);
+}
+
+void IoUringEventLoop::handle_wakeup_completion(const OperationContext& /*op*/, int result) {
+    if (result >= 0) {
+        // Drain the eventfd counter (best-effort: EAGAIN just means another
+        // forward() raced in and re-signaled after our poll already fired,
+        // which the next poll_add will catch) before draining frames, so a
+        // frame pushed between the read and the re-arm below still wakes us
+        // again rather than being missed.
+        std::uint64_t discard = 0;
+        while (::read(router_->wake_fd(worker_id_), &discard, sizeof(discard)) > 0) {
+        }
+        drain_router_frames();
+    } else if (result != -ECANCELED) {
+        RTMP_LOG(LogLevel::Warn, "event_loop", "router_poll_failed", {{"errno", std::to_string(-result)}});
+    }
+
+    if (!stopping_.load()) submit_router_poll();
+}
+
+void IoUringEventLoop::drain_router_frames() {
+    for (auto& queued : router_->drain(worker_id_)) {
+        switch (queued.kind) {
+            case CrossWorkerRouter::FrameKind::Video:
+                live_fanout_.on_video(queued.stream_id, queued.frame, /*is_replayed=*/true);
+                break;
+            case CrossWorkerRouter::FrameKind::Audio:
+                live_fanout_.on_audio(queued.stream_id, queued.frame, /*is_replayed=*/true);
+                break;
+            case CrossWorkerRouter::FrameKind::Metadata:
+                live_fanout_.on_metadata(queued.stream_id, queued.frame, /*is_replayed=*/true);
+                break;
+        }
+    }
 }
 
 void IoUringEventLoop::submit_receive(std::shared_ptr<TcpConnection> connection) {
@@ -291,6 +376,8 @@ void IoUringEventLoop::process_completion(std::uint64_t operation_id, int result
 
     if (ctx.type == OperationType::Accept) {
         pending_accept_operation_id_ = 0;
+    } else if (ctx.type == OperationType::Wakeup) {
+        pending_router_poll_operation_id_ = 0;
     }
 
     switch (ctx.type) {
@@ -305,6 +392,9 @@ void IoUringEventLoop::process_completion(std::uint64_t operation_id, int result
             break;
         case OperationType::Timeout:
             handle_timeout_completion(ctx, result);
+            break;
+        case OperationType::Wakeup:
+            handle_wakeup_completion(ctx, result);
             break;
         case OperationType::Cancel:
             // The cancel request's own completion — its result (0 on

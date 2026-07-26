@@ -5,11 +5,15 @@
 # split (include/rtmp_server/network vs include/rtmp_server/io/io_uring)
 # still enforces that everything above IAsyncTransport only ever includes
 # rtmp_server/network/async_transport.hpp, never liburing.h directly.
+find_package(Threads REQUIRED)
+
 add_library(rtmp_server_io_uring STATIC
     capabilities.cpp
     context.cpp
+    cross_worker_router.cpp
     event_loop.cpp
     file_sink.cpp
+    worker_pool.cpp
     ${CMAKE_SOURCE_DIR}/src/network/tcp_connection.cpp
 )
 
@@ -24,6 +28,7 @@ target_link_libraries(rtmp_server_io_uring
         rtmp_server_warnings
         rtmp_server_sanitizers
         liburing::liburing
+        Threads::Threads
 )
 
 target_compile_features(rtmp_server_io_uring PUBLIC cxx_std_23)

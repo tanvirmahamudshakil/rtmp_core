@@ -40,7 +40,8 @@ LiveFanout::StreamState& LiveFanout::state_for(StreamId id) {
 }
 
 std::vector<LiveFanout::PendingDelivery> LiveFanout::dispatch_locked(StreamState& state, const SharedMediaFrame& frame,
-                                                                      bool is_video, bool is_audio, bool is_keyframe) {
+                                                                      bool is_video, bool is_audio, bool is_keyframe,
+                                                                      StreamId stream_id) {
     std::vector<PendingDelivery> deliveries;
     std::vector<std::uint64_t> evict_ids;
     deliveries.reserve(state.subscribers.size());
@@ -76,6 +77,7 @@ std::vector<LiveFanout::PendingDelivery> LiveFanout::dispatch_locked(StreamState
         deliveries.push_back(PendingDelivery{it->second.sink, PendingDelivery::Kind::Evict, std::nullopt,
                                               std::nullopt, SharedMediaFrame{}});
         state.subscribers.erase(it);
+        if (subscription_hook_) subscription_hook_(stream_id, -1);
     }
 
     return deliveries;
@@ -102,7 +104,7 @@ void LiveFanout::run_deliveries(std::vector<PendingDelivery> deliveries) {
     }
 }
 
-void LiveFanout::on_video(StreamId stream_id, const SharedMediaFrame& frame) {
+void LiveFanout::on_video(StreamId stream_id, const SharedMediaFrame& frame, bool is_replayed) {
     StreamState& state = state_for(stream_id);
     std::vector<PendingDelivery> deliveries;
     bool is_keyframe = false;
@@ -118,12 +120,13 @@ void LiveFanout::on_video(StreamId stream_id, const SharedMediaFrame& frame) {
                 state.gop_cache.push(frame); // no-op until the first keyframe arrives
             }
         }
-        deliveries = dispatch_locked(state, frame, /*is_video=*/true, /*is_audio=*/false, is_keyframe);
+        deliveries = dispatch_locked(state, frame, /*is_video=*/true, /*is_audio=*/false, is_keyframe, stream_id);
     }
     run_deliveries(std::move(deliveries));
+    if (!is_replayed && forward_hook_) forward_hook_(stream_id, frame, /*is_video=*/true, /*is_audio=*/false);
 }
 
-void LiveFanout::on_audio(StreamId stream_id, const SharedMediaFrame& frame) {
+void LiveFanout::on_audio(StreamId stream_id, const SharedMediaFrame& frame, bool is_replayed) {
     StreamState& state = state_for(stream_id);
     std::vector<PendingDelivery> deliveries;
     {
@@ -133,20 +136,22 @@ void LiveFanout::on_audio(StreamId stream_id, const SharedMediaFrame& frame) {
         } else {
             state.gop_cache.push(frame); // no-op until a video keyframe has started a GOP
         }
-        deliveries = dispatch_locked(state, frame, /*is_video=*/false, /*is_audio=*/true, /*is_keyframe=*/false);
+        deliveries = dispatch_locked(state, frame, /*is_video=*/false, /*is_audio=*/true, /*is_keyframe=*/false, stream_id);
     }
     run_deliveries(std::move(deliveries));
+    if (!is_replayed && forward_hook_) forward_hook_(stream_id, frame, /*is_video=*/false, /*is_audio=*/true);
 }
 
-void LiveFanout::on_metadata(StreamId stream_id, const SharedMediaFrame& frame) {
+void LiveFanout::on_metadata(StreamId stream_id, const SharedMediaFrame& frame, bool is_replayed) {
     StreamState& state = state_for(stream_id);
     std::vector<PendingDelivery> deliveries;
     {
         std::lock_guard<std::mutex> lock(state.mutex);
         state.metadata = frame;
-        deliveries = dispatch_locked(state, frame, /*is_video=*/false, /*is_audio=*/false, /*is_keyframe=*/false);
+        deliveries = dispatch_locked(state, frame, /*is_video=*/false, /*is_audio=*/false, /*is_keyframe=*/false, stream_id);
     }
     run_deliveries(std::move(deliveries));
+    if (!is_replayed && forward_hook_) forward_hook_(stream_id, frame, /*is_video=*/false, /*is_audio=*/false);
 }
 
 void LiveFanout::subscribe(StreamId stream_id, SubscriberId subscriber_id, PlaybackSink* sink) {
@@ -192,6 +197,8 @@ void LiveFanout::subscribe(StreamId stream_id, SubscriberId subscriber_id, Playb
             sink->on_audio(frame);
         }
     }
+
+    if (subscription_hook_) subscription_hook_(stream_id, +1);
 }
 
 void LiveFanout::unsubscribe(StreamId stream_id, SubscriberId subscriber_id) {
@@ -201,8 +208,12 @@ void LiveFanout::unsubscribe(StreamId stream_id, SubscriberId subscriber_id) {
     StreamState& state = *it->second;
     structural_lock.unlock();
 
-    std::lock_guard<std::mutex> lock(state.mutex);
-    state.subscribers.erase(subscriber_id.raw()); // erase() on a missing key is a no-op: idempotent
+    std::size_t erased = 0;
+    {
+        std::lock_guard<std::mutex> lock(state.mutex);
+        erased = state.subscribers.erase(subscriber_id.raw()); // no-op on a missing key: idempotent
+    }
+    if (erased > 0 && subscription_hook_) subscription_hook_(stream_id, -1);
 }
 
 void LiveFanout::publisher_stopped(StreamId stream_id) {
@@ -223,6 +234,8 @@ void LiveFanout::publisher_stopped(StreamId stream_id) {
     sinks.reserve(removed->subscribers.size());
     for (auto& [id, sub] : removed->subscribers) sinks.push_back(sub.sink);
     for (auto* sink : sinks) sink->on_publisher_stopped();
+
+    if (stream_end_hook_) stream_end_hook_(stream_id);
 }
 
 std::size_t LiveFanout::subscriber_count(StreamId stream_id) const {

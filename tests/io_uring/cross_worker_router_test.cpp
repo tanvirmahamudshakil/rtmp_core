@@ -1,0 +1,170 @@
+#include "rtmp_server/io/io_uring/cross_worker_router.hpp"
+
+#include <gtest/gtest.h>
+
+#include <sys/eventfd.h>
+#include <unistd.h>
+
+#include <thread>
+#include <vector>
+
+#include "rtmp_server/core/buffer.hpp"
+#include "rtmp_server/protocol/commands/stream_ids.hpp"
+
+namespace rtmp_server::io::io_uring {
+namespace {
+
+using protocol::commands::StreamId;
+
+SharedMediaFrame make_frame(std::uint32_t timestamp = 0) {
+    SharedMediaFrame frame;
+    frame.payload = core::SharedBuffer::copy_from(std::vector<std::byte>{std::byte{1}, std::byte{2}});
+    frame.timestamp = timestamp;
+    return frame;
+}
+
+bool fd_is_readable(int fd) {
+    std::uint64_t value = 0;
+    ssize_t n = ::read(fd, &value, sizeof(value));
+    return n == static_cast<ssize_t>(sizeof(value));
+}
+
+TEST(CrossWorkerRouterTest, ForwardWithoutSubscribersDoesNothing) {
+    CrossWorkerRouter router(2);
+    StreamId stream = StreamId::next();
+    router.forward(/*source_worker=*/0, stream, make_frame(), /*is_video=*/true, /*is_audio=*/false);
+    EXPECT_TRUE(router.drain(1).empty());
+    EXPECT_EQ(router.dropped_frame_count(), 0u);
+}
+
+TEST(CrossWorkerRouterTest, ForwardsOnlyToWorkersWithSubscribers) {
+    CrossWorkerRouter router(3);
+    StreamId stream = StreamId::next();
+    router.note_subscription(/*worker=*/1, stream, +1);
+
+    router.forward(/*source_worker=*/0, stream, make_frame(), /*is_video=*/true, /*is_audio=*/false);
+
+    auto to_worker_1 = router.drain(1);
+    ASSERT_EQ(to_worker_1.size(), 1u);
+    EXPECT_EQ(to_worker_1[0].kind, CrossWorkerRouter::FrameKind::Video);
+    EXPECT_TRUE(router.drain(2).empty());
+}
+
+TEST(CrossWorkerRouterTest, NeverForwardsBackToSourceWorker) {
+    CrossWorkerRouter router(2);
+    StreamId stream = StreamId::next();
+    router.note_subscription(0, stream, +1);
+    router.note_subscription(1, stream, +1);
+
+    router.forward(/*source_worker=*/0, stream, make_frame(), /*is_video=*/false, /*is_audio=*/true);
+
+    EXPECT_TRUE(router.drain(0).empty());
+    EXPECT_EQ(router.drain(1).size(), 1u);
+}
+
+TEST(CrossWorkerRouterTest, UnsubscribeStopsForwarding) {
+    CrossWorkerRouter router(2);
+    StreamId stream = StreamId::next();
+    router.note_subscription(1, stream, +1);
+    router.note_subscription(1, stream, -1);
+
+    router.forward(0, stream, make_frame(), true, false);
+    EXPECT_TRUE(router.drain(1).empty());
+}
+
+TEST(CrossWorkerRouterTest, SubscriptionCountNeverUnderflowsBelowZero) {
+    CrossWorkerRouter router(2);
+    StreamId stream = StreamId::next();
+    router.note_subscription(1, stream, -1); // no matching +1 yet: must clamp at 0, not wrap
+    router.note_subscription(1, stream, +1);
+
+    router.forward(0, stream, make_frame(), true, false);
+    EXPECT_EQ(router.drain(1).size(), 1u); // exactly one subscriber's worth of forwarding
+}
+
+TEST(CrossWorkerRouterTest, StreamEndClearsSubscriptionBookkeeping) {
+    CrossWorkerRouter router(2);
+    StreamId stream = StreamId::next();
+    router.note_subscription(1, stream, +1);
+    router.on_stream_end(stream);
+
+    router.forward(0, stream, make_frame(), true, false);
+    EXPECT_TRUE(router.drain(1).empty());
+}
+
+TEST(CrossWorkerRouterTest, DropsFramesWhenDestinationQueueIsFull) {
+    CrossWorkerRouter router(2, /*max_queue_frames_per_worker=*/2);
+    StreamId stream = StreamId::next();
+    router.note_subscription(1, stream, +1);
+
+    router.forward(0, stream, make_frame(1), true, false);
+    router.forward(0, stream, make_frame(2), true, false);
+    router.forward(0, stream, make_frame(3), true, false); // over capacity: dropped
+
+    auto drained = router.drain(1);
+    EXPECT_EQ(drained.size(), 2u);
+    EXPECT_EQ(router.dropped_frame_count(), 1u);
+}
+
+TEST(CrossWorkerRouterTest, DrainIsFifoAndClearsQueue) {
+    CrossWorkerRouter router(2);
+    StreamId stream = StreamId::next();
+    router.note_subscription(1, stream, +1);
+
+    router.forward(0, stream, make_frame(1), true, false);
+    router.forward(0, stream, make_frame(2), false, true);
+
+    auto drained = router.drain(1);
+    ASSERT_EQ(drained.size(), 2u);
+    EXPECT_EQ(drained[0].frame.timestamp, 1u);
+    EXPECT_EQ(drained[1].frame.timestamp, 2u);
+
+    EXPECT_TRUE(router.drain(1).empty()); // already drained
+}
+
+TEST(CrossWorkerRouterTest, WakeFdBecomesReadableAfterForward) {
+    CrossWorkerRouter router(2);
+    StreamId stream = StreamId::next();
+    router.note_subscription(1, stream, +1);
+
+    int fd = router.wake_fd(1);
+    ASSERT_GE(fd, 0);
+
+    router.forward(0, stream, make_frame(), true, false);
+    EXPECT_TRUE(fd_is_readable(fd));
+}
+
+TEST(CrossWorkerRouterTest, OutOfRangeWorkerIdsAreIgnoredNotUb) {
+    CrossWorkerRouter router(2);
+    StreamId stream = StreamId::next();
+    router.note_subscription(5, stream, +1); // out of range: ignored
+    router.forward(5, stream, make_frame(), true, false); // out of range source: ignored
+    EXPECT_TRUE(router.drain(5).empty()); // out of range destination: empty, not UB
+    EXPECT_EQ(router.wake_fd(5), -1);
+}
+
+TEST(CrossWorkerRouterTest, ConcurrentForwardAndSubscriptionUpdatesAreThreadSafe) {
+    constexpr std::size_t kWorkers = 4;
+    CrossWorkerRouter router(kWorkers);
+    StreamId stream = StreamId::next();
+    router.note_subscription(1, stream, +1);
+    router.note_subscription(2, stream, +1);
+
+    std::vector<std::thread> threads;
+    for (std::size_t i = 0; i < kWorkers; ++i) {
+        threads.emplace_back([&router, &stream, i] {
+            for (int n = 0; n < 200; ++n) {
+                router.forward(static_cast<CrossWorkerRouter::WorkerId>(i), stream, make_frame(), n % 2 == 0, n % 2 != 0);
+            }
+        });
+    }
+    for (auto& t : threads) t.join();
+
+    // No crash/UB is the primary assertion here; also sanity-check nothing
+    // was forwarded back to worker 0/3 (never subscribed).
+    EXPECT_TRUE(router.drain(0).empty());
+    EXPECT_TRUE(router.drain(3).empty());
+}
+
+} // namespace
+} // namespace rtmp_server::io::io_uring

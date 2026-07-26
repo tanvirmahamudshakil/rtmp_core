@@ -22,7 +22,23 @@ struct ServerConfig {
     std::uint32_t ring_queue_depth = 1024;
     std::uint32_t completion_batch_size = 64;
     std::uint32_t submission_batch_size = 64;
-    std::uint32_t worker_ring_count = 1;
+
+    // Phase 4 (docs/v2_promot.md "Multi-core io_uring worker architecture"):
+    // number of independent IoUringEventLoop workers to run, each with its
+    // own ring/connections/buffers, bound to the same port via
+    // SO_REUSEPORT. 0 means "auto": use std::thread::hardware_concurrency(),
+    // clamped to [1, max_worker_ring_count]. A positive value is used as-is,
+    // also clamped to max_worker_ring_count (task "worker_ring_count
+    // actually control worker creation" + "default based on hardware
+    // concurrency, with a configurable upper bound").
+    std::uint32_t worker_ring_count = 0;
+    std::uint32_t max_worker_ring_count = 64;
+
+    // Pins worker i to CPU (i % hardware_concurrency) via
+    // pthread_setaffinity_np when true. Optional per task 12 ("must not be
+    // mandatory") — default off since pinning can hurt on shared/cloud hosts
+    // with noisy-neighbour scheduling.
+    bool worker_cpu_pinning_enabled = false;
 
     bool enable_multishot_accept = true;
     bool enable_multishot_recv = true;

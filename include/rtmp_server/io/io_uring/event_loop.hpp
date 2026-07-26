@@ -12,6 +12,7 @@
 #include "rtmp_server/core/buffer.hpp"
 #include "rtmp_server/core/config.hpp"
 #include "rtmp_server/io/io_uring/context.hpp"
+#include "rtmp_server/io/io_uring/cross_worker_router.hpp"
 #include "rtmp_server/io/io_uring/operation_registry.hpp"
 #include "rtmp_server/network/tcp_connection.hpp"
 #include "rtmp_server/protocol/commands/live_fanout.hpp"
@@ -27,12 +28,26 @@ namespace rtmp_server::io::io_uring {
 // ConnectionRegistry, one receive BufferPool, and drives accept/receive/
 // send/timeout/cancel completions to their connections.
 //
-// Phase 1 milestone runs exactly one of these on the main thread
-// (docs/architecture.md section 8, Threading Model — worker_ring_count > 1
-// is a later increment on top of this same class).
+// Phase 4 (docs/v2_promot.md "Multi-core io_uring worker architecture"):
+// a process runs `worker_ring_count` of these concurrently, one per
+// std::thread, each with its own ring/connections/buffers/LiveFanout (see
+// WorkerPool). `stream_registry`/`stream_id_registry` are therefore taken
+// by reference — they are the one piece of state genuinely shared
+// process-wide across workers (both are internally mutex-guarded, safe for
+// concurrent access) — while LiveFanout stays a private, single-threaded-
+// per-worker value member; cross-worker media fan-out goes through the
+// optional CrossWorkerRouter instead of a shared LiveFanout (see
+// cross_worker_router.hpp for why: GopCache/ViewerQueue have no locking of
+// their own and must never be touched from more than one thread).
+// A `router` of nullptr (and default worker_id 0 / reuseport false) is
+// exactly the old Phase 1-3 single-worker shape.
 class IoUringEventLoop {
 public:
-    IoUringEventLoop(IoUringContext context, core::ServerConfig config);
+    IoUringEventLoop(IoUringContext context, core::ServerConfig config,
+                      protocol::commands::StreamRegistry& stream_registry,
+                      protocol::commands::StreamIdRegistry& stream_id_registry,
+                      CrossWorkerRouter::WorkerId worker_id = 0, CrossWorkerRouter* router = nullptr,
+                      bool enable_reuseport = false);
 
     IoUringEventLoop(const IoUringEventLoop&) = delete;
     IoUringEventLoop& operator=(const IoUringEventLoop&) = delete;
@@ -114,6 +129,19 @@ private:
     // (docs/rtmp_promot.md "Connection shutdown sequence").
     void cancel_all_operations_for_connection(std::uint64_t connection_id);
 
+    // Phase 4: registers a (re-armed) poll on router_->wake_fd(worker_id_)
+    // so a cross-worker frame pushed by another worker wakes this worker's
+    // own io_uring_submit_and_wait promptly instead of only being picked up
+    // incidentally alongside unrelated local completions. No-op if
+    // router_ is nullptr.
+    void submit_router_poll();
+    void handle_wakeup_completion(const OperationContext& op, int result);
+
+    // Drains every frame router_->drain(worker_id_) currently has queued
+    // and feeds each into this worker's *local* live_fanout_ as a replayed
+    // frame (is_replayed=true — never re-forwarded, see live_fanout.hpp).
+    void drain_router_frames();
+
     IoUringContext context_;
     core::ServerConfig config_;
     core::FileDescriptor listener_;
@@ -129,13 +157,23 @@ private:
     std::unordered_map<std::uint64_t, std::uint64_t> handshake_timeout_operation_ids_;
     server::ConnectionRegistry connections_;
 
-    // Process-wide RTMP stream state (Phase 1): one registry/fanout shared
-    // by every connection's RtmpConnectionSession, mirroring how
-    // ConnectionRegistry is the single shared table of TcpConnections.
-    // Fan-out sharding across workers is a Phase 4 concern, not Phase 1's.
-    protocol::commands::StreamRegistry stream_registry_;
-    protocol::commands::StreamIdRegistry stream_id_registry_;
+    // Process-wide RTMP stream identity tables (Phase 1), shared by
+    // reference across every worker (see WorkerPool) so a publish/playback
+    // name resolves to the same StreamId no matter which worker's ring
+    // accepted the connection. Both are internally mutex-guarded.
+    protocol::commands::StreamRegistry& stream_registry_;
+    protocol::commands::StreamIdRegistry& stream_id_registry_;
+
+    // Per-worker (Phase 4): each worker owns its own LiveFanout — its own
+    // subscriber table and GopCache, touched only from this worker's
+    // thread. Viewers subscribed on a *different* worker than the one
+    // ingesting a given stream are reached via router_ instead (see class
+    // doc comment).
     protocol::commands::LiveFanout live_fanout_;
+    CrossWorkerRouter::WorkerId worker_id_;
+    CrossWorkerRouter* router_;
+    bool enable_reuseport_;
+    std::uint64_t pending_router_poll_operation_id_ = 0;
     std::mutex rtmp_sessions_mutex_;
     std::unordered_map<std::uint64_t, std::unique_ptr<protocol::session::RtmpConnectionSession>>
         rtmp_sessions_;

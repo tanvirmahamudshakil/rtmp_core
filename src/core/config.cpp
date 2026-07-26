@@ -117,9 +117,17 @@ Result<void> ServerConfig::validate() const {
         return Error(ErrorCode::InvalidConfiguration, ErrorCategory::Configuration,
                       "rtmp_port and api_port must differ when bind addresses match");
     }
-    if (ring_queue_depth == 0 || worker_ring_count == 0) {
+    if (ring_queue_depth == 0) {
         return Error(ErrorCode::InvalidConfiguration, ErrorCategory::Configuration,
-                      "ring_queue_depth and worker_ring_count must be positive");
+                      "ring_queue_depth must be positive");
+    }
+    if (max_worker_ring_count == 0) {
+        return Error(ErrorCode::InvalidConfiguration, ErrorCategory::Configuration,
+                      "max_worker_ring_count must be positive");
+    }
+    if (worker_ring_count > max_worker_ring_count) {
+        return Error(ErrorCode::InvalidConfiguration, ErrorCategory::Configuration,
+                      "worker_ring_count must not exceed max_worker_ring_count");
     }
     if (maximum_connections == 0 || maximum_connections_per_ip == 0) {
         return Error(ErrorCode::InvalidConfiguration, ErrorCategory::Configuration,
@@ -190,6 +198,8 @@ Result<ServerConfig> load_config(const std::string& path) {
     u32("completion_batch_size", cfg.completion_batch_size);
     u32("submission_batch_size", cfg.submission_batch_size);
     u32("worker_ring_count", cfg.worker_ring_count);
+    u32("max_worker_ring_count", cfg.max_worker_ring_count);
+    boolean("worker_cpu_pinning_enabled", cfg.worker_cpu_pinning_enabled);
 
     boolean("enable_multishot_accept", cfg.enable_multishot_accept);
     boolean("enable_multishot_recv", cfg.enable_multishot_recv);
