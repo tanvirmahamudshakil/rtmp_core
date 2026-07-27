@@ -8,6 +8,7 @@ add_library(rtmp_server_management STATIC
     token.cpp
     url_builder.cpp
     authorization_cache.cpp
+    query_parser.cpp
 )
 
 target_include_directories(rtmp_server_management PUBLIC

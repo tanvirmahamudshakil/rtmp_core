@@ -13,6 +13,7 @@ add_executable(rtmp_server_protocol_tests
     commands/live_fanout_test.cpp
     commands/stream_ids_test.cpp
     media/media_ingest_test.cpp
+    security_limits_test.cpp
 )
 
 target_link_libraries(rtmp_server_protocol_tests PRIVATE

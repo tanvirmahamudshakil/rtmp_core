@@ -1,33 +1,8 @@
 #include "rtmp_server/authentication/rtmp_authenticator.hpp"
 
-#include <charconv>
+#include "rtmp_server/management/query_parser.hpp"
 
 namespace rtmp_server::authentication {
-
-namespace {
-
-// Minimal "a=b&c=d" query-string parser for playback URLs
-// ("?token=...&expires=..."). Deliberately not a general URL-decoding
-// parser (no percent-decoding) — the values this project puts on the wire
-// (hex signatures, decimal unix timestamps) never need it, and skipping it
-// avoids a whole class of decoding-related bugs on attacker-controlled
-// input for very little value.
-[[nodiscard]] std::unordered_map<std::string, std::string> parse_query(std::string_view query) {
-    std::unordered_map<std::string, std::string> out;
-    std::size_t pos = 0;
-    while (pos < query.size()) {
-        auto amp = query.find('&', pos);
-        std::string_view pair = query.substr(pos, amp == std::string_view::npos ? std::string_view::npos : amp - pos);
-        if (auto eq = pair.find('='); eq != std::string_view::npos) {
-            out.emplace(std::string(pair.substr(0, eq)), std::string(pair.substr(eq + 1)));
-        }
-        if (amp == std::string_view::npos) break;
-        pos = amp + 1;
-    }
-    return out;
-}
-
-} // namespace
 
 RtmpAuthenticator::RtmpAuthenticator(management::StreamManager& manager, AuthenticatorLimits limits)
     : manager_(manager), limits_(limits) {}
@@ -104,17 +79,26 @@ protocol::commands::PlaybackAuthorizer RtmpAuthenticator::playback_authorizer() 
         // it) — enforcing "token absent -> reject" here unconditionally
         // would break every existing open-playback test/deployment that
         // predates Phase 5. See docs/authentication.md.
-        auto fields = parse_query(query);
-        if (auto token_it = fields.find("token"); token_it != fields.end()) {
-            auto expires_it = fields.find("expires");
-            std::int64_t expires_at = 0;
-            if (expires_it != fields.end()) {
-                std::from_chars(expires_it->second.data(), expires_it->second.data() + expires_it->second.size(),
-                                 expires_at);
-            }
+        // Bounded parse (management/query_parser.hpp): the query is
+        // attacker-controlled and previously drove an unbounded map.
+        const auto fields = management::parse_playback_query(query);
+        if (fields.truncated) {
+            // An over-long/over-dense query is never something a legitimate
+            // client sends; fail closed rather than authorize on a partial
+            // parse in which the real token may have been cut off.
+            std::lock_guard<std::mutex> lock(mutex_);
+            record_auth_result_locked(std::string(client_ip), false);
+            return false;
+        }
+        if (fields.token.has_value()) {
+            // A missing/garbled expiry becomes 0, i.e. definitely expired.
+            // That is fail-closed and matches the pre-Phase-8 behaviour; the
+            // parser now distinguishes the two cases so the difference is
+            // visible to future callers even though both reject here.
+            const std::int64_t expires_at = fields.expires_at_unix.value_or(0);
             auto now_unix =
                 std::chrono::duration_cast<std::chrono::seconds>(core::wall_now().time_since_epoch()).count();
-            auto result = manager_.verify_playback_token(app, name, token_it->second, expires_at, now_unix);
+            auto result = manager_.verify_playback_token(app, name, *fields.token, expires_at, now_unix);
             if (!result.ok()) {
                 std::lock_guard<std::mutex> lock(mutex_);
                 record_auth_result_locked(std::string(client_ip), false);
