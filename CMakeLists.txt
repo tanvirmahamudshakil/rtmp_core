@@ -25,6 +25,10 @@ endif()
 option(RTMP_SERVER_BUILD_TESTS "Build unit and integration tests" ON)
 option(RTMP_SERVER_ENABLE_ASAN "Enable AddressSanitizer + UBSan" OFF)
 option(RTMP_SERVER_ENABLE_TSAN "Enable ThreadSanitizer" OFF)
+option(RTMP_SERVER_ENABLE_UBSAN "Enable UndefinedBehaviorSanitizer on its own (ASan already includes it)" OFF)
+# Phase 8: exploit mitigations for deployable builds. Set by the `production`
+# CMake preset; see cmake/Sanitizers.cmake and docs/deployment.md.
+option(RTMP_SERVER_ENABLE_HARDENING "Enable production exploit-mitigation compile/link flags" OFF)
 option(RTMP_SERVER_CORE_ONLY "Only build platform-independent core (no io_uring transport)" OFF)
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_SOURCE_DIR}/cmake")
@@ -39,6 +43,10 @@ rtmp_server_set_warnings(rtmp_server_warnings)
 
 add_library(rtmp_server_sanitizers INTERFACE)
 rtmp_server_set_sanitizers(rtmp_server_sanitizers)
+# Production exploit mitigations ride on the same interface target every
+# library already links, so enabling the `production` preset applies them
+# everywhere without touching each target's CMakeLists.
+rtmp_server_set_hardening(rtmp_server_sanitizers)
 
 add_subdirectory(src/core)
 add_subdirectory(src/protocol)

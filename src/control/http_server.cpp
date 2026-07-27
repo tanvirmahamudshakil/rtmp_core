@@ -8,9 +8,16 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <sys/socket.h>
+#include <poll.h>
 #include <unistd.h>
 
 #include "rtmp_server/observability/logger.hpp"
+
+namespace {
+// Shutdown-latency bound for the accept loop. Short enough that stop() feels
+// immediate to an operator, long enough that an idle server is not spinning.
+constexpr int kAcceptPollTimeoutMs = 100;
+} // namespace
 
 namespace rtmp_server::control {
 
@@ -167,37 +174,39 @@ HttpServer::HttpServer(HttpServerOptions options) : options_(std::move(options))
 HttpServer::~HttpServer() { stop(); }
 
 bool HttpServer::start() {
-    listen_fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
-    if (listen_fd_ < 0) return false;
+    // Built up in a local and published to listen_fd_ only once the socket is
+    // fully bound and listening: nothing may observe a half-initialised
+    // descriptor, and the accept thread does not exist until after the store.
+    const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return false;
 
     int reuse = 1;
-    ::setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+    ::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
 
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_port = htons(options_.port);
     if (::inet_pton(AF_INET, options_.bind_address.c_str(), &addr.sin_addr) != 1) {
-        ::close(listen_fd_);
-        listen_fd_ = -1;
+        ::close(fd);
         return false;
     }
 
-    if (::bind(listen_fd_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
-        ::close(listen_fd_);
-        listen_fd_ = -1;
+    if (::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
+        ::close(fd);
         return false;
     }
-    if (::listen(listen_fd_, options_.listen_backlog) != 0) {
-        ::close(listen_fd_);
-        listen_fd_ = -1;
+    if (::listen(fd, options_.listen_backlog) != 0) {
+        ::close(fd);
         return false;
     }
 
     sockaddr_in bound{};
     socklen_t bound_len = sizeof(bound);
-    if (::getsockname(listen_fd_, reinterpret_cast<sockaddr*>(&bound), &bound_len) == 0) {
+    if (::getsockname(fd, reinterpret_cast<sockaddr*>(&bound), &bound_len) == 0) {
         bound_port_ = ntohs(bound.sin_port);
     }
+
+    listen_fd_.store(fd, std::memory_order_release);
 
     running_.store(true, std::memory_order_release);
     for (std::size_t i = 0; i < options_.worker_threads; ++i) {
@@ -210,12 +219,21 @@ bool HttpServer::start() {
 void HttpServer::stop() {
     if (!running_.exchange(false, std::memory_order_acq_rel)) return;
 
-    if (listen_fd_ >= 0) {
-        ::shutdown(listen_fd_, SHUT_RDWR);
-        ::close(listen_fd_);
-        listen_fd_ = -1;
-    }
+    const int fd = listen_fd_.load(std::memory_order_acquire);
+
+    // Join the accept thread BEFORE closing the listening descriptor. Closing
+    // first (as this did before Phase 8) leaves a window in which the accept
+    // thread is between its running_ check and its accept() call: the
+    // descriptor number can by then have been reused by any other thread in
+    // the process, and the accept would apply to an unrelated file. The
+    // accept loop polls with a timeout, so clearing running_ is sufficient to
+    // make it exit promptly without needing close() as the wakeup mechanism.
     if (accept_thread_.joinable()) accept_thread_.join();
+
+    if (fd >= 0) {
+        listen_fd_.store(-1, std::memory_order_release);
+        ::close(fd);
+    }
 
     {
         std::lock_guard<std::mutex> lock(queue_mutex_);
@@ -231,11 +249,32 @@ void HttpServer::stop() {
 }
 
 void HttpServer::accept_loop() {
+    const int fd = listen_fd_.load(std::memory_order_acquire);
+    if (fd < 0) return;
+
     while (running_.load(std::memory_order_acquire)) {
+        // poll() with a bounded timeout rather than a blocking accept(). A
+        // blocking accept() can only be woken by closing the descriptor out
+        // from under it, which is precisely the unsynchronised close this
+        // loop must avoid; polling makes running_ the single, race-free
+        // shutdown signal and caps shutdown latency at the timeout.
+        pollfd pfd{};
+        pfd.fd = fd;
+        pfd.events = POLLIN;
+        const int ready = ::poll(&pfd, 1, kAcceptPollTimeoutMs);
+        if (ready < 0) {
+            if (errno == EINTR) continue; // signal, not an error
+            break;
+        }
+        if (ready == 0) continue; // timeout: re-check running_
+
         sockaddr_in peer{};
         socklen_t peer_len = sizeof(peer);
-        int client_fd = ::accept(listen_fd_, reinterpret_cast<sockaddr*>(&peer), &peer_len);
+        const int client_fd = ::accept(fd, reinterpret_cast<sockaddr*>(&peer), &peer_len);
         if (client_fd < 0) {
+            // EAGAIN/ECONNABORTED are ordinary: the pending connection was
+            // reset between poll() and accept().
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK || errno == ECONNABORTED) continue;
             if (!running_.load(std::memory_order_acquire)) break;
             continue;
         }
