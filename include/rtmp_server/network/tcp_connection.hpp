@@ -6,6 +6,7 @@
 #include <deque>
 #include <memory>
 #include <mutex>
+#include <string>
 
 #include "rtmp_server/core/buffer.hpp"
 #include "rtmp_server/core/file_descriptor.hpp"
@@ -36,7 +37,7 @@ enum class ConnectionState : std::uint8_t {
 class TcpConnection : public IAsyncTransport, public std::enable_shared_from_this<TcpConnection> {
 public:
     TcpConnection(io::io_uring::IoUringEventLoop& loop, core::FileDescriptor fd,
-                  std::uint64_t connection_id, std::uint64_t generation);
+                  std::uint64_t connection_id, std::uint64_t generation, std::string client_ip = {});
 
     void set_receive_handler(ReceiveHandler handler) override { receive_handler_ = std::move(handler); }
     void set_close_handler(CloseHandler handler) override { close_handler_ = std::move(handler); }
@@ -49,6 +50,7 @@ public:
     [[nodiscard]] int fd() const noexcept { return fd_.get(); }
     [[nodiscard]] std::uint64_t connection_id() const noexcept { return connection_id_; }
     [[nodiscard]] std::uint64_t generation() const noexcept { return generation_; }
+    [[nodiscard]] const std::string& client_ip() const noexcept { return client_ip_; }
     [[nodiscard]] ConnectionState state() const noexcept { return state_.load(); }
     void set_state(ConnectionState state) noexcept { state_.store(state); }
 
@@ -123,6 +125,7 @@ private:
     core::FileDescriptor fd_;
     std::uint64_t connection_id_;
     std::uint64_t generation_;
+    std::string client_ip_;
     std::atomic<ConnectionState> state_{ConnectionState::Accepted};
 
     ReceiveHandler receive_handler_;

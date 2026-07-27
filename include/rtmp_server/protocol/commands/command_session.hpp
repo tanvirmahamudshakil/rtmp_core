@@ -54,6 +54,8 @@ using StreamIdResolver = std::function<std::optional<std::string>(std::string_vi
 // before Phase 5 (always allowed), matching every existing test.
 using PlaybackAuthorizer =
     std::function<bool(std::string_view app, std::string_view name, std::string_view query, std::string_view client_ip)>;
+using ViewerLifecycleHandler =
+    std::function<void(std::string_view app, std::string_view name)>;
 
 // Parsed view of one decoded AMF0 command message (type 20). Exposed
 // mainly for tests; CommandSession::handle_message() does this parsing
@@ -138,6 +140,12 @@ public:
     // enabled-state checks, viewer/IP limits). See PlaybackAuthorizer's doc
     // comment above.
     void set_playback_authorizer(PlaybackAuthorizer authorizer) { playback_authorizer_ = std::move(authorizer); }
+    void set_viewer_attached_handler(ViewerLifecycleHandler handler) {
+        viewer_attached_handler_ = std::move(handler);
+    }
+    void set_viewer_detached_handler(ViewerLifecycleHandler handler) {
+        viewer_detached_handler_ = std::move(handler);
+    }
 
     // The connection's peer IP, passed through to key_validator_-adjacent
     // Phase 5 authorization hooks (rate limiting, per-IP limits, token IP
@@ -231,6 +239,8 @@ private:
     LiveFanout* live_fanout_ = nullptr;
     StreamIdResolver stream_id_resolver_;
     PlaybackAuthorizer playback_authorizer_;
+    ViewerLifecycleHandler viewer_attached_handler_;
+    ViewerLifecycleHandler viewer_detached_handler_;
     std::string client_ip_;
     PendingBytesProvider pending_bytes_provider_;
     QueueLimits playback_queue_limits_;

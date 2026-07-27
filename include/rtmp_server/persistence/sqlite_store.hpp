@@ -1,6 +1,7 @@
 #pragma once
 
 #include <memory>
+#include <mutex>
 #include <string>
 
 #include "rtmp_server/persistence/store.hpp"
@@ -15,10 +16,10 @@ namespace rtmp_server::persistence {
 // SQLite-backed Store — the development/single-node persistence engine
 // (docs/rtmp_promot.md Phase 9 "SQLite development persistence"). Opens (and
 // creates, with `CREATE TABLE IF NOT EXISTS`) a two-table schema
-// (applications, streams) at construction. Not safe for concurrent use from
-// multiple threads without external synchronization (same posture as every
-// other component here — the management layer that owns this already
-// serializes access via StreamManager's own mutex).
+// (applications, streams) at construction. Calls are serialized internally:
+// the management HTTP pool may run a readiness read concurrently with a
+// StreamManager write, and sharing one SQLite connection without this guard
+// would make correctness depend on how the distro compiled libsqlite.
 class SqliteStore : public Store {
 public:
     // `path` may be a filesystem path or ":memory:" for an ephemeral
@@ -44,6 +45,7 @@ private:
     explicit SqliteStore(sqlite3* db) noexcept : db_(db) {}
 
     sqlite3* db_;
+    std::mutex mutex_;
 };
 
 } // namespace rtmp_server::persistence

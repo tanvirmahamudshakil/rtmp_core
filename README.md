@@ -1,105 +1,145 @@
-# rtmp
+# StreamForge RTMP Server
 
-Production-grade raw C++23 RTMP streaming server for Linux, built on `io_uring`.
+A self-hosted C++23 RTMP origin for Linux, built on `io_uring`, with a secure
+web control plane. It accepts OBS/encoder publishing, validates hashed stream
+keys, fans H.264/AAC RTMP media to viewers, persists application and stream
+configuration in SQLite, and exports Prometheus metrics.
 
-> Status: Phase 0 complete (repository inspection, design, scaffolding). No
-> executable code yet — see `docs/architecture.md` and `docs/phase0-checklist.md`.
+This deployment is designed for direct origin delivery. It does not require
+or configure a CDN.
 
-## Project Purpose
+## One-command Linux installation
 
-Accepts RTMP publishing (OBS/encoders), authenticates publishers via stream
-keys and signed tokens, fans a single incoming H.264/AAC stream out to
-multiple RTMP viewers, records to FLV, and exposes a secure HTTP management
-API for applications/streams/tokens/recordings. Pass-through only: no
-encoding, decoding, or transcoding in this phase.
-
-## Architecture Summary
-
-Layered: Management API -> Stream Registry -> Publisher/Subscriber sessions
--> RTMP Protocol Engine (handshake/chunk/AMF0/commands) -> Async Transport
-Layer (`io_uring` only) -> FLV Recorder / Metrics-Logs. Full detail in
-`docs/architecture.md`.
-
-## Supported Features (target, by phase)
-
-See `docs/architecture.md` section 13 for the phase-by-phase build order
-(Phase 1 core+io_uring TCP through Phase 9 persistence+hardening).
-
-## Unsupported Features
-
-Media encoding/decoding/transcoding (H.264, H.265, AV1, AAC), HLS, DASH, SRT,
-WebRTC, RTMPS, clustering, CDN, GPU acceleration — all designed as future
-extension points (`docs/future-roadmap.md`), not implemented here.
-
-## Dependencies
-
-C++23 stdlib, POSIX sockets, `liburing`, CMake, Ninja, Clang/GCC, OpenSSL,
-SQLite (dev) / PostgreSQL (prod), GoogleTest or Catch2, a small JSON library.
-No FFmpeg/libav*, no Boost.Asio, no existing RTMP server source. Full list in
-`docs/rtmp_promot.md`.
-
-## Ubuntu Installation Steps
-
-TODO: filled in once Phase 1 lands (CMake/Ninja/liburing package setup).
-
-## Build Steps
-
-TODO: filled in once Phase 1 lands (`scripts/build-debug.sh`, `scripts/build-release.sh`).
-
-## Run Steps
+Ubuntu 24.04+ or Debian 13+ with systemd:
 
 ```bash
-./rtmp_server --config ./config/server.yaml
+sudo env \
+  RTMP_DOMAIN=stream.example.com \
+  RTMP_BANDWIDTH_MBIT=auto \
+  RTMP_EXPECTED_STREAM_MBIT=2.5 \
+  bash scripts/install-linux.sh
 ```
 
-(target invocation; binary not yet implemented)
+The installer builds the hardened production binary and admin panel, installs
+Caddy with automatic HTTPS, creates an isolated system user, generates
+secrets, configures systemd and conservative kernel networking baselines,
+detects the public network interface, and runs a readiness check.
 
-## Configuration
-
-See `config/server.example.yaml` and `docs/configuration.md`.
-
-## OBS Setup
+`RTMP_BANDWIDTH_MBIT=auto` reads the primary NIC's reported link speed using
+Linux sysfs/ethtool. On virtual VPS interfaces that number can be higher than
+the bandwidth purchased from the provider, so set the committed Mbps
+explicitly whenever it differs. `RTMP_EXPECTED_STREAM_MBIT` remains required
+because bandwidth alone cannot determine viewer count. The installer has no
+fixed 10,000-viewer cap; it calculates limits from:
 
 ```text
-Service: Custom
-Server: rtmp://SERVER_IP:1935/live
-Stream Key: GENERATED_STREAM_KEY
+viewer budget = bandwidth × utilization ÷ (per-viewer bitrate × protocol overhead)
 ```
 
-## Playback Setup
+The default high-density target uses 90% link utilization and 5% overhead;
+both are configurable. The network tune uses CAKE at 95% of the declared
+uplink through 10 Gbps; above that it switches to lower-overhead Linux `fq`
+per-flow pacing so the queue discipline does not become the throughput
+bottleneck.
 
-```text
-rtmp://SERVER_IP:1935/live/STREAM_NAME
+The detected/declared value is written to the installer-owned
+`runtime-config.json`, so the admin dashboard and capacity planner load the
+server bandwidth automatically instead of starting from a hard-coded UI
+value.
+
+After installation:
+
+- Admin credential: `/root/streamforge-credentials.txt`
+- Admin panel: `https://RTMP_DOMAIN`
+- RTMP origin: `rtmp://RTMP_DOMAIN:1935`
+- Service logs: `journalctl -u rtmp-server -f`
+
+## Operator flow
+
+1. Sign in to the admin panel with the generated bearer token.
+2. Create an application such as `live`.
+3. Create a stream and copy its one-time publish key.
+4. Configure OBS:
+
+   ```text
+   Service:    Custom
+   Server:     rtmp://stream.example.com:1935/live
+   Stream Key: <one-time key from the panel>
+   ```
+
+5. Play the public stream:
+
+   ```text
+   rtmp://stream.example.com:1935/live/STREAM_NAME
+   ```
+
+## Capacity reality
+
+Direct delivery is bounded by the lowest of usable NIC bandwidth, CPU/kernel
+send cost, memory/socket queues, and packets per second. A 10 Gbps port cannot
+serve 10,000 viewers at 2.5 Mbps each: even before overhead that would require
+25 Gbps. The admin panel includes a no-CDN capacity calculator, and the repo
+includes `rtmp_load_gen` for measurement on the actual VPS.
+
+Examples with the installer's default 90% utilization and 5% overhead:
+
+| Committed bandwidth | Average per viewer | Calculated viewer budget |
+|---:|---:|---:|
+| 50,000 Mbps | 1.00 Mbps | 42,857 |
+| 50,000 Mbps | 0.85 Mbps | 50,420 |
+| 60,000 Mbps | 0.85 Mbps | 60,504 |
+
+The installer also scales the process connection ceiling, per-worker receive
+buffer pool and systemd file-descriptor limit from the calculated budget.
+
+## Development build
+
+Portable core build (also works on macOS):
+
+```bash
+cmake --preset core-only
+cmake --build --preset core-only
+ctest --preset core-only
 ```
 
-## API Examples
+Production Linux build:
 
-See `docs/control-api.md` (stub, filled in during Phase 8).
+```bash
+cmake --preset production
+cmake --build --preset production
+```
 
-## Testing
+Admin panel:
 
-See `docs/testing.md` and `scripts/run-tests.sh` (stub, filled in from Phase 1 onward).
+```bash
+cd admin
+npm ci
+npm run dev
+```
 
-## Sanitizer Commands
+Append `?demo=1` to the local panel URL for the built-in safe preview dataset.
 
-See `scripts/run-sanitizers.sh` (stub, filled in from Phase 1 onward).
+## Configuration and operations
 
-## Docker Deployment
+- Example configuration: `config/server.example.yaml`
+- Management API: `docs/management-api.md`
+- Deployment, backup and rollback: `docs/deployment.md`
+- Architecture: `docs/architecture.md`
+- Load testing: `scripts/load-test.sh`
 
-See `deploy/docker/` and `docs/deployment.md` (stub, filled in during Phase 9).
+The management API binds to loopback. Caddy is the only public HTTP entry
+point and proxies `/api/*`; the RTMP listener remains a direct TCP service on
+port 1935.
 
-## systemd Deployment
+## Current scope
 
-See `deploy/systemd/` and `docs/deployment.md` (stub, filled in during Phase 9).
+Implemented: RTMP handshake/chunk/AMF0 pipeline, publish/play fan-out, GOP
+cache, slow-viewer backpressure, multi-worker routing, hashed publish keys,
+signed playback tokens, SQLite control state, management HTTP API, metrics,
+audit records, and the Linux deployment stack.
 
-## Security Notes
-
-See `docs/security.md`.
-
-## Troubleshooting
-
-See `docs/troubleshooting.md`.
-
-## Future Roadmap
-
-See `docs/future-roadmap.md`.
+Not included: transcoding, WebRTC, SRT, clustering, multi-node state
+replication, or a CDN. HLS and recording components exist in the library but
+their full production service composition is still separate from the main
+direct-RTMP deployment; the panel persists recording policy but the installer
+leaves global recording disabled.

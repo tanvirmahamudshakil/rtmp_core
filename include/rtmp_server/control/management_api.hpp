@@ -3,9 +3,11 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <functional>
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 #include "rtmp_server/control/http_server.hpp"
 #include "rtmp_server/management/stream_manager.hpp"
@@ -46,6 +48,8 @@ struct ManagementApiOptions {
 // Publisher/ViewerDisconnectHandler doc comment).
 class ManagementApi {
 public:
+    using LiveStateProvider = std::function<std::vector<management::LiveState>()>;
+
     ManagementApi(management::StreamManager& manager, ManagementApiOptions options);
 
     void set_store(persistence::Store* store) { store_ = store; }
@@ -54,6 +58,7 @@ public:
     void set_registry(protocol::commands::StreamRegistry* registry) { registry_ = registry; }
     void set_fanout(protocol::commands::LiveFanout* fanout) { fanout_ = fanout; }
     void set_stream_id_registry(protocol::commands::StreamIdRegistry* stream_ids) { stream_ids_ = stream_ids; }
+    void set_live_state_provider(LiveStateProvider provider) { live_state_provider_ = std::move(provider); }
 
     // Suitable for HttpServer::set_handler directly.
     [[nodiscard]] HttpResponse handle(const HttpRequest& request);
@@ -90,6 +95,7 @@ private:
     protocol::commands::StreamRegistry* registry_ = nullptr;
     protocol::commands::LiveFanout* fanout_ = nullptr;
     protocol::commands::StreamIdRegistry* stream_ids_ = nullptr;
+    LiveStateProvider live_state_provider_;
 
     struct FailureWindow {
         std::size_t count = 0;

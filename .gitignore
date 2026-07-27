@@ -16,4 +16,6 @@ compile_commands.json
 *.db
 *.sqlite3
 recordings/
+node_modules/
+dist/
 .DS_Store

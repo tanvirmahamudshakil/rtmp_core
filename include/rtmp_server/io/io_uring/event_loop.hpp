@@ -1,12 +1,15 @@
 #pragma once
 
 #include <liburing.h>
+#include <sys/socket.h>
 
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
+#include <string_view>
 #include <unordered_map>
 
 #include "rtmp_server/core/buffer.hpp"
@@ -24,6 +27,20 @@
 #include "rtmp_server/server/connection/connection_registry.hpp"
 
 namespace rtmp_server::io::io_uring {
+
+// Process-owned services copied into every RTMP session a worker creates.
+// The callbacks themselves may point at shared, internally synchronized
+// management/authentication state and therefore must outlive the worker.
+struct EventLoopServices {
+    observability::Metrics* metrics = nullptr;
+    protocol::commands::StreamKeyValidator key_validator;
+    protocol::commands::StreamIdResolver stream_id_resolver;
+    protocol::commands::PlaybackAuthorizer playback_authorizer;
+    protocol::commands::ViewerLifecycleHandler viewer_attached_handler;
+    protocol::commands::ViewerLifecycleHandler viewer_detached_handler;
+    std::function<bool(std::string_view)> admit_connection;
+    std::function<void(std::string_view)> release_connection;
+};
 
 // Single-threaded io_uring event loop: owns one IoUringContext, one
 // ConnectionRegistry, one receive BufferPool, and drives accept/receive/
@@ -48,7 +65,7 @@ public:
                       protocol::commands::StreamRegistry& stream_registry,
                       protocol::commands::StreamIdRegistry& stream_id_registry,
                       CrossWorkerRouter::WorkerId worker_id = 0, CrossWorkerRouter* router = nullptr,
-                      bool enable_reuseport = false);
+                      bool enable_reuseport = false, EventLoopServices services = {});
 
     IoUringEventLoop(const IoUringEventLoop&) = delete;
     IoUringEventLoop& operator=(const IoUringEventLoop&) = delete;
@@ -73,6 +90,9 @@ public:
 
     [[nodiscard]] server::ConnectionRegistry& connections() noexcept { return connections_; }
     [[nodiscard]] const IoUringCapabilities& capabilities() const noexcept { return context_.capabilities(); }
+    [[nodiscard]] std::size_t subscriber_count(protocol::commands::StreamId stream_id) const {
+        return live_fanout_.subscriber_count(stream_id);
+    }
 
     // Called by TcpConnection; not part of any external API.
     void submit_receive(std::shared_ptr<network::TcpConnection> connection);
@@ -192,6 +212,7 @@ private:
     CrossWorkerRouter::WorkerId worker_id_;
     CrossWorkerRouter* router_;
     bool enable_reuseport_;
+    EventLoopServices services_;
     std::uint64_t pending_router_poll_operation_id_ = 0;
     std::mutex rtmp_sessions_mutex_;
     std::unordered_map<std::uint64_t, std::unique_ptr<protocol::session::RtmpConnectionSession>>
@@ -202,6 +223,8 @@ private:
     std::uint64_t next_connection_id_ = 1;
     std::uint64_t next_generation_ = 1;
     std::uint64_t pending_accept_operation_id_ = 0;
+    sockaddr_storage accept_address_{};
+    socklen_t accept_address_length_ = sizeof(accept_address_);
 
     // Not a spec-required config key (docs/rtmp_promot.md's Configuration
     // section doesn't list one) — a fixed upper bound on graceful shutdown

@@ -28,6 +28,8 @@ Documentation=file:///usr/share/doc/rtmp-server/deployment.md
 # is configured turns a transient boot ordering issue into a failed unit.
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=60s
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -73,8 +75,6 @@ RestartSec=2s
 # ...but give up after 5 restarts in 60s. A server that cannot stay up is
 # broken (bad config, port in use, missing data directory); silently
 # restarting for ever hides the outage from anyone watching unit state.
-StartLimitIntervalSec=60s
-StartLimitBurst=5
 # Configuration is invalid -> ServerConfig::validate() fails -> EXIT_FAILURE.
 # Restarting cannot fix that, so do not: fail the unit immediately and make
 # the problem visible.

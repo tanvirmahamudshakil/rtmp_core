@@ -441,11 +441,15 @@ HttpResponse ManagementApi::handle_playback_token(std::string_view application, 
 }
 
 HttpResponse ManagementApi::handle_status(std::string_view application, std::string_view name) {
-    if (registry_ == nullptr || fanout_ == nullptr || stream_ids_ == nullptr) {
+    std::vector<management::LiveState> states;
+    if (live_state_provider_) {
+        states = live_state_provider_();
+    } else if (registry_ != nullptr && fanout_ != nullptr && stream_ids_ != nullptr) {
+        states = manager_.live_state(*registry_, *fanout_, *stream_ids_);
+    } else {
         return HttpResponse::json(503, error_body("state_source_unavailable",
                                                     "publisher/viewer state source not wired", ""));
     }
-    auto states = manager_.live_state(*registry_, *fanout_, *stream_ids_);
     for (const auto& state : states) {
         if (state.application == application && state.name == name) {
             std::ostringstream os;

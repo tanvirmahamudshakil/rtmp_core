@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <thread>
@@ -30,7 +31,7 @@ namespace rtmp_server::io::io_uring {
 class WorkerPool {
 public:
     WorkerPool(core::ServerConfig config, protocol::commands::StreamRegistry& stream_registry,
-               protocol::commands::StreamIdRegistry& stream_id_registry);
+               protocol::commands::StreamIdRegistry& stream_id_registry, EventLoopServices services = {});
 
     WorkerPool(const WorkerPool&) = delete;
     WorkerPool& operator=(const WorkerPool&) = delete;
@@ -51,6 +52,7 @@ public:
     void stop();
 
     [[nodiscard]] std::size_t worker_count() const noexcept { return workers_.size(); }
+    [[nodiscard]] std::size_t subscriber_count(protocol::commands::StreamId stream_id) const;
 
     // Task 2 ("Default worker count based on hardware concurrency, with a
     // configurable upper bound"): 0 means auto-detect via
@@ -68,8 +70,10 @@ private:
     core::ServerConfig config_;
     protocol::commands::StreamRegistry& stream_registry_;
     protocol::commands::StreamIdRegistry& stream_id_registry_;
+    EventLoopServices services_;
     std::unique_ptr<CrossWorkerRouter> router_;
     std::vector<Worker> workers_;
+    std::atomic<bool> workers_ready_{false};
 };
 
 } // namespace rtmp_server::io::io_uring

@@ -25,7 +25,7 @@ IoUringEventLoop::IoUringEventLoop(IoUringContext context, core::ServerConfig co
                                     protocol::commands::StreamRegistry& stream_registry,
                                     protocol::commands::StreamIdRegistry& stream_id_registry,
                                     CrossWorkerRouter::WorkerId worker_id, CrossWorkerRouter* router,
-                                    bool enable_reuseport)
+                                    bool enable_reuseport, EventLoopServices services)
     : context_(std::move(context)),
       config_(std::move(config)),
       receive_pool_(config_.provided_buffer_count, config_.provided_buffer_size),
@@ -33,11 +33,18 @@ IoUringEventLoop::IoUringEventLoop(IoUringContext context, core::ServerConfig co
       stream_id_registry_(stream_id_registry),
       live_fanout_(protocol::commands::GopLimits{config_.gop_cache_max_bytes, config_.gop_cache_max_packets,
                                                   config_.gop_cache_max_duration},
-                   protocol::commands::QueueLimits{config_.subscriber_queue_max_bytes,
-                                                    config_.subscriber_queue_max_packets}),
+                   // The connection-local ViewerQueue below sees the real
+                   // TcpConnection backlog and owns slow-viewer decisions.
+                   // A second transport-blind queue here would only count
+                   // every delivered frame forever and eventually evict
+                   // healthy viewers, so its synthetic caps are disabled in
+                   // the production transport.
+                   protocol::commands::QueueLimits{/*max_bytes=*/0, /*max_packets=*/0}),
       worker_id_(worker_id),
       router_(router),
-      enable_reuseport_(enable_reuseport) {
+      enable_reuseport_(enable_reuseport),
+      services_(std::move(services)) {
+    set_metrics(services_.metrics);
     if (router_ != nullptr) {
         // Lightweight, non-reentrant hooks only — never call back into
         // LiveFanout from inside them (see live_fanout.hpp's dispatch_locked
@@ -171,7 +178,10 @@ void IoUringEventLoop::submit_accept() {
         RTMP_LOG(LogLevel::Error, "event_loop", "sqe_exhausted_accept", {});
         return;
     }
-    ::io_uring_prep_accept(sqe, listener_.get(), nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC);
+    std::memset(&accept_address_, 0, sizeof(accept_address_));
+    accept_address_length_ = sizeof(accept_address_);
+    ::io_uring_prep_accept(sqe, listener_.get(), reinterpret_cast<sockaddr*>(&accept_address_),
+                           &accept_address_length_, SOCK_NONBLOCK | SOCK_CLOEXEC);
 
     OperationContext ctx{OperationType::Accept, 0, 0, 0, {}, TimeoutPurpose::None};
     auto id = operations_.create(std::move(ctx));
@@ -371,12 +381,13 @@ void IoUringEventLoop::close_connection(const std::shared_ptr<TcpConnection>& co
     cancel_all_operations_for_connection(connection->connection_id());
     cleanup_handshake_state(connection->connection_id());
     cleanup_rtmp_session_state(connection->connection_id());
+    if (services_.release_connection) services_.release_connection(connection->client_ip());
 
     connection->set_state(ConnectionState::Closed);
     connections_.remove(connection->connection_id());
     connection->on_peer_closed();
     if (metrics_ != nullptr) {
-        metrics_->add(observability::MetricId::ActiveConnections, -1);
+        if (!services_.release_connection) metrics_->add(observability::MetricId::ActiveConnections, -1);
         metrics_->set_connections_for_worker(worker_id_, static_cast<std::int64_t>(connections_.size()));
     }
     RTMP_LOG(LogLevel::Info, "event_loop", "connection_closed",
@@ -428,6 +439,23 @@ void IoUringEventLoop::process_completion(std::uint64_t operation_id, int result
 }
 
 void IoUringEventLoop::handle_accept_completion(const OperationContext& /*op*/, int result) {
+    // One accept is outstanding per worker, so capture its peer address
+    // before submit_accept() reuses the storage for the next SQE.
+    std::string client_ip;
+    if (result >= 0) {
+        char address[INET6_ADDRSTRLEN]{};
+        const void* source = nullptr;
+        const int family = accept_address_.ss_family;
+        if (family == AF_INET) {
+            source = &reinterpret_cast<const sockaddr_in*>(&accept_address_)->sin_addr;
+        } else if (family == AF_INET6) {
+            source = &reinterpret_cast<const sockaddr_in6*>(&accept_address_)->sin6_addr;
+        }
+        if (source != nullptr && ::inet_ntop(family, source, address, sizeof(address)) != nullptr) {
+            client_ip = address;
+        }
+    }
+
     if (!stopping_.load()) {
         submit_accept();
     }
@@ -445,6 +473,12 @@ void IoUringEventLoop::handle_accept_completion(const OperationContext& /*op*/, 
         ::close(result);
         return;
     }
+    if (services_.admit_connection && !services_.admit_connection(client_ip)) {
+        RTMP_LOG(LogLevel::Warn, "event_loop", "per_ip_connection_limit_reached",
+                 {{"client_ip", client_ip}});
+        ::close(result);
+        return;
+    }
 
     int client_fd = result;
     int nodelay = 1;
@@ -455,17 +489,17 @@ void IoUringEventLoop::handle_accept_completion(const OperationContext& /*op*/, 
     auto connection_id = next_connection_id_++;
     auto generation = next_generation_++;
     auto connection = std::make_shared<TcpConnection>(*this, core::FileDescriptor(client_fd),
-                                                        connection_id, generation);
+                                                        connection_id, generation, client_ip);
     connections_.add(connection);
     if (metrics_ != nullptr) {
-        metrics_->add(observability::MetricId::ActiveConnections, +1);
+        if (!services_.admit_connection) metrics_->add(observability::MetricId::ActiveConnections, +1);
         // Bounded-cardinality per-worker series: worker count comes from
         // configuration, never from client behaviour.
         metrics_->set_connections_for_worker(worker_id_, static_cast<std::int64_t>(connections_.size()));
     }
 
     RTMP_LOG(LogLevel::Info, "event_loop", "connection_accepted",
-             {{"connection_id", std::to_string(connection_id)}});
+             {{"connection_id", std::to_string(connection_id)}, {"client_ip", client_ip}});
 
     connection->set_state(ConnectionState::Handshaking);
     start_handshake(connection);
@@ -570,11 +604,18 @@ void IoUringEventLoop::start_rtmp_session(const std::shared_ptr<TcpConnection>& 
     deps.registry = &stream_registry_;
     deps.stream_id_registry = &stream_id_registry_;
     deps.live_fanout = &live_fanout_;
+    deps.key_validator = services_.key_validator;
+    deps.stream_id_resolver = services_.stream_id_resolver;
+    deps.playback_authorizer = services_.playback_authorizer;
+    deps.viewer_attached_handler = services_.viewer_attached_handler;
+    deps.viewer_detached_handler = services_.viewer_detached_handler;
+    deps.client_ip = connection->client_ip();
     deps.playback_queue_limits =
         protocol::commands::QueueLimits{config_.subscriber_queue_max_bytes, config_.subscriber_queue_max_packets};
 
     auto session = std::make_unique<protocol::session::RtmpConnectionSession>(
         connection->connection_id(), deps, config_.maximum_rtmp_message_size, config_.output_chunk_size);
+    session->set_metrics(metrics_);
 
     std::weak_ptr<TcpConnection> weak_connection = connection;
     auto connection_id = connection->connection_id();

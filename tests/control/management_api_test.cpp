@@ -135,6 +135,24 @@ TEST(ManagementApiTest, StatusWithoutRegistryWiredReturnsServiceUnavailable) {
     EXPECT_EQ(status.status, 503);
 }
 
+TEST(ManagementApiTest, StatusUsesInjectedMultiWorkerLiveState) {
+    StreamManager manager(manager_options());
+    ManagementApi api(manager, api_options());
+    ASSERT_EQ(api.handle(authed("POST", "/v1/applications", R"({"name":"live"})")).status, 201);
+    ASSERT_EQ(api.handle(authed("POST", "/v1/streams", R"({"application":"live","name":"alpha"})")).status, 201);
+
+    api.set_live_state_provider([] {
+        return std::vector<rtmp_server::management::LiveState>{
+            {.application = "live", .name = "alpha", .is_live = true, .viewer_count = 42},
+        };
+    });
+
+    auto status = api.handle(authed("GET", "/v1/streams/live:alpha/status"));
+    EXPECT_EQ(status.status, 200);
+    EXPECT_NE(status.body.find(R"("is_live":true)"), std::string::npos);
+    EXPECT_NE(status.body.find(R"("viewer_count":42)"), std::string::npos);
+}
+
 TEST(ManagementApiTest, UnknownRouteReturns404) {
     StreamManager manager(manager_options());
     ManagementApi api(manager, api_options());

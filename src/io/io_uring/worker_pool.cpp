@@ -10,8 +10,11 @@ namespace rtmp_server::io::io_uring {
 using observability::LogLevel;
 
 WorkerPool::WorkerPool(core::ServerConfig config, protocol::commands::StreamRegistry& stream_registry,
-                        protocol::commands::StreamIdRegistry& stream_id_registry)
-    : config_(std::move(config)), stream_registry_(stream_registry), stream_id_registry_(stream_id_registry) {}
+                        protocol::commands::StreamIdRegistry& stream_id_registry, EventLoopServices services)
+    : config_(std::move(config)),
+      stream_registry_(stream_registry),
+      stream_id_registry_(stream_id_registry),
+      services_(std::move(services)) {}
 
 std::uint32_t WorkerPool::effective_worker_count(const core::ServerConfig& config) {
     std::uint32_t count = config.worker_ring_count;
@@ -52,12 +55,17 @@ core::Result<void> WorkerPool::run() {
         // count==1 configuration: harmless there, and keeps the bind path
         // identical regardless of worker_ring_count so no separate
         // single-worker code path needs to exist or be tested.
-        auto loop = std::make_unique<IoUringEventLoop>(std::move(context_result).value(), config_, stream_registry_,
-                                                         stream_id_registry_,
-                                                         static_cast<CrossWorkerRouter::WorkerId>(i), router_.get(),
-                                                         /*enable_reuseport=*/true);
+        auto worker_config = config_;
+        // maximum_connections is a process-level operator budget. Each loop
+        // owns a private registry, so handing the full value to every worker
+        // would multiply the advertised cap by worker count.
+        worker_config.maximum_connections = (config_.maximum_connections + count - 1) / count;
+        auto loop = std::make_unique<IoUringEventLoop>(
+            std::move(context_result).value(), std::move(worker_config), stream_registry_, stream_id_registry_,
+            static_cast<CrossWorkerRouter::WorkerId>(i), router_.get(), /*enable_reuseport=*/true, services_);
         workers_.push_back(Worker{std::move(loop), std::thread()});
     }
+    workers_ready_.store(true, std::memory_order_release);
 
     unsigned hardware = std::thread::hardware_concurrency();
     if (hardware == 0) hardware = 1;
@@ -97,6 +105,15 @@ void WorkerPool::stop() {
     for (auto& worker : workers_) {
         if (worker.loop) worker.loop->stop();
     }
+}
+
+std::size_t WorkerPool::subscriber_count(protocol::commands::StreamId stream_id) const {
+    if (!workers_ready_.load(std::memory_order_acquire)) return 0;
+    std::size_t total = 0;
+    for (const auto& worker : workers_) {
+        if (worker.loop) total += worker.loop->subscriber_count(stream_id);
+    }
+    return total;
 }
 
 } // namespace rtmp_server::io::io_uring

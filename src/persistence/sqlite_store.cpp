@@ -14,6 +14,10 @@ using core::Result;
 namespace {
 
 constexpr const char* kSchema = R"sql(
+PRAGMA journal_mode=WAL;
+PRAGMA synchronous=NORMAL;
+PRAGMA foreign_keys=ON;
+PRAGMA busy_timeout=5000;
 CREATE TABLE IF NOT EXISTS applications (
     name TEXT PRIMARY KEY,
     enabled INTEGER NOT NULL
@@ -79,6 +83,7 @@ SqliteStore::~SqliteStore() {
 }
 
 Result<void> SqliteStore::upsert_application(const ApplicationRow& row) {
+    std::lock_guard<std::mutex> lock(mutex_);
     Statement stmt(db_, "INSERT INTO applications (name, enabled) VALUES (?, ?) "
                         "ON CONFLICT(name) DO UPDATE SET enabled = excluded.enabled");
     if (!stmt.valid()) return sqlite_error(db_, "prepare upsert_application");
@@ -91,6 +96,7 @@ Result<void> SqliteStore::upsert_application(const ApplicationRow& row) {
 }
 
 Result<void> SqliteStore::delete_application(std::string_view name) {
+    std::lock_guard<std::mutex> lock(mutex_);
     Statement stmt(db_, "DELETE FROM applications WHERE name = ?");
     if (!stmt.valid()) return sqlite_error(db_, "prepare delete_application");
 
@@ -100,6 +106,7 @@ Result<void> SqliteStore::delete_application(std::string_view name) {
 }
 
 Result<std::vector<ApplicationRow>> SqliteStore::load_applications() {
+    std::lock_guard<std::mutex> lock(mutex_);
     Statement stmt(db_, "SELECT name, enabled FROM applications");
     if (!stmt.valid()) return sqlite_error(db_, "prepare load_applications");
 
@@ -116,6 +123,7 @@ Result<std::vector<ApplicationRow>> SqliteStore::load_applications() {
 }
 
 Result<void> SqliteStore::upsert_stream(const StreamRow& row) {
+    std::lock_guard<std::mutex> lock(mutex_);
     Statement stmt(db_, "INSERT INTO streams (application, name, key_hash, enabled, recording_enabled, "
                         "created_at_unix) VALUES (?, ?, ?, ?, ?, ?) "
                         "ON CONFLICT(application, name) DO UPDATE SET "
@@ -135,6 +143,7 @@ Result<void> SqliteStore::upsert_stream(const StreamRow& row) {
 }
 
 Result<void> SqliteStore::delete_stream(std::string_view application, std::string_view name) {
+    std::lock_guard<std::mutex> lock(mutex_);
     Statement stmt(db_, "DELETE FROM streams WHERE application = ? AND name = ?");
     if (!stmt.valid()) return sqlite_error(db_, "prepare delete_stream");
 
@@ -145,6 +154,7 @@ Result<void> SqliteStore::delete_stream(std::string_view application, std::strin
 }
 
 Result<std::vector<StreamRow>> SqliteStore::load_streams() {
+    std::lock_guard<std::mutex> lock(mutex_);
     Statement stmt(db_, "SELECT application, name, key_hash, enabled, recording_enabled, created_at_unix "
                         "FROM streams");
     if (!stmt.valid()) return sqlite_error(db_, "prepare load_streams");

@@ -5,6 +5,7 @@
 #include <functional>
 #include <memory>
 #include <span>
+#include <string>
 #include <vector>
 
 #include "rtmp_server/core/error.hpp"
@@ -54,6 +55,11 @@ public:
         media::MediaIngest* media_ingest = nullptr;           // optional, not owned
         commands::RecorderSink* recorder = nullptr;           // optional, not owned
         commands::StreamKeyValidator key_validator;           // optional; defaults to "always allow"
+        commands::StreamIdResolver stream_id_resolver;         // optional; raw publish key -> public stream name
+        commands::PlaybackAuthorizer playback_authorizer;      // optional; stream/token/IP playback gate
+        commands::ViewerLifecycleHandler viewer_attached_handler;
+        commands::ViewerLifecycleHandler viewer_detached_handler;
+        std::string client_ip;                                 // optional; forwarded to playback authorization
         commands::QueueLimits playback_queue_limits;           // optional; defaults per viewer_queue.hpp
     };
 

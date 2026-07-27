@@ -323,6 +323,26 @@ void HttpServer::handle_connection(int client_fd, std::string client_ip) {
         return;
     }
 
+    // Caddy reaches this listener over loopback and supplies the original
+    // address in X-Forwarded-For. Trust that header only from loopback;
+    // accepting it from a public peer would let an attacker bypass per-IP
+    // authentication throttles. Validate the first hop as an IP literal so
+    // arbitrary header text never becomes a rate-limit map key.
+    if (client_ip == "127.0.0.1") {
+        auto forwarded = request.headers.find("x-forwarded-for");
+        if (forwarded != request.headers.end()) {
+            std::string candidate = forwarded->second.substr(0, forwarded->second.find(','));
+            while (!candidate.empty() && candidate.front() == ' ') candidate.erase(candidate.begin());
+            while (!candidate.empty() && candidate.back() == ' ') candidate.pop_back();
+            in_addr ipv4{};
+            in6_addr ipv6{};
+            if (::inet_pton(AF_INET, candidate.c_str(), &ipv4) == 1 ||
+                ::inet_pton(AF_INET6, candidate.c_str(), &ipv6) == 1) {
+                request.client_ip = std::move(candidate);
+            }
+        }
+    }
+
     HttpResponse response;
     if (handler_) {
         response = handler_(request);

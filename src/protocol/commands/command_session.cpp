@@ -166,6 +166,9 @@ bool CommandSession::deliver_playback_message(std::uint32_t message_stream_id, c
 void CommandSession::handle_playback_publisher_stopped(std::uint32_t message_stream_id) {
     auto it = streams_.find(message_stream_id);
     if (it != streams_.end()) {
+        if (it->second.state == NetStreamState::Playing && viewer_detached_handler_) {
+            viewer_detached_handler_(app_name_, it->second.stream_key);
+        }
         it->second.state = NetStreamState::Idle;
         send_status(message_stream_id, "status", "NetStream.Play.UnpublishNotify", "Stream unpublished.");
     }
@@ -175,6 +178,9 @@ void CommandSession::handle_playback_publisher_stopped(std::uint32_t message_str
 void CommandSession::handle_playback_evicted(std::uint32_t message_stream_id) {
     auto it = streams_.find(message_stream_id);
     if (it != streams_.end()) {
+        if (it->second.state == NetStreamState::Playing && viewer_detached_handler_) {
+            viewer_detached_handler_(app_name_, it->second.stream_key);
+        }
         it->second.state = NetStreamState::Idle;
         send_status(message_stream_id, "error", "NetStream.Play.InsufficientBW", "Viewer fell too far behind.");
     }
@@ -371,6 +377,7 @@ void CommandSession::handle_play(const Amf0Command& command, std::uint32_t messa
         playback_relays_[message_stream_id] = std::move(relay);
         live_fanout_->subscribe(slot.stream_id, subscriber_id, playback_relays_[message_stream_id].get());
     }
+    if (viewer_attached_handler_) viewer_attached_handler_(app_name_, stream_key);
 }
 
 void CommandSession::handle_delete_stream(const Amf0Command& command) {
@@ -391,6 +398,7 @@ void CommandSession::handle_delete_stream(const Amf0Command& command) {
             live_fanout_->unsubscribe(it->second.stream_id, relay_it->second->subscriber_id());
         }
         playback_relays_.erase(stream_id);
+        if (viewer_detached_handler_) viewer_detached_handler_(app_name_, it->second.stream_key);
     }
     streams_.erase(it);
 }
@@ -407,6 +415,7 @@ void CommandSession::on_connection_closed() {
             if (live_fanout_ != nullptr && relay_it != playback_relays_.end()) {
                 live_fanout_->unsubscribe(slot.stream_id, relay_it->second->subscriber_id());
             }
+            if (viewer_detached_handler_) viewer_detached_handler_(app_name_, slot.stream_key);
         }
     }
     streams_.clear();

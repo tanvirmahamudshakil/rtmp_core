@@ -8,8 +8,12 @@ namespace rtmp_server::network {
 using observability::LogLevel;
 
 TcpConnection::TcpConnection(io::io_uring::IoUringEventLoop& loop, core::FileDescriptor fd,
-                              std::uint64_t connection_id, std::uint64_t generation)
-    : loop_(loop), fd_(std::move(fd)), connection_id_(connection_id), generation_(generation) {}
+                              std::uint64_t connection_id, std::uint64_t generation, std::string client_ip)
+    : loop_(loop),
+      fd_(std::move(fd)),
+      connection_id_(connection_id),
+      generation_(generation),
+      client_ip_(std::move(client_ip)) {}
 
 void TcpConnection::start_read() { loop_.submit_receive(shared_from_this()); }
 
