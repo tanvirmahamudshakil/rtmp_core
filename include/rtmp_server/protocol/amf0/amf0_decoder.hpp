@@ -9,6 +9,23 @@
 
 namespace rtmp_server::protocol::amf0 {
 
+// Maximum Object/ECMA-Array/Strict-Array nesting the decoder will descend
+// into before rejecting the input (docs/v2_promot.md 3.5 "AMF nesting
+// depth", Phase 8 security task 5).
+//
+// The decoder is recursive-descent, so nesting depth is *stack* depth: an
+// unbounded limit means an attacker who can send an AMF0 command message
+// (i.e. any peer that finished the RTMP handshake — no authentication
+// required) crashes the process with a stack overflow. Phase 8 reproduced
+// exactly that: 800 KB of `03 00 01 61` repeated (object, one-char property
+// name, value = another object) segfaulted the decoder before this limit
+// existed. See docs/security.md "AMF0 nesting depth".
+//
+// 32 is far above anything real: OBS/FFmpeg/librtmp `connect` command
+// objects nest at most 2-3 levels, and the deepest structure the server
+// itself ever emits (onMetaData with a nested keyframes array) is 3.
+inline constexpr std::size_t kMaxNestingDepth = 32;
+
 // Result of decoding exactly one AMF0 value off the front of a byte span.
 struct Amf0Decoded {
     Amf0Value value;

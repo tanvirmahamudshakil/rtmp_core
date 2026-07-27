@@ -45,12 +45,24 @@ std::string read_bytes_as_string(std::span<const std::byte> data, std::size_t of
 // Forward declaration: property lists (Object/ECMA Array bodies) recurse
 // into decode_value() for each property's value.
 Result<std::size_t> decode_properties(std::span<const std::byte> data, std::size_t offset,
-                                       Amf0PropertyList& out);
+                                       Amf0PropertyList& out, std::size_t depth);
+
+// Smallest number of bytes any AMF0 value can occupy on the wire: a bare
+// type marker (Null/Undefined/Object-End). Used to bound container element
+// counts against the bytes actually present before reserving (Phase 8
+// security task 6, "validate all client-controlled lengths before
+// allocation").
+constexpr std::size_t kMinValueBytes = 1;
 
 // Decodes exactly one AMF0 value (including its leading type marker)
 // starting at data[offset]. Returns the number of bytes consumed (>= 1) on
-// success.
-Result<Amf0Decoded> decode_value(std::span<const std::byte> data, std::size_t offset) {
+// success. `depth` is the current container nesting level; see
+// kMaxNestingDepth in the header for why it must be bounded.
+Result<Amf0Decoded> decode_value(std::span<const std::byte> data, std::size_t offset, std::size_t depth) {
+    if (depth > kMaxNestingDepth) {
+        return Error(ErrorCode::MalformedAmf, ErrorCategory::Protocol,
+                     "AMF0 value nesting exceeds the maximum supported depth");
+    }
     if (auto r = require(data, offset, 1); !r) return r.error();
     auto marker = static_cast<Amf0Marker>(data[offset]);
     std::size_t cursor = offset + 1;
@@ -88,7 +100,7 @@ Result<Amf0Decoded> decode_value(std::span<const std::byte> data, std::size_t of
         }
         case Amf0Marker::Object: {
             Amf0PropertyList props;
-            auto consumed = decode_properties(data, cursor, props);
+            auto consumed = decode_properties(data, cursor, props, depth + 1);
             if (!consumed) return consumed.error();
             cursor += consumed.value();
             return Amf0Decoded{Amf0Value::object(std::move(props)), cursor - offset};
@@ -97,7 +109,7 @@ Result<Amf0Decoded> decode_value(std::span<const std::byte> data, std::size_t of
             if (auto r = require(data, cursor, 4); !r) return r.error();
             cursor += 4; // associative-count hint; not authoritative, terminator governs parsing
             Amf0PropertyList props;
-            auto consumed = decode_properties(data, cursor, props);
+            auto consumed = decode_properties(data, cursor, props, depth + 1);
             if (!consumed) return consumed.error();
             cursor += consumed.value();
             return Amf0Decoded{Amf0Value::ecma_array(std::move(props)), cursor - offset};
@@ -106,10 +118,21 @@ Result<Amf0Decoded> decode_value(std::span<const std::byte> data, std::size_t of
             if (auto r = require(data, cursor, 4); !r) return r.error();
             std::uint32_t count = read_u32_be_at(data, cursor);
             cursor += 4;
+            // `count` is fully client-controlled (up to 4294967295). Reserving
+            // it directly would let 5 bytes of input request ~275 GB of
+            // storage. Every element needs at least kMinValueBytes on the
+            // wire, so anything beyond the bytes actually remaining is
+            // provably a lie — reject it up front rather than reserve-then-
+            // fail (Phase 8 security task 6).
+            const std::size_t remaining = data.size() - cursor;
+            if (static_cast<std::size_t>(count) > remaining / kMinValueBytes) {
+                return Error(ErrorCode::MalformedAmf, ErrorCategory::Protocol,
+                             "AMF0 strict-array element count exceeds the bytes remaining in the message");
+            }
             std::vector<Amf0Value> items;
             items.reserve(count);
             for (std::uint32_t i = 0; i < count; ++i) {
-                auto item = decode_value(data, cursor);
+                auto item = decode_value(data, cursor, depth + 1);
                 if (!item) return item.error();
                 items.push_back(std::move(item.value().value));
                 cursor += item.value().bytes_consumed;
@@ -144,7 +167,11 @@ Result<Amf0Decoded> decode_value(std::span<const std::byte> data, std::size_t of
 }
 
 Result<std::size_t> decode_properties(std::span<const std::byte> data, std::size_t offset,
-                                       Amf0PropertyList& out) {
+                                       Amf0PropertyList& out, std::size_t depth) {
+    if (depth > kMaxNestingDepth) {
+        return Error(ErrorCode::MalformedAmf, ErrorCategory::Protocol,
+                     "AMF0 value nesting exceeds the maximum supported depth");
+    }
     std::size_t cursor = offset;
     // Cap iteration so a pathological "terminator never appears" input
     // cannot spin forever; every iteration consumes at least 1 byte of
@@ -174,7 +201,7 @@ Result<std::size_t> decode_properties(std::span<const std::byte> data, std::size
         std::string name = read_bytes_as_string(data, cursor, name_len);
         cursor += name_len;
 
-        auto value = decode_value(data, cursor);
+        auto value = decode_value(data, cursor, depth);
         if (!value) return value.error();
         cursor += value.value().bytes_consumed;
         out.emplace_back(std::move(name), std::move(value.value().value));
@@ -185,13 +212,13 @@ Result<std::size_t> decode_properties(std::span<const std::byte> data, std::size
 
 } // namespace
 
-core::Result<Amf0Decoded> decode(std::span<const std::byte> data) { return decode_value(data, 0); }
+core::Result<Amf0Decoded> decode(std::span<const std::byte> data) { return decode_value(data, 0, 0); }
 
 core::Result<std::vector<Amf0Value>> decode_all(std::span<const std::byte> data) {
     std::vector<Amf0Value> values;
     std::size_t offset = 0;
     while (offset < data.size()) {
-        auto decoded = decode_value(data, offset);
+        auto decoded = decode_value(data, offset, 0);
         if (!decoded) return decoded.error();
         values.push_back(std::move(decoded.value().value));
         offset += decoded.value().bytes_consumed;

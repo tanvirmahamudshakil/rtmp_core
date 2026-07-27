@@ -29,13 +29,16 @@ std::uint32_t read_u32_le_at(std::span<const std::byte> buf, std::size_t offset)
 
 } // namespace
 
-ChunkDecoder::ChunkDecoder(std::uint32_t max_message_size) : max_message_size_(max_message_size) {}
+ChunkDecoder::ChunkDecoder(std::uint32_t max_message_size, ChunkDecoderLimits limits)
+    : limits_(limits), max_message_size_(max_message_size) {}
 
 void ChunkDecoder::fail(core::ErrorCode code, std::string_view message) {
     if (failed_) return;
     failed_ = true;
     buffer_.clear();
+    buffer_.shrink_to_fit();
     streams_.clear();
+    buffered_payload_bytes_ = 0;
     if (error_handler_) error_handler_(core::Error(code, core::ErrorCategory::Protocol, message));
 }
 
@@ -96,6 +99,14 @@ ChunkDecoder::DecodeResult ChunkDecoder::decode_one() {
     bool is_new_stream = (it == streams_.end());
     if (fmt != 0 && is_new_stream) {
         fail(core::ErrorCode::MalformedChunk, "first chunk on a chunk stream ID must use fmt 0");
+        return DecodeResult::Failed;
+    }
+    // Bound the chunk-stream state table before inserting: the basic header
+    // can address 65600 csids and each state can hold an in-progress payload,
+    // so an unbounded table is a memory-amplification primitive available to
+    // any post-handshake peer (chunk_decoder.hpp, ChunkDecoderLimits).
+    if (is_new_stream && streams_.size() >= limits_.max_chunk_streams) {
+        fail(core::ErrorCode::MalformedChunk, "too many concurrent RTMP chunk stream IDs on one connection");
         return DecodeResult::Failed;
     }
     ChunkStreamState& state = is_new_stream ? streams_[csid] : it->second;
@@ -196,8 +207,15 @@ ChunkDecoder::DecodeResult ChunkDecoder::decode_one() {
         state.timestamp_delta = effective_delta;
         state.extended_timestamp = needs_extended;
         state.message_timestamp = effective_timestamp;
+        buffered_payload_bytes_ -= state.partial_payload.size();
         state.partial_payload.clear();
-        state.partial_payload.reserve(effective_length);
+        // Deliberately NOT reserve(effective_length): the declared length is
+        // client-controlled and validated only against max_message_size, so
+        // reserving it upfront lets a 15-byte header commit megabytes. Reserve
+        // a fixed working size and let the vector grow geometrically as real
+        // bytes arrive (chunk_decoder.hpp, ChunkDecoderLimits).
+        state.partial_payload.reserve(
+            std::min(static_cast<std::size_t>(effective_length), limits_.initial_payload_reserve));
         state.bytes_remaining = effective_length;
     }
 
@@ -206,6 +224,16 @@ ChunkDecoder::DecodeResult ChunkDecoder::decode_one() {
                                       buffer_.begin() + static_cast<std::ptrdiff_t>(payload_slice));
         buffer_.erase(buffer_.begin(), buffer_.begin() + static_cast<std::ptrdiff_t>(payload_slice));
         state.bytes_remaining -= payload_slice;
+        buffered_payload_bytes_ += payload_slice;
+        // Checked after the fact rather than before: the bytes are already in
+        // hand (they came off the wire), so the bound is on how much the peer
+        // may leave *outstanding* across chunk streams, not on a single
+        // legitimate large message, which max_message_size already governs.
+        if (buffered_payload_bytes_ > limits_.max_buffered_payload_bytes) {
+            fail(core::ErrorCode::MessageTooLarge,
+                 "outstanding RTMP chunk reassembly buffers exceed the per-connection limit");
+            return DecodeResult::Failed;
+        }
     }
 
     if (state.bytes_remaining == 0) {
@@ -221,8 +249,12 @@ void ChunkDecoder::handle_complete_message(std::uint32_t csid, ChunkStreamState&
     message.message_stream_id = state.message_stream_id;
     message.message_type_id = state.message_type_id;
     message.timestamp = state.message_timestamp;
+    // The bytes leave this decoder's accounting the moment they are handed to
+    // the message handler; the handler owns them from here.
+    buffered_payload_bytes_ -= state.partial_payload.size();
     message.payload = std::move(state.partial_payload);
     state.partial_payload.clear();
+    state.partial_payload.shrink_to_fit();
 
     if (handle_protocol_control(message)) return;
     if (message_handler_) message_handler_(std::move(message));
@@ -242,6 +274,17 @@ bool ChunkDecoder::handle_protocol_control(const RtmpMessage& message) {
                 fail(core::ErrorCode::MalformedChunk, "Set Chunk Size must not be zero");
                 return true;
             }
+            // The wire field allows up to 0x7FFFFFFF, but the RTMP
+            // specification caps the negotiated chunk size at 0xFFFFFF. The
+            // bound is deliberately NOT tied to max_message_size: a peer may
+            // legitimately announce a chunk size larger than the biggest
+            // message we accept (the actual slice taken is always
+            // min(bytes_remaining, chunk_size), so it is already bounded), and
+            // tying the two together would reject conforming peers.
+            if (value > limits_.max_chunk_size) {
+                fail(core::ErrorCode::MalformedChunk, "Set Chunk Size exceeds the maximum supported chunk size");
+                return true;
+            }
             input_chunk_size_ = value;
             return true;
         }
@@ -253,7 +296,9 @@ bool ChunkDecoder::handle_protocol_control(const RtmpMessage& message) {
             std::uint32_t target_csid = read_u32_be_at(message.payload, 0);
             auto it = streams_.find(target_csid);
             if (it != streams_.end()) {
+                buffered_payload_bytes_ -= it->second.partial_payload.size();
                 it->second.partial_payload.clear();
+                it->second.partial_payload.shrink_to_fit();
                 it->second.bytes_remaining = 0;
             }
             return true;
