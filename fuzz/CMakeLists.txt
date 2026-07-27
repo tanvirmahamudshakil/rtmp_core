@@ -9,15 +9,29 @@
 option(RTMP_SERVER_ENABLE_FUZZING
     "Build fuzz harnesses with libFuzzer (-fsanitize=fuzzer,address); requires Clang" OFF)
 
-set(RTMP_SERVER_FUZZ_TARGETS fuzz_amf0_decoder fuzz_chunk_decoder fuzz_flv_parser)
+# Phase 8 adds fuzz_handshake (the earliest unauthenticated parser) and
+# fuzz_token_parser (playback token/query -> HMAC verification), completing the
+# set docs/v2_promot.md Phase 8 task 4 requires: chunk decoder, AMF decoder,
+# handshake parser, token parser.
+set(RTMP_SERVER_FUZZ_TARGETS
+    fuzz_amf0_decoder
+    fuzz_chunk_decoder
+    fuzz_flv_parser
+    fuzz_handshake
+    fuzz_token_parser
+)
 
 foreach(target IN LISTS RTMP_SERVER_FUZZ_TARGETS)
     add_executable(${target} ${target}.cpp)
     target_link_libraries(${target} PRIVATE
         rtmp_server_protocol
         rtmp_server_media
+        rtmp_server_management
         rtmp_server_warnings
     )
+    # fuzz_main.hpp (the standalone mutation driver used where libFuzzer is
+    # unavailable) lives next to the harnesses.
+    target_include_directories(${target} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
     target_compile_features(${target} PUBLIC cxx_std_23)
 
     if(RTMP_SERVER_ENABLE_FUZZING)
