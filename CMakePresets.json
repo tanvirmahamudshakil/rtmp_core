@@ -12,8 +12,19 @@
       }
     },
     {
+      "name": "core-only-base",
+      "hidden": true,
+      "inherits": "base",
+      "description": "Platform-independent subset: no io_uring transport. Required on non-Linux hosts.",
+      "cacheVariables": {
+        "RTMP_SERVER_CORE_ONLY": "ON"
+      }
+    },
+    {
       "name": "debug",
       "inherits": "base",
+      "displayName": "Debug",
+      "description": "Unoptimised build with assertions and debug info; the default development preset.",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Debug"
       }
@@ -21,13 +32,29 @@
     {
       "name": "release",
       "inherits": "base",
+      "displayName": "Release",
+      "description": "Optimised build without the production hardening flags. Use 'production' for deployment.",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release"
       }
     },
     {
+      "name": "production",
+      "inherits": "base",
+      "displayName": "Production",
+      "description": "The preset a deployable artefact must be built with. RelWithDebInfo (optimised, but with debug info retained so a core dump from production is analysable), tests off, and the exploit-mitigation flag set documented in docs/deployment.md 'Build hardening'.",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "RTMP_SERVER_BUILD_TESTS": "OFF",
+        "RTMP_SERVER_ENABLE_HARDENING": "ON",
+        "CMAKE_POSITION_INDEPENDENT_CODE": "ON"
+      }
+    },
+    {
       "name": "asan",
       "inherits": "base",
+      "displayName": "AddressSanitizer + UBSan",
+      "description": "ASan and UBSan together (they are compatible and share a runtime).",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Debug",
         "RTMP_SERVER_ENABLE_ASAN": "ON"
@@ -36,9 +63,21 @@
     {
       "name": "tsan",
       "inherits": "base",
+      "displayName": "ThreadSanitizer",
+      "description": "TSan. Mutually exclusive with ASan; the two runtimes cannot be combined.",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Debug",
         "RTMP_SERVER_ENABLE_TSAN": "ON"
+      }
+    },
+    {
+      "name": "ubsan",
+      "inherits": "base",
+      "displayName": "UndefinedBehaviorSanitizer only",
+      "description": "UBSan without ASan. Much cheaper than the asan preset, so it can run over the whole suite on every commit; also isolates UBSan findings from ASan's.",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "RTMP_SERVER_ENABLE_UBSAN": "ON"
       }
     },
     {
@@ -51,25 +90,74 @@
     },
     {
       "name": "core-only",
-      "inherits": "base",
+      "inherits": "core-only-base",
+      "displayName": "Core only (Debug)",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug"
+      }
+    },
+    {
+      "name": "asan-core-only",
+      "inherits": "core-only-base",
+      "displayName": "ASan + UBSan (core only)",
+      "description": "ASan/UBSan on the platform-independent subset. This is the sanitizer preset that runs on non-Linux development hosts, where the io_uring transport cannot be compiled at all.",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Debug",
-        "RTMP_SERVER_CORE_ONLY": "ON"
+        "RTMP_SERVER_ENABLE_ASAN": "ON"
+      }
+    },
+    {
+      "name": "tsan-core-only",
+      "inherits": "core-only-base",
+      "displayName": "TSan (core only)",
+      "description": "TSan on the platform-independent subset. Covers the genuinely concurrent core components (AsyncFileSink writer thread, LiveFanout, SegmentStore, StreamRegistry, RtmpAuthenticator, HTTP server); the io_uring worker pool needs a Linux host.",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "RTMP_SERVER_ENABLE_TSAN": "ON"
+      }
+    },
+    {
+      "name": "ubsan-core-only",
+      "inherits": "core-only-base",
+      "displayName": "UBSan (core only)",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "RTMP_SERVER_ENABLE_UBSAN": "ON"
+      }
+    },
+    {
+      "name": "fuzz",
+      "inherits": "core-only-base",
+      "displayName": "libFuzzer harnesses",
+      "description": "Coverage-guided fuzzing with libFuzzer + ASan. Requires Clang with compiler-rt's libFuzzer, which Apple Clang does not ship - on macOS use the standalone driver instead (fuzz/fuzz_main.hpp, --runs N).",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "RTMP_SERVER_ENABLE_FUZZING": "ON"
       }
     }
   ],
   "buildPresets": [
     { "name": "debug", "configurePreset": "debug" },
     { "name": "release", "configurePreset": "release" },
+    { "name": "production", "configurePreset": "production" },
     { "name": "asan", "configurePreset": "asan" },
     { "name": "tsan", "configurePreset": "tsan" },
+    { "name": "ubsan", "configurePreset": "ubsan" },
     { "name": "coverage", "configurePreset": "coverage" },
-    { "name": "core-only", "configurePreset": "core-only" }
+    { "name": "core-only", "configurePreset": "core-only" },
+    { "name": "asan-core-only", "configurePreset": "asan-core-only" },
+    { "name": "tsan-core-only", "configurePreset": "tsan-core-only" },
+    { "name": "ubsan-core-only", "configurePreset": "ubsan-core-only" },
+    { "name": "fuzz", "configurePreset": "fuzz" }
   ],
   "testPresets": [
     { "name": "debug", "configurePreset": "debug", "output": { "outputOnFailure": true } },
     { "name": "asan", "configurePreset": "asan", "output": { "outputOnFailure": true } },
     { "name": "tsan", "configurePreset": "tsan", "output": { "outputOnFailure": true } },
-    { "name": "core-only", "configurePreset": "core-only", "output": { "outputOnFailure": true } }
+    { "name": "ubsan", "configurePreset": "ubsan", "output": { "outputOnFailure": true } },
+    { "name": "core-only", "configurePreset": "core-only", "output": { "outputOnFailure": true } },
+    { "name": "asan-core-only", "configurePreset": "asan-core-only", "output": { "outputOnFailure": true } },
+    { "name": "tsan-core-only", "configurePreset": "tsan-core-only", "output": { "outputOnFailure": true } },
+    { "name": "ubsan-core-only", "configurePreset": "ubsan-core-only", "output": { "outputOnFailure": true } }
   ]
 }

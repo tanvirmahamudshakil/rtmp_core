@@ -17,6 +17,7 @@ add_library(rtmp_server_media STATIC
     ${CMAKE_SOURCE_DIR}/src/recording/recorder.cpp
     ${CMAKE_SOURCE_DIR}/src/recording/async_file_sink.cpp
     ${CMAKE_SOURCE_DIR}/src/recording/retention.cpp
+    ${CMAKE_SOURCE_DIR}/src/recording/recording_path.cpp
 )
 
 target_include_directories(rtmp_server_media PUBLIC

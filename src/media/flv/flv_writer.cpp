@@ -47,12 +47,6 @@ void append_amf0_key(std::vector<std::byte>& out, std::string_view key) {
     append_amf0_string_body(out, key);
 }
 
-void append_amf0_number(std::vector<std::byte>& out, double value) {
-    out.push_back(kAmf0Number);
-    auto be = encode_double_be(value);
-    out.insert(out.end(), be.begin(), be.end());
-}
-
 } // namespace
 
 std::array<std::byte, 8> encode_double_be(double value) {
@@ -198,7 +192,18 @@ core::Result<ParsedFlv> parse_flv(std::span<const std::byte> data) {
     out.has_audio = (flags & kFlagAudio) != 0;
     out.has_video = (flags & kFlagVideo) != 0;
     out.data_offset = core::read_u32_be(std::span<const std::byte, 4>(data.subspan(5, 4)));
-    if (out.data_offset < kFileHeaderSize || out.data_offset > data.size()) {
+    // DataOffset is a client/file-controlled 32-bit length. Validating it only
+    // against data.size() left a 4-byte over-read: PreviousTagSize0 is read at
+    // exactly this offset, so a DataOffset in [size-3, size] passed the check
+    // and then read past the end. Found by the FLV fuzz harness under ASan
+    // (container-overflow in read_u32_be via parse_flv). The room for
+    // PreviousTagSize0 must be part of the bound.
+    //
+    // Written as a subtraction rather than `data_offset + kPreviousTagSize >
+    // data.size()` so a DataOffset near 2^32 cannot wrap the addition; the
+    // size() >= kFileHeaderTotalSize check above guarantees the subtraction
+    // cannot underflow.
+    if (out.data_offset < kFileHeaderSize || out.data_offset > data.size() - kPreviousTagSize) {
         return fail("FLV DataOffset out of range");
     }
     // PreviousTagSize0 immediately follows the declared header.

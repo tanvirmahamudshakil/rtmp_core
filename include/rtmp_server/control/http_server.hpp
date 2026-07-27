@@ -99,7 +99,15 @@ private:
     HttpServerOptions options_;
     HttpHandler handler_;
 
-    int listen_fd_ = -1;
+    // Atomic because stop() (caller's thread) and accept_loop() (accept
+    // thread) both touch it. Phase 8: TSan reported this as a genuine data
+    // race, and it was worse than a formality — stop() closed the descriptor
+    // and set -1 while the accept thread could still be entering accept() on
+    // the old value, so a descriptor number reused by any other thread in the
+    // process could have been accepted on. stop() now joins the accept thread
+    // before closing, which removes the reuse window entirely; the atomic
+    // covers the remaining ordinary visibility requirement.
+    std::atomic<int> listen_fd_{-1};
     std::uint16_t bound_port_ = 0;
     std::atomic<bool> running_{false};
 

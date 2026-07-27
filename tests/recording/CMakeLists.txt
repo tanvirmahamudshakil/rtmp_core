@@ -9,6 +9,7 @@ add_executable(rtmp_server_recording_tests
     recorder_test.cpp
     async_file_sink_test.cpp
     retention_test.cpp
+    recording_path_test.cpp
 )
 
 target_link_libraries(rtmp_server_recording_tests PRIVATE

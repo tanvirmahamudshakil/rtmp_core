@@ -107,7 +107,13 @@ private:
     [[nodiscard]] std::size_t next_video_payload_size(bool keyframe) const;
 
     MediaProfile profile_;
-    std::uint64_t seed_;
+    // Retained but currently unread: frame generation is deterministic from
+    // (profile, frame index) alone, so the generator is seed-independent
+    // today. The field and the constructor parameter are kept so a future
+    // randomised profile can consume it without a public API break --
+    // [[maybe_unused]] documents that this is deliberate rather than an
+    // oversight the compiler happened to spot.
+    [[maybe_unused]] std::uint64_t seed_;
 
     std::uint64_t video_frames_ = 0;
     std::uint64_t audio_frames_ = 0;

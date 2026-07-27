@@ -49,6 +49,15 @@ enum class ErrorCode : std::uint32_t {
     // Storage
     StorageUnavailable,
     StorageWriteFailed,
+
+    // Caller/peer supplied a structurally invalid value (Phase 8). Distinct
+    // from InvalidConfiguration, which means operator-supplied configuration
+    // is wrong: this one means a client-controlled value failed validation,
+    // e.g. a stream name that is unsafe to use as a filesystem path.
+    // Appended at the end deliberately — no switch in the tree is exhaustive
+    // over ErrorCode, but the numeric values appear in logs and metrics, so
+    // existing codes must not be renumbered.
+    InvalidArgument,
 };
 
 // Lightweight, allocation-free-in-the-common-case error value for hot-path

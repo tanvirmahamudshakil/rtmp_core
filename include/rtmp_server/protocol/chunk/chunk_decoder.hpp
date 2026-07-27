@@ -28,12 +28,54 @@ namespace rtmp_server::protocol::chunk {
 // state and are simply delivered to the message handler like any other
 // message, since acting on them is a session-level (not chunk-level)
 // concern.
+// Per-connection reassembly bounds (Phase 8 security tasks 5 and 6,
+// docs/v2_promot.md 3.5 "Chunk size" / "Per-connection receive buffer").
+//
+// Why these exist: the RTMP basic header can address 65600 distinct chunk
+// stream IDs, and a peer may legally start a message on each of them and
+// leave every one incomplete. Before Phase 8 the decoder created a
+// ChunkStreamState per csid on demand and immediately called
+// partial_payload.reserve(declared_message_length) — so a peer could
+// declare the full max_message_size on thousands of chunk streams and make
+// the server allocate gigabytes. Measured on the pre-fix code: 2.84 MB of
+// input drove 269 MiB RSS / 792 MiB peak footprint in a single decoder
+// (docs/security.md "Chunk-stream reassembly amplification").
+struct ChunkDecoderLimits {
+    // Concurrently tracked chunk stream IDs. Real publishers use a handful
+    // (2 = protocol control, 3 = command, 4/5/6 = audio/video/data is the
+    // conventional layout used by OBS, FFmpeg and librtmp); 64 leaves an
+    // order of magnitude of headroom while capping the state table.
+    std::uint32_t max_chunk_streams = 64;
+
+    // Total bytes held across every chunk stream's in-progress payload on
+    // this connection. Two full maximum-size messages' worth of headroom
+    // lets one big message be reassembled while another chunk stream is
+    // mid-message, which is the deepest legitimate interleaving; beyond
+    // that the peer is hoarding, not streaming.
+    std::uint64_t max_buffered_payload_bytes = 2ULL * 10 * 1024 * 1024;
+
+    // Largest Set Chunk Size the peer may negotiate. The RTMP specification
+    // caps the field at 0xFFFFFF, and a chunk can never usefully exceed the
+    // largest message we accept, so the effective cap is
+    // min(this, max_message_size). Bounding it keeps the raw input buffer
+    // (which must hold one whole chunk before a slice can be committed)
+    // proportional to the message limit rather than to a 2 GiB field.
+    std::uint32_t max_chunk_size = 0xFFFFFF;
+
+    // Upfront reservation cap for a new message's payload. The declared
+    // length is validated against max_message_size, but reserving it in one
+    // go still lets a 15-byte header commit max_message_size of memory. The
+    // vector grows geometrically from here instead, so a peer only ever
+    // gets memory proportional to bytes it actually sent.
+    std::size_t initial_payload_reserve = 64u * 1024u;
+};
+
 class ChunkDecoder {
 public:
     using MessageHandler = std::function<void(RtmpMessage)>;
     using ErrorHandler = std::function<void(core::Error)>;
 
-    explicit ChunkDecoder(std::uint32_t max_message_size);
+    explicit ChunkDecoder(std::uint32_t max_message_size, ChunkDecoderLimits limits = {});
 
     void set_message_handler(MessageHandler handler) { message_handler_ = std::move(handler); }
     void set_error_handler(ErrorHandler handler) { error_handler_ = std::move(handler); }
@@ -67,6 +109,16 @@ public:
     void mark_acknowledged() noexcept { bytes_at_last_ack_ = bytes_received_; }
 
     [[nodiscard]] bool failed() const noexcept { return failed_; }
+
+    [[nodiscard]] const ChunkDecoderLimits& limits() const noexcept { return limits_; }
+
+    // Bytes currently held across every chunk stream's in-progress payload
+    // (the quantity bounded by limits().max_buffered_payload_bytes).
+    // Exposed for tests and for connection-level memory accounting.
+    [[nodiscard]] std::uint64_t buffered_payload_bytes() const noexcept { return buffered_payload_bytes_; }
+
+    // Number of chunk stream IDs currently tracked.
+    [[nodiscard]] std::size_t chunk_stream_count() const noexcept { return streams_.size(); }
 
 private:
     // Per-chunk-stream-ID header/reassembly state, carried across calls so
@@ -102,8 +154,10 @@ private:
     std::vector<std::byte> buffer_;
     std::unordered_map<std::uint32_t, ChunkStreamState> streams_;
 
+    ChunkDecoderLimits limits_;
     std::uint32_t input_chunk_size_ = kDefaultChunkSize;
     std::uint32_t max_message_size_;
+    std::uint64_t buffered_payload_bytes_ = 0;
     std::uint64_t bytes_received_ = 0;
     std::uint32_t window_ack_size_ = 0;
     std::uint64_t bytes_at_last_ack_ = 0;

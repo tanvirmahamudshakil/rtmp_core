@@ -1,0 +1,64 @@
+# logrotate configuration for rtmp_server.
+#
+# ONLY NEEDED IF YOU REDIRECT LOGS TO A FILE.
+#
+# The server writes structured JSON log lines to stdout/stderr and performs no
+# log file management of its own -- deliberately, because a process that
+# rotates its own logs has to reopen files from a signal handler and is a
+# recurring source of lost lines and fd leaks. Under the supplied systemd unit
+# stdout/stderr go to the journal, which already handles rotation and
+# retention, and this file is unnecessary. Configure retention there instead:
+#
+#   /etc/systemd/journald.conf
+#     SystemMaxUse=2G         # cap total journal size
+#     MaxRetentionSec=30day   # cap age
+#   sudo systemctl restart systemd-journald
+#
+# Use this file only when running under a supervisor that redirects to a plain
+# file (e.g. `rtmp-server ... >> /var/log/rtmp-server/rtmp-server.log 2>&1`).
+#
+# Install:
+#   sudo cp deploy/logrotate/rtmp-server /etc/logrotate.d/rtmp-server
+#   sudo logrotate --debug /etc/logrotate.d/rtmp-server   # dry run first
+#
+# NOT EXECUTED IN THIS REPOSITORY'S DEVELOPMENT ENVIRONMENT (macOS, no
+# logrotate); reviewed against logrotate(8) but not run. Validate with the
+# --debug dry run above before relying on it.
+
+/var/log/rtmp-server/*.log {
+    # Rotate daily, but only if the file is non-trivial -- a busy server can
+    # produce gigabytes a day, and 'daily' alone would keep a full day of it
+    # on disk before the first rotation.
+    daily
+    size 100M
+
+    # 14 compressed generations. At 100M/rotation that is a bounded ~1.4 GB
+    # ceiling, which is the point: log volume must never be able to fill the
+    # partition that also holds recordings and the SQLite database.
+    rotate 14
+    compress
+    # Delay compressing the most recent rotation so a tail -F or an in-flight
+    # log shipper is not reading a file being rewritten underneath it.
+    delaycompress
+
+    missingok
+    notifempty
+    # One state entry for the whole glob rather than per-file.
+    sharedscripts
+    # 0640 root:adm -- logs contain stream names and client IPs.
+    create 0640 root adm
+
+    # copytruncate, NOT create-and-signal.
+    #
+    # The server holds stdout open for the process lifetime and has no
+    # log-reopen signal handler (by design, see above). Plain 'create' would
+    # rename the file while the server kept writing to the now-unlinked inode,
+    # and all subsequent output would be silently lost. copytruncate copies
+    # then truncates in place, so the open fd keeps working.
+    #
+    # The trade-off is a small race: lines written between the copy and the
+    # truncate are lost. That is acceptable for a file-redirect fallback; if
+    # you cannot tolerate it, use the journal (the supported path) or a log
+    # shipper that reads the stream directly.
+    copytruncate
+}

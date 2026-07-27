@@ -57,7 +57,7 @@ TEST(FlvWriterTest, DoubleEncodingIsBigEndianIeee754) {
     auto be = encode_double_be(1.0);
     EXPECT_EQ(static_cast<std::uint8_t>(be[0]), 0x3F);
     EXPECT_EQ(static_cast<std::uint8_t>(be[1]), 0xF0);
-    for (int i = 2; i < 8; ++i) EXPECT_EQ(static_cast<std::uint8_t>(be[i]), 0x00);
+    for (std::size_t i = 2; i < 8; ++i) EXPECT_EQ(static_cast<std::uint8_t>(be[i]), 0x00);
 }
 
 TEST(FlvWriterTest, OnMetaDataPlaceholderOffsetsPointAtTheirDoubles) {
@@ -101,6 +101,45 @@ TEST(FlvWriterTest, ParseRejectsTruncatedTag) {
     file.insert(file.end(), header.begin(), header.end());
     // A tag header claiming DataSize=100 but no data follows.
     for (int b : {0x09, 0x00, 0x00, 0x64, 0, 0, 0, 0, 0, 0, 0}) file.push_back(static_cast<std::byte>(b));
+    EXPECT_FALSE(parse_flv(std::span<const std::byte>(file.data(), file.size())).ok());
+}
+
+
+// Phase 8: found by the FLV fuzz harness under ASan (container-overflow in
+// read_u32_be via parse_flv). DataOffset was validated only against
+// data.size(), but PreviousTagSize0 is read as four bytes starting AT that
+// offset — so any DataOffset in [size-3, size] passed validation and then read
+// past the end of the buffer.
+TEST(FlvWriterTest, ParseRejectsDataOffsetLeavingNoRoomForPreviousTagSize) {
+    for (std::uint32_t slack = 0; slack < 4; ++slack) {
+        std::vector<std::byte> file;
+        auto header = encode_file_header(true, true);
+        file.assign(header.begin(), header.end());
+        // Pad so the file is comfortably larger than the header, then point
+        // DataOffset at a position with fewer than 4 bytes left after it.
+        for (int i = 0; i < 32; ++i) file.push_back(std::byte{0});
+
+        const auto offset = static_cast<std::uint32_t>(file.size() - slack);
+        file[5] = static_cast<std::byte>((offset >> 24) & 0xFF);
+        file[6] = static_cast<std::byte>((offset >> 16) & 0xFF);
+        file[7] = static_cast<std::byte>((offset >> 8) & 0xFF);
+        file[8] = static_cast<std::byte>(offset & 0xFF);
+
+        EXPECT_FALSE(parse_flv(std::span<const std::byte>(file.data(), file.size())).ok())
+            << "DataOffset leaving " << slack << " trailing byte(s) must be rejected";
+    }
+}
+
+TEST(FlvWriterTest, ParseRejectsDataOffsetPastEndOfFile) {
+    std::vector<std::byte> file;
+    auto header = encode_file_header(true, true);
+    file.assign(header.begin(), header.end());
+    for (int i = 0; i < 16; ++i) file.push_back(std::byte{0});
+
+    file[5] = std::byte{0xFF};
+    file[6] = std::byte{0xFF};
+    file[7] = std::byte{0xFF};
+    file[8] = std::byte{0xFF};
     EXPECT_FALSE(parse_flv(std::span<const std::byte>(file.data(), file.size())).ok());
 }
 

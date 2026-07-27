@@ -4,6 +4,7 @@ add_executable(rtmp_server_management_tests
     stream_manager_test.cpp
     authorization_cache_test.cpp
     stream_manager_persistence_test.cpp
+    query_parser_test.cpp
 )
 
 target_link_libraries(rtmp_server_management_tests PRIVATE
