@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "rtmp_server/core/error.hpp"
+#include "rtmp_server/observability/metrics.hpp"
 #include "rtmp_server/protocol/chunk/chunk_decoder.hpp"
 #include "rtmp_server/protocol/chunk/chunk_encoder.hpp"
 #include "rtmp_server/protocol/commands/command_session.hpp"
@@ -89,6 +90,11 @@ public:
     // fragmentation. No-op once failed().
     void on_bytes_received(std::span<const std::byte> data);
 
+    // Phase 7 observability. Non-owning, optional, must outlive the session.
+    // Feeds ingress_bytes_total from the single point every inbound RTMP byte
+    // passes through.
+    void set_metrics(observability::Metrics* metrics) noexcept { metrics_ = metrics; }
+
     // Must be called exactly once by the connection owner on socket
     // disconnect (regardless of state — mid-handshake reuse is not this
     // class's concern) so any publisher/viewer registration this session
@@ -115,6 +121,7 @@ private:
     CloseHandler close_handler_;
     std::vector<std::byte> out_scratch_;
     bool failed_ = false;
+    observability::Metrics* metrics_ = nullptr; // not owned, may be null
     bool closed_ = false;
     bool started_ = false;
 };

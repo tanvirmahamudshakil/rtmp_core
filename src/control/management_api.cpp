@@ -278,13 +278,22 @@ HttpResponse ManagementApi::handle_health_ready() {
 
 HttpResponse ManagementApi::handle_metrics() {
     if (metrics_ == nullptr) return HttpResponse::json(200, "");
-    std::ostringstream os;
-    for (const auto& [name, value] : metrics_->counters_snapshot()) os << name << " " << value << "\n";
-    for (const auto& [name, value] : metrics_->gauges_snapshot()) os << name << " " << value << "\n";
+
+    // Phase 7: refresh the derived series at scrape time. Both calls are
+    // cheap, bounded and non-blocking (an RSS query and two subtractions) —
+    // this handler already runs on the management HTTP thread, never on an
+    // RTMP event-loop worker, so sampling here does not violate the
+    // "no work on network workers" rule.
+    metrics_->refresh_process_metrics();
+    metrics_->refresh_derived();
+
     HttpResponse r;
     r.status = 200;
     r.content_type = "text/plain; version=0.0.4";
-    r.body = os.str();
+    // Full exposition format (HELP/TYPE + declared catalog + bounded
+    // per-worker series + legacy dynamic names) instead of the bare
+    // "name value" lines this endpoint emitted before Phase 7.
+    r.body = metrics_->render_prometheus();
     return r;
 }
 

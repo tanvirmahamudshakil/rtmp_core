@@ -41,7 +41,12 @@ bool RtmpAuthenticator::ip_locked_out_locked(const std::string& client_ip) const
 }
 
 void RtmpAuthenticator::record_auth_result_locked(const std::string& client_ip, bool success) {
-    if (client_ip.empty() || success) return;
+    if (success) return;
+    // Counted even when client_ip is empty (the per-IP lockout below cannot
+    // be, but the global failure rate is exactly what an operator alerts on,
+    // and dropping unattributed failures would under-report an attack).
+    if (metrics_ != nullptr) metrics_->increment(observability::MetricId::AuthenticationFailures);
+    if (client_ip.empty()) return;
     auto now = core::monotonic_now();
     auto& window = auth_failures_per_ip_[client_ip];
     if (now - window.window_start > limits_.auth_failure_window) {
@@ -132,20 +137,34 @@ protocol::commands::PlaybackAuthorizer RtmpAuthenticator::playback_authorizer() 
 }
 
 bool RtmpAuthenticator::admit_connection(std::string_view client_ip) {
-    if (client_ip.empty()) return true; // can't bound what we can't identify.
-    std::lock_guard<std::mutex> lock(mutex_);
-    auto& count = connections_per_ip_[std::string(client_ip)];
-    if (count >= limits_.max_connections_per_ip) return false;
-    ++count;
+    if (client_ip.empty()) {
+        // Can't bound what we can't identify, but it is still a connection.
+        if (metrics_ != nullptr) metrics_->add(observability::MetricId::ActiveConnections, +1);
+        return true;
+    }
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto& count = connections_per_ip_[std::string(client_ip)];
+        if (count >= limits_.max_connections_per_ip) return false; // not admitted: gauge untouched
+        ++count;
+    }
+    if (metrics_ != nullptr) metrics_->add(observability::MetricId::ActiveConnections, +1);
     return true;
 }
 
 void RtmpAuthenticator::release_connection(std::string_view client_ip) {
-    if (client_ip.empty()) return;
-    std::lock_guard<std::mutex> lock(mutex_);
-    auto it = connections_per_ip_.find(std::string(client_ip));
-    if (it == connections_per_ip_.end()) return;
-    if (--it->second == 0) connections_per_ip_.erase(it);
+    if (client_ip.empty()) {
+        // Mirrors the admit_connection() empty-IP branch, which did count it.
+        if (metrics_ != nullptr) metrics_->add(observability::MetricId::ActiveConnections, -1);
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto it = connections_per_ip_.find(std::string(client_ip));
+        if (it == connections_per_ip_.end()) return; // never admitted: gauge untouched
+        if (--it->second == 0) connections_per_ip_.erase(it);
+    }
+    if (metrics_ != nullptr) metrics_->add(observability::MetricId::ActiveConnections, -1);
 }
 
 void RtmpAuthenticator::on_viewer_attached(std::string_view application, std::string_view stream_name) {

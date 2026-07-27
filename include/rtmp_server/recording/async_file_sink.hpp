@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "rtmp_server/core/result.hpp"
+#include "rtmp_server/observability/metrics.hpp"
 #include "rtmp_server/recording/file_sink.hpp"
 
 namespace rtmp_server::recording {
@@ -130,6 +131,13 @@ public:
     [[nodiscard]] const std::string& final_path() const noexcept { return final_path_; }
     [[nodiscard]] const std::string& temp_path() const noexcept { return temp_path_; }
 
+    // Phase 7 observability. Non-owning, optional; must be set before the
+    // sink starts taking traffic and must outlive the sink. Feeds
+    // recording_queue_depth (queued bytes, updated on every enqueue — a
+    // single relaxed atomic store, no allocation) and recording_failures
+    // (queue overflow and any error that takes the sink unhealthy).
+    void set_metrics(observability::Metrics* metrics) noexcept { metrics_ = metrics; }
+
 private:
     AsyncFileSink(int fd, std::string final_path, std::string temp_path, Options options);
 
@@ -168,6 +176,8 @@ private:
     std::uint64_t bytes_since_disk_check_ = 0; // writer-thread-only
 
     std::thread writer_;
+
+    observability::Metrics* metrics_ = nullptr; // not owned, may be null
 };
 
 } // namespace rtmp_server::recording

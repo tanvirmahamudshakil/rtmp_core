@@ -50,6 +50,13 @@ add_subdirectory(apps/flv_inspector)
 # load_bench is a synthetic in-process load generator (Phase 9), also pure
 # protocol-layer code — builds everywhere.
 add_subdirectory(apps/load_bench)
+# Phase 7 real load generator: real TCP sockets + real RTMP handshake and
+# commands. POSIX sockets only (no io_uring), so it builds everywhere.
+add_subdirectory(src/loadgen)
+add_subdirectory(apps/rtmp_load_gen)
+# TEST-ONLY poll-based server so the load generator has something to drive on
+# hosts without io_uring. Never deployed; see its main.cpp header comment.
+add_subdirectory(apps/rtmp_test_server)
 # SQLite-backed persistence (Phase 9): system libsqlite3, no io_uring, builds
 # everywhere.
 add_subdirectory(src/persistence)
@@ -87,6 +94,7 @@ if(RTMP_SERVER_BUILD_TESTS)
     add_subdirectory(tests/management)
     add_subdirectory(tests/persistence)
     add_subdirectory(tests/integration)
+    add_subdirectory(tests/load)
     if(NOT RTMP_SERVER_CORE_ONLY AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
         add_subdirectory(tests/io_uring)
     endif()

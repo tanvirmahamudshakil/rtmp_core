@@ -6,6 +6,7 @@ add_executable(rtmp_server_unit_tests
     core/hmac_test.cpp
     observability/audit_log_test.cpp
     observability/metrics_test.cpp
+    observability/logger_test.cpp
 )
 
 target_link_libraries(rtmp_server_unit_tests PRIVATE

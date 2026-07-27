@@ -8,6 +8,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "rtmp_server/observability/metrics.hpp"
 #include "rtmp_server/protocol/commands/gop_cache.hpp"
 #include "rtmp_server/protocol/commands/shared_media_frame.hpp"
 #include "rtmp_server/protocol/commands/stream_ids.hpp"
@@ -142,6 +143,32 @@ public:
 
     [[nodiscard]] std::size_t subscriber_count(StreamId stream_id) const;
 
+    // Phase 7 observability. Optional and non-owning; the embedder (server
+    // main, or a test) owns the registry and must outlive this LiveFanout.
+    // When null, every metric call site below compiles to a null check —
+    // no behavioural change for the Phase 1-6 tests that never set it.
+    //
+    // What is recorded on the hot path (lock-free atomic adds only):
+    //   dropped_video_frames / dropped_audio_frames  (ViewerQueue DropAndWait)
+    //   slow_viewer_recoveries                       (DeliverResumed)
+    //   slow_viewer_evictions                        (Evict)
+    //   active_viewers                               (subscribe/unsubscribe)
+    //   egress_bytes_total                           (bytes actually handed
+    //                                                 to a PlaybackSink)
+    // Gauges that require walking every stream (gop_cache_bytes,
+    // outbound_queue_bytes, viewers_per_stream) are NOT maintained on the
+    // hot path — see sample_gauges() below.
+    void set_metrics(observability::Metrics* metrics) noexcept { metrics_ = metrics; }
+
+    // Walks every live stream under its own per-stream lock and publishes the
+    // aggregate gauges: gop_cache_bytes/packets, outbound_queue_bytes/packets
+    // and the viewers_per_stream max/mean aggregation. Intended to be called
+    // from a low-frequency sampler thread or from the /metrics handler, NOT
+    // from the media path: it is O(streams + subscribers) and takes locks.
+    // No PlaybackSink callback is invoked, so it cannot deadlock against
+    // run_deliveries().
+    void sample_gauges();
+
 private:
     struct Subscriber {
         PlaybackSink* sink;
@@ -197,6 +224,7 @@ private:
     ForwardHook forward_hook_;
     SubscriptionHook subscription_hook_;
     StreamEndHook stream_end_hook_;
+    observability::Metrics* metrics_ = nullptr; // not owned, may be null
 };
 
 } // namespace rtmp_server::protocol::commands

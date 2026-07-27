@@ -57,6 +57,9 @@ std::vector<LiveFanout::PendingDelivery> LiveFanout::dispatch_locked(StreamState
                 deliveries.push_back(PendingDelivery{sub.sink, kind, std::nullopt, std::nullopt, frame});
                 break;
             case ViewerQueue::Decision::DeliverResumed: {
+                // This viewer was stalled in WaitingForKeyframe and just got
+                // the keyframe that lets it resume: a recovery, not a drop.
+                if (metrics_ != nullptr) metrics_->increment(observability::MetricId::SlowViewerRecoveries);
                 PendingDelivery delivery{sub.sink, kind, std::nullopt, std::nullopt, frame};
                 if (state.video_sequence_header) delivery.resend_video_seq_header = state.video_sequence_header;
                 if (state.audio_sequence_header) delivery.resend_audio_seq_header = state.audio_sequence_header;
@@ -64,6 +67,19 @@ std::vector<LiveFanout::PendingDelivery> LiveFanout::dispatch_locked(StreamState
                 break;
             }
             case ViewerQueue::Decision::DropAndWait:
+                // Counted per (frame, viewer) pair: 100 backed-up viewers
+                // dropping the same frame is 100 dropped deliveries, which is
+                // what an operator needs to see. These are plain atomic adds,
+                // safe to do while state.mutex is held (no reentrancy, no
+                // subscriber callback) — same justification as
+                // subscription_hook_ below.
+                // Metadata (is_video == is_audio == false) is deliberately
+                // counted under neither: it is not a media frame and folding
+                // it into dropped_audio_frames would mislead.
+                if (metrics_ != nullptr && (is_video || is_audio)) {
+                    metrics_->increment(is_video ? observability::MetricId::DroppedVideoFrames
+                                                 : observability::MetricId::DroppedAudioFrames);
+                }
                 break;
             case ViewerQueue::Decision::Evict:
                 evict_ids.push_back(id);
@@ -77,6 +93,11 @@ std::vector<LiveFanout::PendingDelivery> LiveFanout::dispatch_locked(StreamState
         deliveries.push_back(PendingDelivery{it->second.sink, PendingDelivery::Kind::Evict, std::nullopt,
                                               std::nullopt, SharedMediaFrame{}});
         state.subscribers.erase(it);
+        if (metrics_ != nullptr) {
+            metrics_->increment(observability::MetricId::SlowViewerEvictions);
+            metrics_->increment(observability::MetricId::ViewerDisconnects);
+            metrics_->add(observability::MetricId::ActiveViewers, -1);
+        }
         if (subscription_hook_) subscription_hook_(stream_id, -1);
     }
 
@@ -84,9 +105,24 @@ std::vector<LiveFanout::PendingDelivery> LiveFanout::dispatch_locked(StreamState
 }
 
 void LiveFanout::run_deliveries(std::vector<PendingDelivery> deliveries) {
+    // Bytes actually handed to viewer sinks. Accumulated locally and folded
+    // into the counter once, rather than one atomic add per viewer per
+    // frame — at 1,000 viewers that is the difference between 1 and 1,000
+    // contended RMWs on the same cache line per media frame.
+    std::uint64_t egress_bytes = 0;
+
     for (auto& delivery : deliveries) {
-        if (delivery.resend_video_seq_header) delivery.sink->on_video(*delivery.resend_video_seq_header);
-        if (delivery.resend_audio_seq_header) delivery.sink->on_audio(*delivery.resend_audio_seq_header);
+        if (delivery.resend_video_seq_header) {
+            egress_bytes += delivery.resend_video_seq_header->payload.size();
+            delivery.sink->on_video(*delivery.resend_video_seq_header);
+        }
+        if (delivery.resend_audio_seq_header) {
+            egress_bytes += delivery.resend_audio_seq_header->payload.size();
+            delivery.sink->on_audio(*delivery.resend_audio_seq_header);
+        }
+        if (delivery.kind != PendingDelivery::Kind::Evict) {
+            egress_bytes += delivery.frame.payload.size();
+        }
         switch (delivery.kind) {
             case PendingDelivery::Kind::Audio:
                 delivery.sink->on_audio(delivery.frame);
@@ -101,6 +137,10 @@ void LiveFanout::run_deliveries(std::vector<PendingDelivery> deliveries) {
                 delivery.sink->on_slow_client_evicted();
                 break;
         }
+    }
+
+    if (metrics_ != nullptr && egress_bytes > 0) {
+        metrics_->increment(observability::MetricId::EgressBytesTotal, egress_bytes);
     }
 }
 
@@ -198,6 +238,7 @@ void LiveFanout::subscribe(StreamId stream_id, SubscriberId subscriber_id, Playb
         }
     }
 
+    if (metrics_ != nullptr) metrics_->add(observability::MetricId::ActiveViewers, +1);
     if (subscription_hook_) subscription_hook_(stream_id, +1);
 }
 
@@ -213,7 +254,13 @@ void LiveFanout::unsubscribe(StreamId stream_id, SubscriberId subscriber_id) {
         std::lock_guard<std::mutex> lock(state.mutex);
         erased = state.subscribers.erase(subscriber_id.raw()); // no-op on a missing key: idempotent
     }
-    if (erased > 0 && subscription_hook_) subscription_hook_(stream_id, -1);
+    if (erased > 0) {
+        if (metrics_ != nullptr) {
+            metrics_->add(observability::MetricId::ActiveViewers, -1);
+            metrics_->increment(observability::MetricId::ViewerDisconnects);
+        }
+        if (subscription_hook_) subscription_hook_(stream_id, -1);
+    }
 }
 
 void LiveFanout::publisher_stopped(StreamId stream_id) {
@@ -235,7 +282,62 @@ void LiveFanout::publisher_stopped(StreamId stream_id) {
     for (auto& [id, sub] : removed->subscribers) sinks.push_back(sub.sink);
     for (auto* sink : sinks) sink->on_publisher_stopped();
 
+    if (metrics_ != nullptr) {
+        metrics_->increment(observability::MetricId::PublisherDisconnects);
+        // Every subscriber of this stream is gone too; they were counted in
+        // active_viewers at subscribe() time, so unwind them all here rather
+        // than leaving the gauge permanently inflated after a publisher ends.
+        const auto viewers = static_cast<std::int64_t>(sinks.size());
+        if (viewers > 0) {
+            metrics_->add(observability::MetricId::ActiveViewers, -viewers);
+            metrics_->increment(observability::MetricId::ViewerDisconnects, static_cast<std::uint64_t>(viewers));
+        }
+    }
+
     if (stream_end_hook_) stream_end_hook_(stream_id);
+}
+
+void LiveFanout::sample_gauges() {
+    if (metrics_ == nullptr) return;
+
+    // Snapshot the node pointers under the structural lock only, then release
+    // it before touching any per-stream mutex — same lock-ordering discipline
+    // the media path uses (streams_mutex_ is never held across state.mutex).
+    // StreamState nodes are held by unique_ptr and are address-stable, but a
+    // concurrent publisher_stopped() could destroy one after we drop
+    // streams_mutex_, so copy the owning shared state instead: here we take
+    // the simpler, provably-safe route of doing the whole walk under
+    // streams_mutex_, which blocks only structural changes (publish/stop),
+    // not the media hot path.
+    std::uint64_t gop_bytes = 0;
+    std::uint64_t gop_packets = 0;
+    std::uint64_t queue_bytes = 0;
+    std::uint64_t queue_packets = 0;
+    std::vector<std::int64_t> viewers_per_stream;
+
+    {
+        std::lock_guard<std::mutex> structural_lock(streams_mutex_);
+        viewers_per_stream.reserve(streams_.size());
+        for (const auto& [raw_id, node] : streams_) {
+            std::lock_guard<std::mutex> lock(node->mutex);
+            gop_bytes += node->gop_cache.total_bytes();
+            gop_packets += node->gop_cache.packet_count();
+            for (const auto& [sub_id, sub] : node->subscribers) {
+                queue_bytes += sub.queue.bytes();
+                queue_packets += sub.queue.packet_count();
+            }
+            viewers_per_stream.push_back(static_cast<std::int64_t>(node->subscribers.size()));
+        }
+    }
+
+    metrics_->set(observability::MetricId::GopCacheBytes, static_cast<std::int64_t>(gop_bytes));
+    metrics_->set(observability::MetricId::GopCachePackets, static_cast<std::int64_t>(gop_packets));
+    metrics_->set(observability::MetricId::OutboundQueueBytes, static_cast<std::int64_t>(queue_bytes));
+    metrics_->set(observability::MetricId::OutboundQueuePackets, static_cast<std::int64_t>(queue_packets));
+
+    // Aggregate, never per-stream-labelled: stream count is unbounded.
+    for (const std::int64_t viewers : viewers_per_stream) metrics_->observe_viewers_per_stream(viewers);
+    metrics_->commit_viewers_per_stream();
 }
 
 std::size_t LiveFanout::subscriber_count(StreamId stream_id) const {
