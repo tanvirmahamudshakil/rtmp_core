@@ -13,12 +13,14 @@ or configure a CDN.
 Ubuntu 24.04+ or Debian 13+ with systemd:
 
 ```bash
-sudo env \
-  RTMP_DOMAIN=stream.example.com \
-  RTMP_BANDWIDTH_MBIT=auto \
-  RTMP_EXPECTED_STREAM_MBIT=2.5 \
-  bash scripts/install-linux.sh
+git clone https://github.com/tanvirmahamudshakil/rtmp_core.git
+cd rtmp_core
+sudo env RTMP_BANDWIDTH_MBIT=auto bash scripts/install-linux.sh
 ```
+
+With no domain, the installer detects the VPS primary IPv4 address and serves
+the panel over HTTP on that IP. Add `RTMP_DOMAIN=stream.example.com` when DNS
+is ready to let Caddy provision HTTPS automatically.
 
 The installer builds the hardened production binary and admin panel, installs
 Caddy with automatic HTTPS, creates an isolated system user, generates
@@ -28,9 +30,21 @@ detects the public network interface, and runs a readiness check.
 `RTMP_BANDWIDTH_MBIT=auto` reads the primary NIC's reported link speed using
 Linux sysfs/ethtool. On virtual VPS interfaces that number can be higher than
 the bandwidth purchased from the provider, so set the committed Mbps
-explicitly whenever it differs. `RTMP_EXPECTED_STREAM_MBIT` remains required
-because bandwidth alone cannot determine viewer count. The installer has no
-fixed 10,000-viewer cap; it calculates limits from:
+explicitly whenever it differs.
+
+Stream bitrate is automatic by default. The server is a media passthrough: it
+does not re-encode or force a bitrate, so viewers receive the bitrate sent by
+OBS or an upstream transcoder. After publishing starts, the admin panel first
+uses measured egress per active viewer; before a viewer connects, it uses
+measured ingress per active publisher. The live estimate refreshes with the
+server metrics.
+
+Before the first publisher connects there is no bitrate to measure, but the
+installer still has to create finite socket, buffer and file-descriptor safety
+limits. It uses `RTMP_RESOURCE_SIZING_MBIT=0.50` only for that pre-live
+resource ceiling; this value never alters the media. An advanced operator can
+change that sizing floor, or supply a numeric `RTMP_EXPECTED_STREAM_MBIT` as a
+backward-compatible capacity override. The capacity relationship is:
 
 ```text
 viewer budget = bandwidth × utilization ÷ (per-viewer bitrate × protocol overhead)
@@ -42,16 +56,15 @@ uplink through 10 Gbps; above that it switches to lower-overhead Linux `fq`
 per-flow pacing so the queue discipline does not become the throughput
 bottleneck.
 
-The detected/declared value is written to the installer-owned
-`runtime-config.json`, so the admin dashboard and capacity planner load the
-server bandwidth automatically instead of starting from a hard-coded UI
-value.
+The detected/declared bandwidth and auto-bitrate mode are written to the
+installer-owned `runtime-config.json`, so the admin dashboard loads the server
+link automatically instead of starting from a hard-coded UI value.
 
 After installation:
 
 - Admin credential: `/root/streamforge-credentials.txt`
-- Admin panel: `https://RTMP_DOMAIN`
-- RTMP origin: `rtmp://RTMP_DOMAIN:1935`
+- Admin panel: `http://VPS_IP` without a domain, otherwise `https://RTMP_DOMAIN`
+- RTMP origin: `rtmp://VPS_IP:1935` without a domain, otherwise `rtmp://RTMP_DOMAIN:1935`
 - Service logs: `journalctl -u rtmp-server -f`
 
 ## Operator flow
@@ -90,7 +103,9 @@ Examples with the installer's default 90% utilization and 5% overhead:
 | 60,000 Mbps | 0.85 Mbps | 60,504 |
 
 The installer also scales the process connection ceiling, per-worker receive
-buffer pool and systemd file-descriptor limit from the calculated budget.
+buffer pool and systemd file-descriptor limit from the pre-live safety budget.
+The dashboard's live viewer estimate uses the current measured bitrate, not
+that sizing floor.
 
 ## Development build
 

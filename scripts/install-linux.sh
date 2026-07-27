@@ -4,14 +4,19 @@
 #
 # Quick start:
 #   sudo env RTMP_DOMAIN=stream.example.com RTMP_BANDWIDTH_MBIT=auto \
-#     RTMP_EXPECTED_STREAM_MBIT=2.5 bash scripts/install-linux.sh
+#     bash scripts/install-linux.sh
 #
 # Supported inputs:
 #   RTMP_DOMAIN                  DNS name for HTTPS panel and RTMP URLs.
 #                                Empty = HTTP on the server's primary IP.
 #   RTMP_BANDWIDTH_MBIT          "auto" (default) reads the NIC-reported link
 #                                speed; set Mbps explicitly for provider caps.
-#   RTMP_EXPECTED_STREAM_MBIT    Required average bitrate delivered to one viewer.
+#   RTMP_EXPECTED_STREAM_MBIT    "auto" (default) keeps OBS/transcoder bitrate
+#                                unchanged and measures it while live. A numeric
+#                                value only overrides install-time capacity sizing.
+#   RTMP_RESOURCE_SIZING_MBIT    Pre-live socket/buffer sizing floor used only
+#                                in auto mode (default 0.50 Mbps). It never
+#                                changes or transcodes media.
 #   RTMP_LINK_UTILIZATION_PERCENT
 #                                Capacity target (default 90, accepted 50-95).
 #   RTMP_PROTOCOL_OVERHEAD_PERCENT
@@ -62,7 +67,8 @@ esac
 
 DOMAIN="${RTMP_DOMAIN:-}"
 BANDWIDTH_MBIT="${RTMP_BANDWIDTH_MBIT:-auto}"
-EXPECTED_STREAM_MBIT="${RTMP_EXPECTED_STREAM_MBIT:-}"
+EXPECTED_STREAM_MBIT="${RTMP_EXPECTED_STREAM_MBIT:-auto}"
+RESOURCE_SIZING_MBIT="${RTMP_RESOURCE_SIZING_MBIT:-0.50}"
 LINK_UTILIZATION_PERCENT="${RTMP_LINK_UTILIZATION_PERCENT:-90}"
 PROTOCOL_OVERHEAD_PERCENT="${RTMP_PROTOCOL_OVERHEAD_PERCENT:-5}"
 MAX_CONNECTIONS_PER_IP="${RTMP_MAX_CONNECTIONS_PER_IP:-1000}"
@@ -76,7 +82,12 @@ if [[ "${BANDWIDTH_MBIT}" != "auto" ]]; then
   (( BANDWIDTH_MBIT <= 1000000 )) || die "RTMP_BANDWIDTH_MBIT is outside the supported range."
   (( BANDWIDTH_MBIT >= 10 )) || die "RTMP_BANDWIDTH_MBIT must be at least 10 Mbps."
 fi
-[[ "${EXPECTED_STREAM_MBIT}" =~ ^[0-9]+([.][0-9]+)?$ ]] || die "RTMP_EXPECTED_STREAM_MBIT must be numeric."
+if [[ "${EXPECTED_STREAM_MBIT}" != "auto" ]]; then
+  [[ "${EXPECTED_STREAM_MBIT}" =~ ^[0-9]+([.][0-9]+)?$ ]] ||
+    die "RTMP_EXPECTED_STREAM_MBIT must be 'auto' or numeric Mbps."
+fi
+[[ "${RESOURCE_SIZING_MBIT}" =~ ^[0-9]+([.][0-9]+)?$ ]] ||
+  die "RTMP_RESOURCE_SIZING_MBIT must be numeric."
 [[ "${LINK_UTILIZATION_PERCENT}" =~ ^[0-9]+$ ]] ||
   die "RTMP_LINK_UTILIZATION_PERCENT must be a whole percentage."
 (( LINK_UTILIZATION_PERCENT >= 50 && LINK_UTILIZATION_PERCENT <= 95 )) ||
@@ -95,8 +106,21 @@ fi
 if [[ -n "${DOMAIN}" && ! "${DOMAIN}" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]]; then
   die "RTMP_DOMAIN must be a hostname without a URL scheme, path, port or whitespace."
 fi
-awk -v value="${EXPECTED_STREAM_MBIT}" 'BEGIN { exit !(value >= 0.05 && value <= 100) }' ||
-  die "RTMP_EXPECTED_STREAM_MBIT must be between 0.05 and 100 Mbps."
+if [[ "${EXPECTED_STREAM_MBIT}" != "auto" ]]; then
+  awk -v value="${EXPECTED_STREAM_MBIT}" 'BEGIN { exit !(value >= 0.05 && value <= 100) }' ||
+    die "RTMP_EXPECTED_STREAM_MBIT must be between 0.05 and 100 Mbps."
+fi
+awk -v value="${RESOURCE_SIZING_MBIT}" 'BEGIN { exit !(value >= 0.05 && value <= 100) }' ||
+  die "RTMP_RESOURCE_SIZING_MBIT must be between 0.05 and 100 Mbps."
+
+BITRATE_MODE="auto"
+CAPACITY_STREAM_MBIT="${RESOURCE_SIZING_MBIT}"
+EXPECTED_STREAM_JSON="null"
+if [[ "${EXPECTED_STREAM_MBIT}" != "auto" ]]; then
+  BITRATE_MODE="fixed-capacity-override"
+  CAPACITY_STREAM_MBIT="${EXPECTED_STREAM_MBIT}"
+  EXPECTED_STREAM_JSON="${EXPECTED_STREAM_MBIT}"
+fi
 
 log "Installing compiler, runtime, web server and network tooling"
 export DEBIAN_FRONTEND=noninteractive
@@ -159,7 +183,7 @@ if [[ "${BANDWIDTH_MBIT}" == "auto" ]]; then
   log "Auto-detected ${BANDWIDTH_MBIT} Mbps on ${PRIMARY_INTERFACE}; provider shaping may be lower"
 fi
 
-MAX_VIEWERS="$(awk -v bw="${BANDWIDTH_MBIT}" -v rate="${EXPECTED_STREAM_MBIT}" \
+MAX_VIEWERS="$(awk -v bw="${BANDWIDTH_MBIT}" -v rate="${CAPACITY_STREAM_MBIT}" \
   -v utilization="${LINK_UTILIZATION_PERCENT}" -v overhead="${PROTOCOL_OVERHEAD_PERCENT}" \
   'BEGIN {
     value=int((bw * (utilization / 100.0)) / (rate * (1.0 + overhead / 100.0)));
@@ -224,7 +248,9 @@ cat > /var/www/streamforge/runtime-config.json <<EOF
 {
   "bandwidth_mbps": ${BANDWIDTH_MBIT},
   "bandwidth_source": "${BANDWIDTH_SOURCE_KIND}",
-  "expected_stream_mbps": ${EXPECTED_STREAM_MBIT},
+  "bitrate_mode": "${BITRATE_MODE}",
+  "expected_stream_mbps": ${EXPECTED_STREAM_JSON},
+  "resource_sizing_stream_mbps": ${CAPACITY_STREAM_MBIT},
   "utilization_percent": ${LINK_UTILIZATION_PERCENT},
   "protocol_overhead_percent": ${PROTOCOL_OVERHEAD_PERCENT},
   "viewer_budget": ${MAX_VIEWERS}
@@ -289,6 +315,8 @@ Admin URL: $(if [[ -n "${DOMAIN}" ]]; then printf 'https://%s' "${DOMAIN}"; else
 RTMP origin: rtmp://${PUBLIC_HOST}:1935
 Admin token: ${ADMIN_TOKEN}
 Capacity bandwidth: ${BANDWIDTH_MBIT} Mbps (${BANDWIDTH_SOURCE})
+Bitrate mode: $(if [[ "${BITRATE_MODE}" == "auto" ]]; then printf 'OBS/transcoder passthrough, measured while live'; else printf 'manual capacity override (%s Mbps)' "${EXPECTED_STREAM_MBIT}"; fi)
+Pre-live viewer safety ceiling: ${MAX_VIEWERS}
 Generated: $(date -u +%Y-%m-%dT%H:%M:%SZ)
 
 Keep this file private. The admin token controls stream creation and key rotation.
@@ -500,8 +528,14 @@ printf '  RTMP origin:      rtmp://%s:1935\n' "${PUBLIC_HOST}"
 printf '  Network device:   %s\n' "${PRIMARY_INTERFACE}"
 printf '  Link bandwidth:   %s Mbps — %s\n' "${BANDWIDTH_MBIT}" "${BANDWIDTH_SOURCE}"
 printf '  Media workers:    %s\n' "${WORKERS}"
-printf '  Viewer budget:    %s at %s Mbps (%s%% link, %s%% overhead)\n' \
-  "${MAX_VIEWERS}" "${EXPECTED_STREAM_MBIT}" "${LINK_UTILIZATION_PERCENT}" "${PROTOCOL_OVERHEAD_PERCENT}"
+if [[ "${BITRATE_MODE}" == "auto" ]]; then
+  printf '  Bitrate source:   OBS/transcoder traffic, measured after publishing starts\n'
+  printf '  Safety ceiling:   %s viewers (resources sized at %s Mbps; media is not altered)\n' \
+    "${MAX_VIEWERS}" "${CAPACITY_STREAM_MBIT}"
+else
+  printf '  Capacity ceiling: %s viewers at %s Mbps (%s%% link, %s%% overhead)\n' \
+    "${MAX_VIEWERS}" "${CAPACITY_STREAM_MBIT}" "${LINK_UTILIZATION_PERCENT}" "${PROTOCOL_OVERHEAD_PERCENT}"
+fi
 if [[ "${ENABLE_FAIR_QUEUE}" == "1" ]]; then
   if (( SHAPE_MBIT <= 10000 )); then
     printf '  Fair queue:       CAKE at %s Mbps\n' "${SHAPE_MBIT}"

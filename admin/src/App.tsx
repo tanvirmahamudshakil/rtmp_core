@@ -584,19 +584,26 @@ function CapacityPage({
   bandwidth,
   setBandwidth,
   currentEgress,
-  viewers
+  viewers,
+  measuredBitrateMbps,
+  measuredBitrateSource
 }: {
   bandwidth: number;
   setBandwidth: (value: number) => void;
   currentEgress: number;
   viewers: number;
+  measuredBitrateMbps: number;
+  measuredBitrateSource: string;
 }) {
-  const [bitrateMbps, setBitrateMbps] = useState(1);
+  const [manualBitrateMbps, setManualBitrateMbps] = useState(1);
+  const [autoBitrate, setAutoBitrate] = useState(true);
   const [headroom, setHeadroom] = useState(10);
   const [overhead, setOverhead] = useState(5);
+  const hasMeasuredBitrate = measuredBitrateMbps > 0;
+  const bitrateMbps = autoBitrate ? measuredBitrateMbps : manualBitrateMbps;
   const usable = bandwidth * (1 - headroom / 100);
-  const perViewer = bitrateMbps * (1 + overhead / 100);
-  const theoretical = Math.floor(usable / perViewer);
+  const perViewer = bitrateMbps > 0 ? bitrateMbps * (1 + overhead / 100) : 0;
+  const theoretical = perViewer > 0 ? Math.floor(usable / perViewer) : null;
   const currentUse = bandwidth ? (currentEgress / 1e6 / bandwidth) * 100 : 0;
   return (
     <div className="capacity-grid">
@@ -623,29 +630,52 @@ function CapacityPage({
           <div className="range-bounds"><span>100 Mbps</span><span>100 Gbps · enter higher above</span></div>
         </div>
         <div className="planner-input-grid">
-          <label>Average stream bitrate<div className="unit-input"><input type="number" min=".1" step=".1" value={bitrateMbps} onChange={(event) => setBitrateMbps(Math.max(.1, Number(event.target.value)))} /><span>Mbps</span></div></label>
+          <div className="planner-setting">
+            <label htmlFor="stream-bitrate">Stream bitrate</label>
+            <div className="unit-input">
+              <input
+                id="stream-bitrate"
+                type="number"
+                min=".01"
+                step=".01"
+                placeholder="Waiting for live media"
+                disabled={autoBitrate}
+                value={autoBitrate ? (hasMeasuredBitrate ? measuredBitrateMbps.toFixed(3) : "") : manualBitrateMbps}
+                onChange={(event) => setManualBitrateMbps(Math.max(.01, Number(event.target.value) || .01))}
+              />
+              <span>Mbps</span>
+            </div>
+            <button type="button" className={`bitrate-mode ${autoBitrate ? "active" : ""}`} aria-pressed={autoBitrate} onClick={() => setAutoBitrate((current) => !current)}>
+              <RadioTower size={13} /> {autoBitrate ? "Auto from live traffic" : "Use automatic bitrate"}
+            </button>
+            <small className="bitrate-source">
+              {autoBitrate
+                ? (hasMeasuredBitrate ? measuredBitrateSource : "Waiting for OBS or transcoder to publish media.")
+                : "Manual planning only; the server still passes encoder bitrate through unchanged."}
+            </small>
+          </div>
           <label>Safety headroom<div className="unit-input"><input type="number" min="5" max="50" value={headroom} onChange={(event) => setHeadroom(Number(event.target.value))} /><span>%</span></div></label>
           <label>Protocol overhead<div className="unit-input"><input type="number" min="1" max="20" value={overhead} onChange={(event) => setOverhead(Number(event.target.value))} /><span>%</span></div></label>
         </div>
         <div className="formula">
-          <code>({bandwidth} × {(1 - headroom / 100).toFixed(2)}) ÷ ({bitrateMbps} × {(1 + overhead / 100).toFixed(2)})</code>
-          <span>usable link ÷ delivered bitrate per viewer</span>
+          <code>{perViewer > 0 ? `(${bandwidth} × ${(1 - headroom / 100).toFixed(2)}) ÷ (${bitrateMbps.toFixed(3)} × ${(1 + overhead / 100).toFixed(2)})` : "Waiting for a live publisher…"}</code>
+          <span>{perViewer > 0 ? "usable link ÷ delivered bitrate per viewer" : "capacity appears after media starts flowing"}</span>
         </div>
       </section>
       <aside className="capacity-result">
         <span className="eyebrow">ESTIMATED CEILING</span>
-        <strong>{theoretical.toLocaleString()}</strong>
+        <strong>{theoretical === null ? "—" : theoretical.toLocaleString()}</strong>
         <h2>concurrent viewers</h2>
-        <p>at {bitrateMbps.toFixed(1)} Mbps average, with {headroom}% capacity held for bursts.</p>
+        <p>{bitrateMbps > 0 ? `at ${bitrateMbps.toFixed(3)} Mbps average, with ${headroom}% capacity held for bursts.` : "Start publishing from OBS or the transcoder to calculate from measured bitrate."}</p>
         <div className="result-divider" />
         <div className="result-row"><span>Usable delivery</span><b>{usable.toLocaleString()} Mbps</b></div>
-        <div className="result-row"><span>Per-viewer budget</span><b>{perViewer.toFixed(2)} Mbps</b></div>
+        <div className="result-row"><span>Per-viewer budget</span><b>{perViewer > 0 ? `${perViewer.toFixed(3)} Mbps` : "Waiting"}</b></div>
         <div className="result-row"><span>Current viewers</span><b>{viewers.toLocaleString()}</b></div>
         <div className="result-row"><span>Current uplink use</span><b>{currentUse.toFixed(1)}%</b></div>
         <div className="capacity-warning"><Activity size={18} /><span>CPU, kernel send cost, socket memory and NIC PPS can become the limit before bandwidth. Validate with the included load generator.</span></div>
       </aside>
       <section className="panel capacity-guidance">
-        <div><span className="guidance-icon"><Router size={20} /></span><h3>Fair queueing</h3><p>The installer can apply CAKE on the detected public interface when you explicitly provide the link rate.</p></div>
+        <div><span className="guidance-icon"><Router size={20} /></span><h3>Fair queueing</h3><p>The installer applies CAKE on the detected public interface using the detected or declared link rate.</p></div>
         <div><span className="guidance-icon"><CircleGauge size={20} /></span><h3>Keep headroom</h3><p>The high-density default reserves 10%. Use 15–25% when traffic is bursty or the provider's bandwidth is not guaranteed.</p></div>
         <div><span className="guidance-icon"><CloudOff size={20} /></span><h3>No CDN multiplier</h3><p>Every viewer consumes origin egress. Ten thousand viewers require sub-1 Mbps delivery on a 10Gbps link.</p></div>
       </section>
@@ -823,6 +853,17 @@ function App() {
   };
 
   const viewers = metric(snapshot, "active_viewers");
+  const publishers = metric(snapshot, "active_publishers");
+  const currentIngress = metric(snapshot, "ingress_bitrate");
+  const currentEgress = metric(snapshot, "egress_bitrate");
+  const measuredBitrateMbps = viewers > 0 && currentEgress > 0
+    ? currentEgress / viewers / 1e6
+    : publishers > 0 && currentIngress > 0
+      ? currentIngress / publishers / 1e6
+      : 0;
+  const measuredBitrateSource = viewers > 0 && currentEgress > 0
+    ? "Measured from delivered egress per active viewer."
+    : "Measured from OBS/transcoder ingress per active publisher.";
   const title = pageTitles[page];
   const sortedStreams = useMemo(
     () => [...snapshot.streams].sort((a, b) => (b.viewer_count ?? 0) - (a.viewer_count ?? 0)),
@@ -849,7 +890,16 @@ function App() {
           {page === "overview" && <Overview snapshot={snapshot} history={history} bandwidth={bandwidth} onNavigate={setPage} onStreamAction={streamAction} />}
           {page === "streams" && <StreamsPage streams={sortedStreams} onAction={streamAction} openCreate={() => setCreateType("stream")} />}
           {page === "applications" && <ApplicationsPage applications={snapshot.applications} streams={snapshot.streams} openCreate={() => setCreateType("application")} />}
-          {page === "capacity" && <CapacityPage bandwidth={bandwidth} setBandwidth={setBandwidth} currentEgress={metric(snapshot, "egress_bitrate")} viewers={viewers} />}
+          {page === "capacity" && (
+            <CapacityPage
+              bandwidth={bandwidth}
+              setBandwidth={setBandwidth}
+              currentEgress={currentEgress}
+              viewers={viewers}
+              measuredBitrateMbps={measuredBitrateMbps}
+              measuredBitrateSource={measuredBitrateSource}
+            />
+          )}
           {page === "system" && <SystemPage snapshot={snapshot} />}
         </div>
       </main>

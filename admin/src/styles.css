@@ -196,12 +196,17 @@ tbody tr:hover { background: rgba(255, 255, 255, .014); }
 .range-field > input { width: 100%; margin: 18px 0 6px; accent-color: var(--amber); }
 .range-bounds { display: flex; justify-content: space-between; color: #4e596c; font-size: 8px; }
 .planner-input-grid { margin: 0 22px; display: grid; grid-template-columns: repeat(3, 1fr); gap: 11px; }
-.planner-input-grid > label { color: #778397; font-size: 9px; font-weight: 650; }
+.planner-input-grid > label, .planner-setting > label { color: #778397; font-size: 9px; font-weight: 650; }
 .unit-input { height: 40px; margin-top: 8px; display: flex; align-items: center; background: #0b1017; border: 1px solid #26303e; border-radius: 6px; overflow: hidden; }
 .unit-input input { min-width: 0; width: 100%; padding: 0 11px; color: #e4e7eb; background: transparent; border: 0; outline: 0; font-size: 11px; }
+.unit-input input:disabled { color: var(--amber-bright); opacity: 1; cursor: not-allowed; }
+.unit-input input:disabled::placeholder { color: #566174; }
 .unit-input span { padding: 0 10px; color: #5c687b; font-size: 9px; border-left: 1px solid #252e3b; }
 .bandwidth-entry { width: 185px; height: 36px; margin-top: 0; }
 .bandwidth-entry input { color: var(--amber); font-size: 12px; font-weight: 800; }
+.bitrate-mode { width: 100%; margin-top: 7px; padding: 7px 9px; display: flex; align-items: center; justify-content: center; gap: 6px; color: #7a879a; background: #101721; border: 1px solid #26313f; border-radius: 5px; cursor: pointer; font: inherit; font-size: 8px; font-weight: 700; }
+.bitrate-mode.active { color: var(--amber-bright); background: rgba(255, 159, 67, .06); border-color: rgba(255, 159, 67, .28); }
+.bitrate-source { display: block; min-height: 27px; margin-top: 6px; color: #566174; font-size: 8px; font-weight: 500; line-height: 1.45; }
 .formula { margin: 18px 22px 0; padding: 13px 15px; display: flex; justify-content: space-between; align-items: center; gap: 15px; background: rgba(255, 159, 67, .045); border: 1px solid rgba(255, 159, 67, .11); border-radius: 6px; }
 .formula code { color: var(--amber-bright); font-size: 10px; }
 .formula span { color: #667286; font-size: 8px; }
