@@ -1,58 +1,183 @@
-# Phase 9 "systemd" deliverable (docs/rtmp_promot.md). Hardened per
-# systemd.exec(5)/systemd.resource-control(5); the sandboxing directives
-# below are the standard "server process that only needs network + one
-# data directory" set. NOT VERIFIED ON THIS HOST: the development
-# environment this phase was implemented on (macOS) has no systemd — see
-# docs/phase9-checklist.md "Known limitations" ("systemd deployment works"
-# is consequently unverified here). Install with:
+# systemd unit for rtmp_server (docs/v2_promot.md PHASE 8 "systemd unit").
+#
+# NOT EXECUTED IN THIS REPOSITORY'S DEVELOPMENT ENVIRONMENT. This project was
+# developed on macOS, which has neither systemd nor io_uring, so this file has
+# been reviewed line by line against systemd.unit(5), systemd.service(5),
+# systemd.exec(5), systemd.kill(5) and systemd.resource-control(5) but has not
+# been loaded by a running systemd, and `systemd-analyze verify` was not
+# available to check it. Treat it as a reviewed starting point: run
+# `systemd-analyze verify rtmp-server.service` and
+# `systemd-analyze security rtmp-server` on the target host before relying on
+# it. See docs/deployment.md and docs/production-readiness.md.
+#
+# Install:
+#   sudo useradd --system --no-create-home --shell /usr/sbin/nologin rtmp-server
+#   sudo mkdir -p /etc/rtmp-server /var/lib/rtmp-server
+#   sudo install -m 0640 -o root -g rtmp-server config/server.example.yaml /etc/rtmp-server/server.yaml
+#   sudo install -m 0640 -o root -g rtmp-server deploy/systemd/rtmp-server.env.example /etc/rtmp-server/rtmp-server.env
+#   # edit both, then:
 #   sudo cp deploy/systemd/rtmp-server.service /etc/systemd/system/
 #   sudo systemctl daemon-reload
 #   sudo systemctl enable --now rtmp-server
 
 [Unit]
 Description=rtmp_server - C++23 io_uring RTMP streaming server
-Documentation=https://github.com/ (see repository docs/deployment.md)
+Documentation=file:///usr/share/doc/rtmp-server/deployment.md
+# network-online (not merely network) because the server binds a specific
+# address at startup and exits if the bind fails; starting before the address
+# is configured turns a transient boot ordering issue into a failed unit.
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/rtmp_server --config /etc/rtmp_server/server.yaml
-Restart=on-failure
+ExecStart=/usr/local/bin/rtmp-server --config /etc/rtmp-server/server.yaml
+
+# Secrets come from the environment file, never from server.yaml, so the
+# config file can be world-readable/config-managed while the secrets file is
+# 0640 root:rtmp-server. Every ServerConfig key has an RTMP_SERVER_<KEY>
+# override (src/core/config.cpp, apply_env_overrides).
+# The leading '-' means "continue if absent" so a first boot fails with the
+# server's own clear validation error rather than an opaque systemd error.
+EnvironmentFile=-/etc/rtmp-server/rtmp-server.env
+
+User=rtmp-server
+Group=rtmp-server
+
+# --- Graceful shutdown --------------------------------------------------
+# main() installs SIGTERM/SIGINT handlers that call WorkerPool::stop(), which
+# drains in-flight completions and closes connections on each worker's own
+# thread (apps/rtmp_server/main.cpp, docs/shutdown-model.md). SIGTERM is
+# systemd's default KillSignal but is stated explicitly because the whole
+# drain depends on it.
+KillSignal=SIGTERM
+# Only the main process gets the signal. The server has no child processes,
+# and 'mixed'/'control-group' would also signal anything a future ExecStop
+# starts.
+KillMode=mixed
+# Upper bound on the drain before SIGKILL. Long enough for in-flight writes to
+# in-flight viewers to complete and for recordings to be finalised and renamed
+# into place (recording::AsyncFileSink finalises on a writer thread); short
+# enough that a wedged process does not stall a deploy. Raise this if you
+# record very long sessions to slow storage.
+TimeoutStopSec=30s
+
+# --- Restart policy -----------------------------------------------------
+# 'always', not 'on-failure': a clean exit(0) from a network server is itself
+# unexpected (the only intended exits are a signal from systemd, which does
+# not trigger a restart, or a config-validation failure, handled below).
+Restart=always
+# Back off between restarts so a crash loop does not saturate the CPU or the
+# log pipeline.
 RestartSec=2s
+# ...but give up after 5 restarts in 60s. A server that cannot stay up is
+# broken (bad config, port in use, missing data directory); silently
+# restarting for ever hides the outage from anyone watching unit state.
+StartLimitIntervalSec=60s
+StartLimitBurst=5
+# Configuration is invalid -> ServerConfig::validate() fails -> EXIT_FAILURE.
+# Restarting cannot fix that, so do not: fail the unit immediately and make
+# the problem visible.
+RestartPreventExitStatus=1
 
-# Runs as a dedicated, unprivileged system user/group — create with:
-#   sudo useradd --system --no-create-home --shell /usr/sbin/nologin rtmp_server
-User=rtmp_server
-Group=rtmp_server
+# --- Resource limits ----------------------------------------------------
+# Two file descriptors are consumed per RTMP connection in the worst case
+# (socket + any recording file), plus the listening sockets, the io_uring
+# rings, the SQLite database and the HTTP management sockets. Budget:
+#
+#   maximum_connections (10000 default)  x1 socket   = 10000
+#   concurrent recordings                            =  1000
+#   io_uring rings/eventfds, worker_ring_count x few =   ~500
+#   management API sockets + SQLite + logs           =   ~100
+#   headroom for transient accept bursts             = ~2x
+#
+# 65536 covers the default configuration with roughly 5x headroom. If you
+# raise ServerConfig::maximum_connections, raise this in step: the server
+# enforces its own connection limit, but hitting the fd limit first produces
+# accept() EMFILE, which is a much worse failure mode (it degrades every
+# connection rather than cleanly refusing new ones).
+LimitNOFILE=65536
 
-# Filesystem/process sandboxing: only /var/lib/rtmp_server (recordings +
-# SQLite database) is writable; everything else is read-only or hidden.
+# io_uring registers and pins buffers, which counts against RLIMIT_MEMLOCK.
+# registered_buffer_count x registered_buffer_size (1024 x 64 KiB = 64 MiB by
+# default) x worker_ring_count. 512 MiB covers 8 workers at defaults.
+LimitMEMLOCK=536870912
+
+# Core dumps: on by default here because a crash in a media server is worth
+# post-mortem analysis and the production preset keeps debug info
+# (RelWithDebInfo). Set to 0 if your recordings/config make a core dump a
+# data-disclosure risk -- it contains stream keys and signing secrets.
+LimitCORE=infinity
+
+# Prefer killing this service over the rest of the host if memory runs out;
+# it is restartable and its peers (database, monitoring) usually are not.
+OOMScoreAdjust=200
+OOMPolicy=stop
+
+# --- Filesystem and process sandboxing ---------------------------------
+# Only the state directory is writable; everything else is read-only or
+# hidden. StateDirectory= makes systemd create and chown it, which is more
+# reliable than documenting a mkdir.
+StateDirectory=rtmp-server
+ConfigurationDirectory=rtmp-server
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/var/lib/rtmp_server
-NoNewPrivileges=true
+ReadWritePaths=/var/lib/rtmp-server
 PrivateTmp=true
 PrivateDevices=true
+ProtectProc=invisible
+ProcSubset=pid
+ProtectClock=true
+ProtectHostname=true
+ProtectKernelLogs=true
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true
+NoNewPrivileges=true
 RestrictSUIDSGID=true
 RestrictRealtime=true
+RestrictNamespaces=true
 RemoveIPC=true
 LockPersonality=true
+# The server never generates code at runtime; denying W+X pages removes a
+# whole exploitation technique at no cost.
 MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
 
-# io_uring needs these capabilities/syscalls beyond the very restrictive
-# systemd default; do not add more than this without re-reviewing why.
+# Only IPv4/IPv6 TCP and AF_UNIX (used by the resolver and by systemd's own
+# notification/journal sockets) are needed. AF_NETLINK is deliberately absent.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+# --- Capabilities -------------------------------------------------------
+# The default RTMP port 1935 is above 1024, so no capability is needed at all
+# in the default configuration. CAP_NET_BIND_SERVICE is granted only so an
+# operator can move the management API or RTMP listener to a privileged port
+# without editing this unit. If you do not need that, delete both lines --
+# an empty CapabilityBoundingSet is strictly better.
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 AmbientCapabilities=CAP_NET_BIND_SERVICE
-SystemCallFilter=@system-service io_uring
+
+# --- Syscall filtering --------------------------------------------------
+# NOTE: there is no '@io-uring' syscall group in systemd, and @system-service
+# does NOT include the io_uring syscalls. They must be listed by name, or the
+# server dies at startup when io_uring_setup returns EPERM. (An earlier
+# revision of this unit wrote 'SystemCallFilter=@system-service io_uring',
+# which silently filtered nothing useful -- 'io_uring' is not a real syscall
+# name; the real ones are below.)
+SystemCallFilter=@system-service
+SystemCallFilter=io_uring_setup io_uring_enter io_uring_register
+# EPERM rather than SIGSYS so a denied syscall surfaces as a handled error in
+# the server's logs instead of an unexplained crash.
 SystemCallErrorNumber=EPERM
 
-# Resource limits — tune alongside ServerConfig::maximum_connections
-# (core/config.hpp); this default assumes maximum_connections <= 10000.
-LimitNOFILE=65536
+# --- Logging ------------------------------------------------------------
+# The server writes structured (JSON) logs to stdout/stderr and does no log
+# file management of its own, so the journal owns rotation and retention.
+# See docs/deployment.md "Log rotation" -- deploy/logrotate/rtmp-server is
+# only needed if you redirect to a file instead.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=rtmp-server
 
 [Install]
 WantedBy=multi-user.target
