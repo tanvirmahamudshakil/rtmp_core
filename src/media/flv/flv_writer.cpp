@@ -47,12 +47,6 @@ void append_amf0_key(std::vector<std::byte>& out, std::string_view key) {
     append_amf0_string_body(out, key);
 }
 
-void append_amf0_number(std::vector<std::byte>& out, double value) {
-    out.push_back(kAmf0Number);
-    auto be = encode_double_be(value);
-    out.insert(out.end(), be.begin(), be.end());
-}
-
 } // namespace
 
 std::array<std::byte, 8> encode_double_be(double value) {

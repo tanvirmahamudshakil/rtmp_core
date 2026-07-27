@@ -106,6 +106,49 @@ void apply_env_overrides(std::unordered_map<std::string, std::string>& values) {
     }
 }
 
+// Rejects secrets that are absent, too short to resist offline brute force,
+// or one of the placeholder values that ship in example configuration and
+// tutorials. Phase 8 release gate: "unsupported insecure defaults are used"
+// must fail the deployment rather than produce a warning nobody reads.
+//
+// The placeholder list is a deny-list, which is normally the wrong shape --
+// but here it is only a courtesy check layered on top of the length rule,
+// which is what actually provides the security property. Its job is to turn
+// "your secret is too short" into an unmistakable "you left the example value
+// in place".
+Result<void> validate_secret(const std::string& value, const char* name) {
+    static constexpr std::string_view kPlaceholders[] = {
+        "CHANGE_ME", "changeme", "change_me", "secret", "password", "test",
+        "changethis", "REPLACE_ME", "xxxxxxxx", "0123456789", "TODO",
+    };
+
+    if (value.empty()) {
+        return Error(ErrorCode::MissingConfiguration, ErrorCategory::Configuration,
+                      std::string(name) + " must be set");
+    }
+    for (const auto placeholder : kPlaceholders) {
+        if (value == placeholder) {
+            return Error(ErrorCode::InvalidConfiguration, ErrorCategory::Configuration,
+                          std::string(name) + " is a well-known placeholder value; generate a real secret");
+        }
+    }
+    // 32 bytes matches the HMAC-SHA256 block/output size the token scheme
+    // uses: a shorter key adds no security over a 32-byte one and a much
+    // shorter one is brute-forceable offline from a single observed token.
+    if (value.size() < kMinSecretLength) {
+        return Error(ErrorCode::InvalidConfiguration, ErrorCategory::Configuration,
+                      std::string(name) + " must be at least " + std::to_string(kMinSecretLength) +
+                          " characters (generate with: openssl rand -hex 32)");
+    }
+    // A secret made of one repeated character has far less entropy than its
+    // length suggests; this catches "aaaa...".
+    if (value.find_first_not_of(value.front()) == std::string::npos) {
+        return Error(ErrorCode::InvalidConfiguration, ErrorCategory::Configuration,
+                      std::string(name) + " has no entropy (all characters identical)");
+    }
+    return {};
+}
+
 } // namespace
 
 Result<void> ServerConfig::validate() const {
@@ -137,14 +180,60 @@ Result<void> ServerConfig::validate() const {
         return Error(ErrorCode::InvalidConfiguration, ErrorCategory::Configuration,
                       "chunk sizes must be positive");
     }
-    if (token_signing_secret.empty() || token_signing_secret == "CHANGE_ME") {
+    // --- Phase 8 release gate: "required configuration is missing" and
+    // "unsupported insecure defaults are used" must both fail startup, not
+    // warn. Everything below is enforced at load_config() time, so a
+    // misconfigured deployment cannot reach a listening state.
+
+    if (maximum_rtmp_message_size == 0) {
         return Error(ErrorCode::InvalidConfiguration, ErrorCategory::Configuration,
-                      "token_signing_secret must be set to a real secret");
+                      "maximum_rtmp_message_size must be positive");
     }
-    if (api_authentication_secret.empty() || api_authentication_secret == "CHANGE_ME") {
+    // An unbounded message size defeats every downstream reassembly bound
+    // (ChunkDecoderLimits sizes its per-connection budget from this value).
+    if (maximum_rtmp_message_size > kMaxSupportedRtmpMessageSize) {
         return Error(ErrorCode::InvalidConfiguration, ErrorCategory::Configuration,
-                      "api_authentication_secret must be set to a real secret");
+                      "maximum_rtmp_message_size exceeds the supported maximum (64 MiB)");
     }
+    if (maximum_publishers == 0 || maximum_viewers_per_stream == 0) {
+        return Error(ErrorCode::InvalidConfiguration, ErrorCategory::Configuration,
+                      "maximum_publishers and maximum_viewers_per_stream must be positive");
+    }
+    // Every remote-controlled queue must have a real bound (docs/v2_promot.md
+    // section 3.5). A zero here reads as "unlimited", which is precisely the
+    // failure mode that section exists to prevent.
+    if (gop_cache_max_bytes == 0 || gop_cache_max_packets == 0) {
+        return Error(ErrorCode::InvalidConfiguration, ErrorCategory::Configuration,
+                      "GOP cache bounds must be positive");
+    }
+    if (subscriber_queue_max_bytes == 0 || subscriber_queue_max_packets == 0) {
+        return Error(ErrorCode::InvalidConfiguration, ErrorCategory::Configuration,
+                      "subscriber queue bounds must be positive");
+    }
+    if (idle_timeout.count() <= 0 || handshake_timeout.count() <= 0) {
+        return Error(ErrorCode::InvalidConfiguration, ErrorCategory::Configuration,
+                      "idle_timeout and handshake_timeout must be positive");
+    }
+    if (recording_enabled && recording_directory.empty()) {
+        return Error(ErrorCode::MissingConfiguration, ErrorCategory::Configuration,
+                      "recording_directory is required when recording_enabled is true");
+    }
+    if (database_connection.empty()) {
+        return Error(ErrorCode::MissingConfiguration, ErrorCategory::Configuration,
+                      "database_connection must be set");
+    }
+
+    if (auto r = validate_secret(token_signing_secret, "token_signing_secret"); !r) return r;
+    if (auto r = validate_secret(api_authentication_secret, "api_authentication_secret"); !r) return r;
+
+    // Distinct secrets: reusing one value means a leaked management-API
+    // credential also forges playback tokens for every stream, and rotating
+    // either forces rotation of both.
+    if (token_signing_secret == api_authentication_secret) {
+        return Error(ErrorCode::InvalidConfiguration, ErrorCategory::Configuration,
+                      "token_signing_secret and api_authentication_secret must be different values");
+    }
+
     return {};
 }
 

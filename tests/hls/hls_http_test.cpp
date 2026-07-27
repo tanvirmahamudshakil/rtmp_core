@@ -166,7 +166,9 @@ TEST(HlsHttpTest, PrefixMatchIsBoundaryAwareAndDoesNotSwallowSimilarPaths) {
     });
 
     // "/hlsx/..." must NOT be treated as being under "/hls".
-    handler.handle(get("/hlsx/live/demo/index.m3u8"));
+    // The response is intentionally unused: this asserts on `forwarded`,
+    // i.e. that the request reached the fallback handler at all.
+    (void)handler.handle(get("/hlsx/live/demo/index.m3u8"));
     EXPECT_TRUE(forwarded);
 }
 

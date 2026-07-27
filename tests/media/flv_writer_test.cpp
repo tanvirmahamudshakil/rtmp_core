@@ -57,7 +57,7 @@ TEST(FlvWriterTest, DoubleEncodingIsBigEndianIeee754) {
     auto be = encode_double_be(1.0);
     EXPECT_EQ(static_cast<std::uint8_t>(be[0]), 0x3F);
     EXPECT_EQ(static_cast<std::uint8_t>(be[1]), 0xF0);
-    for (int i = 2; i < 8; ++i) EXPECT_EQ(static_cast<std::uint8_t>(be[i]), 0x00);
+    for (std::size_t i = 2; i < 8; ++i) EXPECT_EQ(static_cast<std::uint8_t>(be[i]), 0x00);
 }
 
 TEST(FlvWriterTest, OnMetaDataPlaceholderOffsetsPointAtTheirDoubles) {

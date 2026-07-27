@@ -9,6 +9,21 @@
 
 namespace rtmp_server::core {
 
+// Phase 8 release-gate constants (see ServerConfig::validate).
+
+// Minimum length for token_signing_secret / api_authentication_secret. 32
+// characters matches the HMAC-SHA256 key size the token scheme uses: shorter
+// keys are brute-forceable offline from a single observed token, longer ones
+// buy nothing. Generate with `openssl rand -hex 32`.
+inline constexpr std::size_t kMinSecretLength = 32;
+
+// Ceiling on maximum_rtmp_message_size. The per-connection chunk reassembly
+// budget is derived from this value, so an unbounded setting would defeat the
+// bounds in protocol/chunk/chunk_decoder.hpp. 64 MiB is far above any real
+// RTMP message (the largest thing a publisher sends is a keyframe, typically
+// well under 1 MiB even at high bitrates).
+inline constexpr std::uint32_t kMaxSupportedRtmpMessageSize = 64u * 1024u * 1024u;
+
 // Mirrors the required keys documented in docs/rtmp_promot.md "Configuration"
 // and config/server.example.yaml. Loaded from YAML with env-var and CLI
 // overrides layered on top (highest precedence: CLI > env > file > default).
