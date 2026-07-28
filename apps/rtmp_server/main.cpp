@@ -139,8 +139,13 @@ int main(int argc, char** argv) {
     };
     rtmp_server::io::io_uring::WorkerPool pool(config, stream_registry, stream_id_registry, std::move(services));
 
-    rtmp_server::control::ManagementApi management_api(
-        stream_manager, {config.api_authentication_secret});
+    // Open control plane: the management API is served without a bearer-token
+    // check so hitting the web panel drops the operator straight into the
+    // dashboard. Anyone who can reach this endpoint can create/delete/rotate
+    // streams — keep it behind loopback + the reverse proxy as documented.
+    rtmp_server::control::ManagementApiOptions management_options{config.api_authentication_secret};
+    management_options.require_authentication = false;
+    rtmp_server::control::ManagementApi management_api(stream_manager, management_options);
     management_api.set_store(store.get());
     management_api.set_audit_log(&audit_log);
     management_api.set_metrics(&metrics);

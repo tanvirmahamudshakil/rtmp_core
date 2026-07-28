@@ -687,7 +687,7 @@ function SystemPage({ snapshot }: { snapshot: Snapshot }) {
   const items = [
     ["RTMP transport", "io_uring / SO_REUSEPORT", "Operational", <Zap size={19} />],
     ["Control database", "SQLite WAL · local disk", "Ready", <Database size={19} />],
-    ["Management API", "Loopback · bearer auth", "Protected", <ShieldCheck size={19} />],
+    ["Management API", "Loopback · open access", "Open", <ShieldCheck size={19} />],
     ["Media delivery", "Direct origin · no CDN", "Active", <Network size={19} />]
   ];
   return (
@@ -728,9 +728,14 @@ function SystemPage({ snapshot }: { snapshot: Snapshot }) {
 
 function App() {
   const demo = new URLSearchParams(window.location.search).get("demo") === "1";
-  const [token, setToken] = useState(() => (demo ? "demo-session" : sessionStorage.getItem("streamforge-token") ?? ""));
-  const [client, setClient] = useState<ControlClient | null>(() => token ? new ControlClient(token, demo) : null);
-  const [authenticated, setAuthenticated] = useState(demo || Boolean(token));
+  // Open control plane: the server serves the management API without a bearer
+  // token, so the panel boots straight into the dashboard instead of asking
+  // for a login. The Bearer value below is a harmless placeholder the API
+  // ignores; the Login screen is retained only as a fallback if a future
+  // deployment turns authentication back on server-side (a 401 clears it).
+  const [token, setToken] = useState(() => (demo ? "demo-session" : sessionStorage.getItem("streamforge-token") ?? "open"));
+  const [client, setClient] = useState<ControlClient | null>(() => new ControlClient(token, demo));
+  const [authenticated, setAuthenticated] = useState(true);
   const [loginLoading, setLoginLoading] = useState(false);
   const [loginError, setLoginError] = useState("");
   const [snapshot, setSnapshot] = useState<Snapshot>(EMPTY_SNAPSHOT);

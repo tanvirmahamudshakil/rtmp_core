@@ -204,7 +204,7 @@ HttpResponse ManagementApi::handle(const HttpRequest& request) {
         return handle_health_ready();
     }
 
-    if (!authorized_locked(request.client_ip, request)) {
+    if (options_.require_authentication && !authorized_locked(request.client_ip, request)) {
         HttpResponse r;
         r.status = 401;
         r.body = error_body("unauthorized", "missing or invalid bearer token", request_id);

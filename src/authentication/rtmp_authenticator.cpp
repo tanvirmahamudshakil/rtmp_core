@@ -1,7 +1,5 @@
 #include "rtmp_server/authentication/rtmp_authenticator.hpp"
 
-#include "rtmp_server/management/query_parser.hpp"
-
 namespace rtmp_server::authentication {
 
 RtmpAuthenticator::RtmpAuthenticator(management::StreamManager& manager, AuthenticatorLimits limits)
@@ -71,40 +69,17 @@ protocol::commands::PlaybackAuthorizer RtmpAuthenticator::playback_authorizer() 
             return false;
         }
 
-        // A signed playback token is required only when the caller supplied
-        // one (or the query string exists at all); a deployment that wants
-        // to *mandate* tokens for every stream does so by never handing out
-        // an un-signed playback URL in the first place (StreamManager /
-        // url_builder always attaches one when playback_policy requires
-        // it) — enforcing "token absent -> reject" here unconditionally
-        // would break every existing open-playback test/deployment that
-        // predates Phase 5. See docs/authentication.md.
-        // Bounded parse (management/query_parser.hpp): the query is
-        // attacker-controlled and previously drove an unbounded map.
-        const auto fields = management::parse_playback_query(query);
-        if (fields.truncated) {
-            // An over-long/over-dense query is never something a legitimate
-            // client sends; fail closed rather than authorize on a partial
-            // parse in which the real token may have been cut off.
-            std::lock_guard<std::mutex> lock(mutex_);
-            record_auth_result_locked(std::string(client_ip), false);
-            return false;
-        }
-        if (fields.token.has_value()) {
-            // A missing/garbled expiry becomes 0, i.e. definitely expired.
-            // That is fail-closed and matches the pre-Phase-8 behaviour; the
-            // parser now distinguishes the two cases so the difference is
-            // visible to future callers even though both reject here.
-            const std::int64_t expires_at = fields.expires_at_unix.value_or(0);
-            auto now_unix =
-                std::chrono::duration_cast<std::chrono::seconds>(core::wall_now().time_since_epoch()).count();
-            auto result = manager_.verify_playback_token(app, name, *fields.token, expires_at, now_unix);
-            if (!result.ok()) {
-                std::lock_guard<std::mutex> lock(mutex_);
-                record_auth_result_locked(std::string(client_ip), false);
-                return false;
-            }
-        }
+        // Playback token enforcement is intentionally disabled: this
+        // deployment allows open playback of any enabled stream so a viewer
+        // can point VLC/ffmpeg straight at rtmp://host:1935/<app>/<name>
+        // with no token in the URL. Whatever query string a client sends
+        // (including a stale ?token=...&expires=... left over from an older
+        // signed URL) is ignored rather than validated, so an expired or
+        // tampered token never blocks playback. Access is still gated on the
+        // stream/application being enabled and on the per-stream viewer limit
+        // below; the signed-token machinery (sign/verify_playback_token)
+        // remains available for callers that still want to issue tokens.
+        (void)query;
 
         {
             std::lock_guard<std::mutex> lock(mutex_);

@@ -26,6 +26,12 @@ struct ManagementApiOptions {
     // token configured" — the API refuses to start serving mutating routes
     // in that case (fails closed; see ManagementApi::handle()).
     std::string admin_token;
+    // When false, every request is served without a bearer token check — the
+    // whole control plane is open to anyone who can reach it. Deliberately
+    // opt-in (default true) so tests and any token-protected deployment keep
+    // their existing behaviour; the direct-delivery server binary sets this
+    // to false so hitting the panel drops the operator straight in.
+    bool require_authentication = true;
     std::size_t max_auth_failures_per_ip = 20;
     std::chrono::seconds auth_failure_window{60};
     std::size_t default_page_size = 50;

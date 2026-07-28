@@ -101,7 +101,9 @@ TEST(RtmpAuthenticatorTest, PlaybackWithValidTokenIsAllowed) {
     EXPECT_TRUE(authorizer("live", "alpha", query, "203.0.113.1"));
 }
 
-TEST(RtmpAuthenticatorTest, PlaybackWithExpiredTokenIsRejected) {
+TEST(RtmpAuthenticatorTest, PlaybackWithExpiredTokenIsIgnoredAndAllowed) {
+    // Token enforcement is disabled for open playback: a stale/expired token
+    // left in the query string must not block playback of an enabled stream.
     StreamManager manager(test_options());
     ASSERT_TRUE(manager.create_application("live").ok());
     ASSERT_TRUE(manager.create_stream("live", "alpha").ok());
@@ -112,10 +114,12 @@ TEST(RtmpAuthenticatorTest, PlaybackWithExpiredTokenIsRejected) {
 
     RtmpAuthenticator auth(manager, AuthenticatorLimits{});
     auto authorizer = auth.playback_authorizer();
-    EXPECT_FALSE(authorizer("live", "alpha", query, "203.0.113.1"));
+    EXPECT_TRUE(authorizer("live", "alpha", query, "203.0.113.1"));
 }
 
-TEST(RtmpAuthenticatorTest, PlaybackWithModifiedTokenIsRejected) {
+TEST(RtmpAuthenticatorTest, PlaybackWithModifiedTokenIsIgnoredAndAllowed) {
+    // A tampered token is likewise ignored rather than validated, so it does
+    // not reject an otherwise-allowed open-playback request.
     StreamManager manager(test_options());
     ASSERT_TRUE(manager.create_application("live").ok());
     ASSERT_TRUE(manager.create_stream("live", "alpha").ok());
@@ -127,7 +131,7 @@ TEST(RtmpAuthenticatorTest, PlaybackWithModifiedTokenIsRejected) {
 
     RtmpAuthenticator auth(manager, AuthenticatorLimits{});
     auto authorizer = auth.playback_authorizer();
-    EXPECT_FALSE(authorizer("live", "alpha", query, "203.0.113.1"));
+    EXPECT_TRUE(authorizer("live", "alpha", query, "203.0.113.1"));
 }
 
 TEST(RtmpAuthenticatorTest, PlaybackOnDisabledStreamIsRejected) {
