@@ -148,10 +148,12 @@ void LiveFanout::on_video(StreamId stream_id, const SharedMediaFrame& frame, boo
     StreamState& state = state_for(stream_id);
     std::vector<PendingDelivery> deliveries;
     bool is_keyframe = false;
+    bool is_sequence_header = false;
     {
         std::lock_guard<std::mutex> lock(state.mutex);
         if (classify_is_video_sequence_header(frame)) {
             state.video_sequence_header = frame;
+            is_sequence_header = true;
         } else {
             is_keyframe = classify_is_video_keyframe(frame);
             if (is_keyframe) {
@@ -163,23 +165,27 @@ void LiveFanout::on_video(StreamId stream_id, const SharedMediaFrame& frame, boo
         deliveries = dispatch_locked(state, frame, /*is_video=*/true, /*is_audio=*/false, is_keyframe, stream_id);
     }
     run_deliveries(std::move(deliveries));
-    if (!is_replayed && forward_hook_) forward_hook_(stream_id, frame, /*is_video=*/true, /*is_audio=*/false);
+    if (!is_replayed && forward_hook_)
+        forward_hook_(stream_id, frame, /*is_video=*/true, /*is_audio=*/false, /*is_sticky=*/is_sequence_header);
 }
 
 void LiveFanout::on_audio(StreamId stream_id, const SharedMediaFrame& frame, bool is_replayed) {
     StreamState& state = state_for(stream_id);
     std::vector<PendingDelivery> deliveries;
+    bool is_sequence_header = false;
     {
         std::lock_guard<std::mutex> lock(state.mutex);
         if (classify_is_audio_sequence_header(frame)) {
             state.audio_sequence_header = frame;
+            is_sequence_header = true;
         } else {
             state.gop_cache.push(frame); // no-op until a video keyframe has started a GOP
         }
         deliveries = dispatch_locked(state, frame, /*is_video=*/false, /*is_audio=*/true, /*is_keyframe=*/false, stream_id);
     }
     run_deliveries(std::move(deliveries));
-    if (!is_replayed && forward_hook_) forward_hook_(stream_id, frame, /*is_video=*/false, /*is_audio=*/true);
+    if (!is_replayed && forward_hook_)
+        forward_hook_(stream_id, frame, /*is_video=*/false, /*is_audio=*/true, /*is_sticky=*/is_sequence_header);
 }
 
 void LiveFanout::on_metadata(StreamId stream_id, const SharedMediaFrame& frame, bool is_replayed) {
@@ -191,7 +197,9 @@ void LiveFanout::on_metadata(StreamId stream_id, const SharedMediaFrame& frame, 
         deliveries = dispatch_locked(state, frame, /*is_video=*/false, /*is_audio=*/false, /*is_keyframe=*/false, stream_id);
     }
     run_deliveries(std::move(deliveries));
-    if (!is_replayed && forward_hook_) forward_hook_(stream_id, frame, /*is_video=*/false, /*is_audio=*/false);
+    // Metadata (onMetadata) is always sticky init state a late subscriber needs.
+    if (!is_replayed && forward_hook_)
+        forward_hook_(stream_id, frame, /*is_video=*/false, /*is_audio=*/false, /*is_sticky=*/true);
 }
 
 void LiveFanout::subscribe(StreamId stream_id, SubscriberId subscriber_id, PlaybackSink* sink) {

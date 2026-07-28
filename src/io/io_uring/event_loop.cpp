@@ -51,7 +51,9 @@ IoUringEventLoop::IoUringEventLoop(IoUringContext context, core::ServerConfig co
         // comment: the subscription hook can run while state.mutex is held).
         live_fanout_.set_forward_hook([this](protocol::commands::StreamId stream_id,
                                               const protocol::commands::SharedMediaFrame& frame, bool is_video,
-                                              bool is_audio) { router_->forward(worker_id_, stream_id, frame, is_video, is_audio); });
+                                              bool is_audio, bool is_sticky) {
+            router_->forward(worker_id_, stream_id, frame, is_video, is_audio, is_sticky);
+        });
         live_fanout_.set_subscription_hook([this](protocol::commands::StreamId stream_id, int delta) {
             router_->note_subscription(worker_id_, stream_id, delta);
         });

@@ -100,8 +100,18 @@ public:
     // false means metadata). The owning worker's CrossWorkerRouter uses this
     // to push the frame — once, not per-viewer — into every other worker's
     // inbound queue that currently has a subscriber for the stream.
+    //
+    // is_sticky marks a frame that is required decoder-init state a late
+    // subscriber must have before any media decodes: onMetadata and the AVC/
+    // AAC sequence headers. These are sent by the publisher once, before any
+    // viewer on a *different* worker exists, so demand-gated forwarding would
+    // never deliver them there and a cross-worker viewer would receive media
+    // it cannot decode (video with no SPS/PPS). The router forwards sticky
+    // frames to every worker unconditionally so each worker's LiveFanout
+    // always holds the current init state for any future subscriber.
     using ForwardHook =
-        std::function<void(StreamId stream_id, const SharedMediaFrame& frame, bool is_video, bool is_audio)>;
+        std::function<void(StreamId stream_id, const SharedMediaFrame& frame, bool is_video, bool is_audio,
+                           bool is_sticky)>;
     void set_forward_hook(ForwardHook hook) { forward_hook_ = std::move(hook); }
 
     // SubscriptionHook is invoked with delta=+1 from subscribe() and

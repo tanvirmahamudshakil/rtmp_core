@@ -70,8 +70,15 @@ public:
     // LiveFanout, with `source_worker` fixed via lambda capture. Pushes one
     // frame reference into every other worker's inbound queue that
     // currently has at least one local subscriber for `stream_id`.
+    //
+    // is_sticky frames (onMetadata, AVC/AAC sequence headers) are pushed to
+    // EVERY other worker unconditionally, ignoring subscriber counts, so each
+    // worker's LiveFanout always holds the decoder-init state a future
+    // subscriber needs. Without this, a viewer that lands on a different
+    // worker than the publisher receives media it cannot decode because the
+    // sequence header was sent before that worker had any subscriber.
     void forward(WorkerId source_worker, StreamId stream_id, const SharedMediaFrame& frame, bool is_video,
-                 bool is_audio);
+                 bool is_audio, bool is_sticky = false);
 
     // Bound to LiveFanout::set_stream_end_hook() on each worker's local
     // LiveFanout; drops all per-worker subscriber-count bookkeeping for a

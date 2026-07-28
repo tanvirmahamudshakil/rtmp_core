@@ -46,22 +46,30 @@ void CrossWorkerRouter::note_subscription(WorkerId worker, StreamId stream_id, i
 }
 
 void CrossWorkerRouter::forward(WorkerId source_worker, StreamId stream_id, const SharedMediaFrame& frame,
-                                 bool is_video, bool is_audio) {
+                                 bool is_video, bool is_audio, bool is_sticky) {
     if (source_worker >= worker_count_) return;
 
     std::vector<std::atomic<std::uint32_t>>* counters = nullptr;
     {
         std::lock_guard<std::mutex> lock(counts_mutex_);
         auto it = counts_.find(stream_id.raw());
-        if (it == counts_.end()) return; // nobody anywhere subscribed to this stream
-        counters = &it->second;
+        // Non-sticky media with nobody subscribed anywhere is dropped. Sticky
+        // decoder-init frames are still fanned out to every worker so their
+        // LiveFanout state is primed for a viewer that subscribes later.
+        if (it == counts_.end()) {
+            if (!is_sticky) return;
+        } else {
+            counters = &it->second;
+        }
     }
 
     FrameKind kind = is_video ? FrameKind::Video : (is_audio ? FrameKind::Audio : FrameKind::Metadata);
 
     for (WorkerId destination = 0; destination < worker_count_; ++destination) {
         if (destination == source_worker) continue;
-        if ((*counters)[destination].load(std::memory_order_relaxed) == 0) continue;
+        // Demand-gate ordinary media; sticky init frames go to every worker.
+        if (!is_sticky && (counters == nullptr || (*counters)[destination].load(std::memory_order_relaxed) == 0))
+            continue;
 
         PerWorkerQueue& queue = *queues_[destination];
         bool pushed = false;

@@ -37,6 +37,33 @@ TEST(CrossWorkerRouterTest, ForwardWithoutSubscribersDoesNothing) {
     EXPECT_EQ(router.dropped_frame_count(), 0u);
 }
 
+TEST(CrossWorkerRouterTest, StickyFramesReachEveryWorkerEvenWithoutSubscribers) {
+    // Regression: the publisher's AVC/AAC sequence headers and onMetadata are
+    // sent once, before any viewer on another worker exists. Demand-gated
+    // forwarding never delivered them there, so a cross-worker viewer got
+    // media it could not decode (video with no SPS/PPS). Sticky frames must
+    // fan out to every worker regardless of subscriber counts.
+    CrossWorkerRouter router(3);
+    StreamId stream = StreamId::next();
+
+    router.forward(/*source_worker=*/0, stream, make_frame(), /*is_video=*/true, /*is_audio=*/false,
+                   /*is_sticky=*/true);
+
+    EXPECT_EQ(router.drain(1).size(), 1u); // no subscriber yet, still primed
+    EXPECT_EQ(router.drain(2).size(), 1u);
+    EXPECT_TRUE(router.drain(0).empty()); // never back to the source
+    EXPECT_EQ(router.dropped_frame_count(), 0u);
+}
+
+TEST(CrossWorkerRouterTest, NonStickyMediaWithoutSubscribersIsStillDropped) {
+    CrossWorkerRouter router(3);
+    StreamId stream = StreamId::next();
+    router.forward(/*source_worker=*/0, stream, make_frame(), /*is_video=*/true, /*is_audio=*/false,
+                   /*is_sticky=*/false);
+    EXPECT_TRUE(router.drain(1).empty());
+    EXPECT_TRUE(router.drain(2).empty());
+}
+
 TEST(CrossWorkerRouterTest, ForwardsOnlyToWorkersWithSubscribers) {
     CrossWorkerRouter router(3);
     StreamId stream = StreamId::next();
