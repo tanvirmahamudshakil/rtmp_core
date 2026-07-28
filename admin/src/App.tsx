@@ -72,6 +72,28 @@ const bitrate = (bits: number) => {
   return `${(bits / 1e3).toFixed(0)} Kbps`;
 };
 
+// Best-effort clipboard copy that also works on plain HTTP, where the async
+// Clipboard API is blocked; falls back to a hidden textarea + execCommand.
+async function copyText(value: string) {
+  try {
+    if (navigator.clipboard && window.isSecureContext) {
+      await navigator.clipboard.writeText(value);
+      return;
+    }
+  } catch {
+    // fall through to the legacy path
+  }
+  const fallback = document.createElement("textarea");
+  fallback.value = value;
+  fallback.setAttribute("readonly", "");
+  fallback.style.position = "fixed";
+  fallback.style.opacity = "0";
+  document.body.appendChild(fallback);
+  fallback.select();
+  document.execCommand("copy");
+  fallback.remove();
+}
+
 function IconButton({
   label,
   children,
@@ -495,6 +517,7 @@ function StreamTable({
               <td><span className={stream.enabled ? "enabled-text" : "disabled-text"}>{stream.enabled ? "Enabled" : "Disabled"}</span></td>
               <td>
                 <div className="row-actions">
+                  {stream.playback_url && <IconButton label="Copy playback URL" onClick={() => copyText(stream.playback_url!)}><Copy size={16} /></IconButton>}
                   {!compactMode && <IconButton label="Create playback token" onClick={() => onAction(stream, "token")}><KeyRound size={16} /></IconButton>}
                   {!compactMode && <IconButton label={stream.enabled ? "Disable stream" : "Enable stream"} onClick={() => onAction(stream, "toggle")}><SlidersHorizontal size={16} /></IconButton>}
                   <IconButton label="More stream actions" onClick={() => onAction(stream, "more")}><MoreHorizontal size={17} /></IconButton>

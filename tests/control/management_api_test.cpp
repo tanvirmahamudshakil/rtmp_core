@@ -89,6 +89,29 @@ TEST(ManagementApiTest, CreateStreamReturnsRawKeyOnlyOnce) {
     auto get = api.handle(authed("GET", "/v1/streams/live:alpha"));
     EXPECT_EQ(get.status, 200);
     EXPECT_EQ(get.body.find("stream_key"), std::string::npos); // never leaked from GET
+    // The reusable public playback URL is exposed on every read so the panel
+    // can show/copy the VLC link at any time, not only at creation.
+    EXPECT_NE(get.body.find("playback_url"), std::string::npos);
+    EXPECT_NE(get.body.find("/live/alpha"), std::string::npos);
+}
+
+TEST(ManagementApiTest, PercentEncodedStreamIdInPathResolves) {
+    // The web panel builds stream-id path segments with
+    // encodeURIComponent("<app>:<name>"), so the ':' arrives as "%3A". The
+    // API must percent-decode it before splitting; otherwise every
+    // per-stream action fails with "application not found".
+    StreamManager manager(manager_options());
+    ManagementApi api(manager, api_options());
+    ASSERT_EQ(api.handle(authed("POST", "/v1/applications", R"({"name":"live"})")).status, 201);
+    ASSERT_EQ(api.handle(authed("POST", "/v1/streams", R"({"application":"live","name":"alpha"})")).status, 201);
+
+    auto get = api.handle(authed("GET", "/v1/streams/live%3Aalpha"));
+    EXPECT_EQ(get.status, 200);
+    EXPECT_NE(get.body.find("\"name\":\"alpha\""), std::string::npos);
+
+    auto patch = api.handle(authed("PATCH", "/v1/streams/live%3Aalpha", R"({"enabled":false})"));
+    EXPECT_EQ(patch.status, 200);
+    EXPECT_NE(patch.body.find("\"enabled\":false"), std::string::npos);
 }
 
 TEST(ManagementApiTest, PatchDisablesAStream) {

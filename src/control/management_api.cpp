@@ -90,7 +90,8 @@ std::string stream_json(const management::Stream& stream) {
     std::ostringstream os;
     os << R"({"application":")" << json_escape(stream.application) << R"(","name":")" << json_escape(stream.name)
        << R"(","enabled":)" << (stream.enabled ? "true" : "false") << R"(,"recording_enabled":)"
-       << (stream.recording_enabled ? "true" : "false") << "}";
+       << (stream.recording_enabled ? "true" : "false") << R"(,"playback_url":")" << json_escape(stream.playback_url)
+       << "\"}";
     return os.str();
 }
 
@@ -116,10 +117,42 @@ int http_status_for(core::ErrorCode code) {
 // Splits a "/v1/streams/{id}/..." path into the stream id and remaining
 // suffix. The stream id itself is "<application>:<name>" (colon, not
 // slash, so it fits in one path segment).
-std::pair<std::string, std::string> split_stream_id(std::string_view id) {
+// Percent-decodes a URL path segment. The panel builds stream-id path
+// segments with encodeURIComponent("<app>:<name>"), so the ':' arrives as
+// "%3A" and, without decoding, split_stream_id would never find the
+// separator — every per-stream route (status, PATCH, rotate, token,
+// disconnect) would then look up the whole "app%3Aname" as an application
+// and fail with "application not found". Invalid/truncated escapes are left
+// as-is rather than dropped.
+std::string percent_decode(std::string_view in) {
+    std::string out;
+    out.reserve(in.size());
+    auto hex = [](char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        return -1;
+    };
+    for (std::size_t i = 0; i < in.size(); ++i) {
+        if (in[i] == '%' && i + 2 < in.size()) {
+            int hi = hex(in[i + 1]);
+            int lo = hex(in[i + 2]);
+            if (hi >= 0 && lo >= 0) {
+                out.push_back(static_cast<char>((hi << 4) | lo));
+                i += 2;
+                continue;
+            }
+        }
+        out.push_back(in[i]);
+    }
+    return out;
+}
+
+std::pair<std::string, std::string> split_stream_id(std::string_view id_raw) {
+    std::string id = percent_decode(id_raw);
     auto colon = id.find(':');
-    if (colon == std::string_view::npos) return {std::string(id), ""};
-    return {std::string(id.substr(0, colon)), std::string(id.substr(colon + 1))};
+    if (colon == std::string::npos) return {id, ""};
+    return {id.substr(0, colon), id.substr(colon + 1)};
 }
 
 std::vector<std::string> split_path(std::string_view path) {

@@ -8,6 +8,7 @@ export type Stream = {
   name: string;
   enabled: boolean;
   recording_enabled: boolean;
+  playback_url?: string;
   is_live?: boolean;
   viewer_count?: number;
 };
@@ -49,12 +50,14 @@ const demoApps: Application[] = [
   { name: "backup", enabled: false }
 ];
 
+const demoPlayback = (application: string, name: string) => `rtmp://stream.example.com:1935/${application}/${name}`;
+
 let demoStreams: Stream[] = [
-  { application: "live", name: "main-stage", enabled: true, recording_enabled: true, is_live: true, viewer_count: 3842 },
-  { application: "live", name: "sports-east", enabled: true, recording_enabled: false, is_live: true, viewer_count: 1947 },
-  { application: "events", name: "conference-a", enabled: true, recording_enabled: true, is_live: true, viewer_count: 826 },
-  { application: "events", name: "studio-feed", enabled: true, recording_enabled: false, is_live: false, viewer_count: 0 },
-  { application: "backup", name: "disaster-recovery", enabled: false, recording_enabled: false, is_live: false, viewer_count: 0 }
+  { application: "live", name: "main-stage", enabled: true, recording_enabled: true, playback_url: demoPlayback("live", "main-stage"), is_live: true, viewer_count: 3842 },
+  { application: "live", name: "sports-east", enabled: true, recording_enabled: false, playback_url: demoPlayback("live", "sports-east"), is_live: true, viewer_count: 1947 },
+  { application: "events", name: "conference-a", enabled: true, recording_enabled: true, playback_url: demoPlayback("events", "conference-a"), is_live: true, viewer_count: 826 },
+  { application: "events", name: "studio-feed", enabled: true, recording_enabled: false, playback_url: demoPlayback("events", "studio-feed"), is_live: false, viewer_count: 0 },
+  { application: "backup", name: "disaster-recovery", enabled: false, recording_enabled: false, playback_url: demoPlayback("backup", "disaster-recovery"), is_live: false, viewer_count: 0 }
 ];
 
 const demoMetrics: Record<string, number> = {
@@ -184,7 +187,7 @@ export class ControlClient {
 
   async createStream(application: string, name: string, recording: boolean): Promise<StreamSecret> {
     if (this.demo) {
-      const stream = { application, name, enabled: true, recording_enabled: recording, is_live: false, viewer_count: 0 };
+      const stream = { application, name, enabled: true, recording_enabled: recording, playback_url: demoPlayback(application, name), is_live: false, viewer_count: 0 };
       demoStreams = [...demoStreams, stream];
       return {
         stream,

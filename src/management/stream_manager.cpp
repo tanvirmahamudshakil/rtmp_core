@@ -161,6 +161,7 @@ core::Result<StreamCreationResult> StreamManager::create_stream(std::string_view
     result.stream_key = raw_key;
     result.publish_url = build_publish_url(options_.public_hostname, options_.rtmp_port, application, raw_key);
     result.playback_url = build_playback_url(options_.public_hostname, options_.rtmp_port, application, name);
+    result.stream.playback_url = result.playback_url;
 
     if (store_ != nullptr) {
         persistence::StreamRow row;
@@ -294,7 +295,10 @@ std::optional<Stream> StreamManager::find_stream(std::string_view application, s
     if (app_it == applications_.end()) return std::nullopt;
     auto stream_it = app_it->second.streams.find(std::string(name));
     if (stream_it == app_it->second.streams.end()) return std::nullopt;
-    return stream_it->second.meta;
+    Stream stream = stream_it->second.meta;
+    stream.playback_url =
+        build_playback_url(options_.public_hostname, options_.rtmp_port, stream.application, stream.name);
+    return stream;
 }
 
 std::vector<Stream> StreamManager::list_streams(std::string_view application) const {
@@ -303,7 +307,12 @@ std::vector<Stream> StreamManager::list_streams(std::string_view application) co
     auto app_it = applications_.find(std::string(application));
     if (app_it == applications_.end()) return out;
     out.reserve(app_it->second.streams.size());
-    for (const auto& [name, record] : app_it->second.streams) out.push_back(record.meta);
+    for (const auto& [name, record] : app_it->second.streams) {
+        Stream stream = record.meta;
+        stream.playback_url =
+            build_playback_url(options_.public_hostname, options_.rtmp_port, stream.application, stream.name);
+        out.push_back(std::move(stream));
+    }
     return out;
 }
 

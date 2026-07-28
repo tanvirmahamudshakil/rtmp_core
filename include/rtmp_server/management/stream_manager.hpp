@@ -36,6 +36,11 @@ struct Stream {
     bool enabled = true;
     bool recording_enabled = false;
     core::WallClock::time_point created_at;
+    // Public RTMP playback URL (rtmp://host:port/app/name), no token. Filled
+    // in by StreamManager when a Stream is handed back to the API so the panel
+    // can show and copy the link for VLC/ffmpeg at any time, not only at
+    // creation. Empty inside the in-memory record; populated on read.
+    std::string playback_url;
 };
 
 // Returned only at creation and at key rotation — the one and only two
