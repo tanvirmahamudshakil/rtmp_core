@@ -100,6 +100,21 @@ box: `RelWithDebInfo` embeds absolute paths in debug info. Add
 you need that. Record for every release: git commit SHA, compiler version,
 dependency versions, and the exact configure line.
 
+### One-command installer reset behaviour
+
+`scripts/install-linux.sh` defaults to `RTMP_FRESH_INSTALL=1`. Before it
+installs anything, it stops the previous StreamForge units and removes every
+installer-owned binary, configuration file, database, stream key, recording,
+backup, web asset, network-tuning file, system account and production build
+artefact. Each removal is conditional, so a first install and a partially
+removed install both continue without errors. The OS packages are not purged
+because they may be shared by unrelated software; in fresh mode the installer
+reinstalls existing required packages and installs any that are missing.
+
+This reset is intentionally destructive. Use `RTMP_FRESH_INSTALL=0` only for
+an in-place installation that must retain the existing database, recordings
+and secrets.
+
 ### Release gate
 
 No artefact ships without:
@@ -445,6 +460,14 @@ re-buffer.** Plan for that.
    stream lifecycle before declaring success.
 
 Multi-node: roll one node at a time, verifying each before proceeding.
+
+With `RTMP_FRESH_INSTALL=0`, `scripts/install-linux.sh` automates the binary
+part of this procedure. It hashes the production build, copies the current
+executable to `/usr/local/bin/rtmp-server.previous`, installs the new
+executable to a staged path, verifies the staged SHA-256, and only then
+atomically renames it into place. A checksum mismatch leaves the running
+installation unchanged. The default full-clean mode deliberately retains no
+previous installation or rollback binary.
 
 ## Rollback procedure
 

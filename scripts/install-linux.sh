@@ -27,7 +27,11 @@
 #   RTMP_CONFIGURE_FIREWALL      1 (default) adds rules only if UFW is active.
 #   RTMP_WORKERS                 Worker count; default min(nproc, 16).
 #   RTMP_MAX_CONNECTIONS_PER_IP  Per-source safety limit (default 1000).
-#   RTMP_FORCE_ROTATE_SECRETS    1 rotates secrets during an existing install.
+#   RTMP_FRESH_INSTALL           1 (default) removes every prior StreamForge
+#                                install, database, key, recording and build
+#                                artefact before reinstalling. Set 0 only for
+#                                the legacy in-place upgrade behaviour.
+#   RTMP_FORCE_ROTATE_SECRETS    1 rotates secrets during an in-place install.
 #
 set -Eeuo pipefail
 IFS=$'\n\t'
@@ -75,6 +79,7 @@ MAX_CONNECTIONS_PER_IP="${RTMP_MAX_CONNECTIONS_PER_IP:-1000}"
 ENABLE_FAIR_QUEUE="${RTMP_ENABLE_FAIR_QUEUE:-1}"
 CONFIGURE_FIREWALL="${RTMP_CONFIGURE_FIREWALL:-1}"
 FORCE_ROTATE="${RTMP_FORCE_ROTATE_SECRETS:-0}"
+FRESH_INSTALL="${RTMP_FRESH_INSTALL:-1}"
 
 if [[ "${BANDWIDTH_MBIT}" != "auto" ]]; then
   [[ "${BANDWIDTH_MBIT}" =~ ^[1-9][0-9]*$ ]] ||
@@ -103,6 +108,7 @@ fi
 [[ "${ENABLE_FAIR_QUEUE}" =~ ^[01]$ ]] || die "RTMP_ENABLE_FAIR_QUEUE must be 0 or 1."
 [[ "${CONFIGURE_FIREWALL}" =~ ^[01]$ ]] || die "RTMP_CONFIGURE_FIREWALL must be 0 or 1."
 [[ "${FORCE_ROTATE}" =~ ^[01]$ ]] || die "RTMP_FORCE_ROTATE_SECRETS must be 0 or 1."
+[[ "${FRESH_INSTALL}" =~ ^[01]$ ]] || die "RTMP_FRESH_INSTALL must be 0 or 1."
 if [[ -n "${DOMAIN}" && ! "${DOMAIN}" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]]; then
   die "RTMP_DOMAIN must be a hostname without a URL scheme, path, port or whitespace."
 fi
@@ -113,6 +119,151 @@ fi
 awk -v value="${RESOURCE_SIZING_MBIT}" 'BEGIN { exit !(value >= 0.05 && value <= 100) }' ||
   die "RTMP_RESOURCE_SIZING_MBIT must be between 0.05 and 100 Mbps."
 
+remove_managed_path() {
+  local target="$1"
+  case "${target}" in
+    "${SOURCE_DIR}/build/production" | \
+    "${SOURCE_DIR}/admin/node_modules" | \
+    "${SOURCE_DIR}/admin/dist" | \
+    /etc/rtmp-server | \
+    /var/lib/rtmp-server | \
+    /var/backups/rtmp-server | \
+    /var/www/streamforge | \
+    /var/log/rtmp-server | \
+    /usr/share/doc/rtmp-server | \
+    /etc/systemd/system/rtmp-server.service | \
+    /etc/systemd/system/rtmp-server.service.d | \
+    /etc/systemd/system/rtmp-network-tune.service | \
+    /etc/systemd/system/rtmp-network-tune.service.d | \
+    /etc/sysctl.d/60-streamforge.conf | \
+    /etc/default/rtmp-network | \
+    /etc/logrotate.d/rtmp-server | \
+    /usr/local/sbin/rtmp-network-tune | \
+    /root/streamforge-credentials.txt | \
+    /etc/caddy/Caddyfile | \
+    /usr/local/bin/rtmp-server*)
+      ;;
+    *)
+      die "Refusing to remove unexpected path '${target}' during fresh-install cleanup."
+      ;;
+  esac
+
+  if [[ -L "${target}" || -f "${target}" ]]; then
+    rm -f -- "${target}"
+  elif [[ -d "${target}" ]]; then
+    rm -rf -- "${target}"
+  fi
+}
+
+remove_streamforge_ufw_rules() {
+  command -v ufw >/dev/null 2>&1 || return
+  ufw status 2>/dev/null | grep -q '^Status: active' || return
+
+  local rule_number
+  while read -r rule_number; do
+    [[ "${rule_number}" =~ ^[0-9]+$ ]] || continue
+    ufw --force delete "${rule_number}" >/dev/null 2>&1 || true
+  done < <(
+    ufw status numbered 2>/dev/null |
+      awk '/StreamForge (RTMP|HTTP|HTTPS)/ {
+        number=$0
+        sub(/^[^[]*\[[[:space:]]*/, "", number)
+        sub(/\].*$/, "", number)
+        gsub(/[^0-9]/, "", number)
+        if (number != "") print number
+      }' |
+      sort -rn
+  )
+}
+
+stop_and_disable_unit() {
+  local unit="$1"
+  if systemctl is-active --quiet "${unit}"; then
+    systemctl stop "${unit}" ||
+      die "Could not stop ${unit}; refusing to remove files used by a running service."
+  fi
+  systemctl disable "${unit}" >/dev/null 2>&1 || true
+}
+
+clean_previous_install() {
+  log "Fresh install requested: removing all previous StreamForge services, data, keys, recordings and builds"
+  log "Fresh-install deletion is permanent; new credentials and stream keys will be generated"
+
+  local old_interface=""
+  if [[ -r /etc/default/rtmp-network ]]; then
+    old_interface="$(sed -n 's/^RTMP_INTERFACE=//p' /etc/default/rtmp-network | tail -n 1)"
+  fi
+
+  # Absent units and files are skipped. A unit that exists but cannot stop is
+  # a hard failure: deleting its executable or data underneath it is unsafe.
+  stop_and_disable_unit rtmp-server.service
+  stop_and_disable_unit rtmp-network-tune.service
+
+  local caddy_config_is_streamforge=0
+  if [[ -r /etc/caddy/Caddyfile ]] &&
+     grep -Eq 'Managed by StreamForge install-linux\.sh|/var/www/streamforge' /etc/caddy/Caddyfile; then
+    caddy_config_is_streamforge=1
+    stop_and_disable_unit caddy.service
+  fi
+
+  if [[ "${old_interface}" =~ ^[A-Za-z0-9_.:-]+$ ]] &&
+     command -v ip >/dev/null 2>&1 &&
+     command -v tc >/dev/null 2>&1 &&
+     ip link show dev "${old_interface}" >/dev/null 2>&1; then
+    tc qdisc del dev "${old_interface}" root >/dev/null 2>&1 || true
+  fi
+
+  remove_streamforge_ufw_rules
+
+  local target
+  for target in \
+    /etc/rtmp-server \
+    /var/lib/rtmp-server \
+    /var/backups/rtmp-server \
+    /var/www/streamforge \
+    /var/log/rtmp-server \
+    /usr/share/doc/rtmp-server \
+    /etc/systemd/system/rtmp-server.service \
+    /etc/systemd/system/rtmp-server.service.d \
+    /etc/systemd/system/rtmp-network-tune.service \
+    /etc/systemd/system/rtmp-network-tune.service.d \
+    /etc/sysctl.d/60-streamforge.conf \
+    /etc/default/rtmp-network \
+    /etc/logrotate.d/rtmp-server \
+    /usr/local/sbin/rtmp-network-tune \
+    /root/streamforge-credentials.txt \
+    "${SOURCE_DIR}/build/production" \
+    "${SOURCE_DIR}/admin/node_modules" \
+    "${SOURCE_DIR}/admin/dist"; do
+    remove_managed_path "${target}"
+  done
+
+  if [[ "${caddy_config_is_streamforge}" == "1" ]]; then
+    remove_managed_path /etc/caddy/Caddyfile
+  fi
+
+  while IFS= read -r -d '' target; do
+    remove_managed_path "${target}"
+  done < <(
+    find /usr/local/bin -maxdepth 1 \( -type f -o -type l \) -name 'rtmp-server*' -print0 2>/dev/null
+  )
+
+  if command -v userdel >/dev/null 2>&1 && id rtmp-server >/dev/null 2>&1; then
+    userdel rtmp-server >/dev/null 2>&1 || true
+  fi
+  if command -v groupdel >/dev/null 2>&1 && getent group rtmp-server >/dev/null 2>&1; then
+    groupdel rtmp-server >/dev/null 2>&1 || true
+  fi
+
+  systemctl daemon-reload
+  systemctl reset-failed rtmp-server.service rtmp-network-tune.service >/dev/null 2>&1 || true
+  log "Previous StreamForge installation cleanup complete"
+}
+
+if [[ "${FRESH_INSTALL}" == "1" ]]; then
+  clean_previous_install
+fi
+
 BITRATE_MODE="auto"
 CAPACITY_STREAM_MBIT="${RESOURCE_SIZING_MBIT}"
 EXPECTED_STREAM_JSON="null"
@@ -122,19 +273,24 @@ if [[ "${EXPECTED_STREAM_MBIT}" != "auto" ]]; then
   EXPECTED_STREAM_JSON="${EXPECTED_STREAM_MBIT}"
 fi
 
-log "Installing compiler, runtime, web server and network tooling"
+APT_REINSTALL_ARGS=()
+if [[ "${FRESH_INSTALL}" == "1" ]]; then
+  APT_REINSTALL_ARGS=(--reinstall)
+fi
+
+log "Installing or refreshing compiler, runtime, web server and network tooling"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
-apt-get install -y --no-install-recommends \
+apt-get install -y --no-install-recommends "${APT_REINSTALL_ARGS[@]}" \
   build-essential clang cmake ninja-build pkg-config git ca-certificates curl \
   liburing-dev liburing2 libssl-dev libsqlite3-dev libsqlite3-0 sqlite3 \
   nodejs npm iproute2 ethtool kmod
 if ! apt-cache show caddy >/dev/null 2>&1 && [[ "${ID}" == "ubuntu" ]]; then
-  apt-get install -y --no-install-recommends software-properties-common
+  apt-get install -y --no-install-recommends "${APT_REINSTALL_ARGS[@]}" software-properties-common
   add-apt-repository -y universe
   apt-get update
 fi
-apt-get install -y --no-install-recommends caddy ||
+apt-get install -y --no-install-recommends "${APT_REINSTALL_ARGS[@]}" caddy ||
   die "Caddy is unavailable from this distribution's configured repositories."
 
 CMAKE_VERSION="$(cmake --version | awk 'NR == 1 { print $3 }')"
@@ -211,10 +367,13 @@ if (( NOFILE > 1048576 )); then NOFILE=1048576; fi
 log "Building hardened C++ server with ${WORKERS} media workers"
 export CC=clang
 export CXX=clang++
-cmake --preset production
-cmake --build --preset production --parallel "${CPU_COUNT}"
+cmake --fresh --preset production
+cmake --build --preset production --clean-first --parallel "${CPU_COUNT}"
 SERVER_BINARY="${SOURCE_DIR}/build/production/apps/rtmp_server/rtmp_server"
 [[ -x "${SERVER_BINARY}" ]] || die "Production server binary was not produced."
+SERVER_BINARY_SHA256="$(sha256sum "${SERVER_BINARY}" | awk '{ print $1 }')"
+[[ "${SERVER_BINARY_SHA256}" =~ ^[0-9a-f]{64}$ ]] ||
+  die "Could not calculate the production server binary SHA-256."
 
 log "Building pinned admin panel assets"
 (
@@ -237,10 +396,22 @@ install -d -m 0750 -o rtmp-server -g rtmp-server \
 install -d -m 0750 -o root -g rtmp-server /etc/rtmp-server
 install -d -m 0755 -o root -g root /var/www/streamforge /usr/share/doc/rtmp-server
 
-if [[ -x /usr/local/bin/rtmp-server ]]; then
-  cp -a /usr/local/bin/rtmp-server /usr/local/bin/rtmp-server.previous
+SERVER_INSTALL_PATH=/usr/local/bin/rtmp-server
+SERVER_STAGED_PATH=/usr/local/bin/rtmp-server.new
+if [[ -x "${SERVER_INSTALL_PATH}" ]]; then
+  cp -a "${SERVER_INSTALL_PATH}" "${SERVER_INSTALL_PATH}.previous"
 fi
-install -m 0755 -o root -g root "${SERVER_BINARY}" /usr/local/bin/rtmp-server
+install -m 0755 -o root -g root "${SERVER_BINARY}" "${SERVER_STAGED_PATH}"
+STAGED_BINARY_SHA256="$(sha256sum "${SERVER_STAGED_PATH}" | awk '{ print $1 }')"
+if [[ "${STAGED_BINARY_SHA256}" != "${SERVER_BINARY_SHA256}" ]]; then
+  rm -f "${SERVER_STAGED_PATH}"
+  die "Staged server binary does not match the production build; the current installation was not changed."
+fi
+# Rename only after verification. A running service keeps its already-open
+# executable while new starts see the complete replacement, never a partial
+# copy. The .previous binary remains available for an immediate rollback.
+mv -f "${SERVER_STAGED_PATH}" "${SERVER_INSTALL_PATH}"
+log "Installed verified server binary (SHA-256 ${SERVER_BINARY_SHA256})"
 install -m 0640 -o root -g rtmp-server "${SOURCE_DIR}/config/server.example.yaml" /etc/rtmp-server/server.yaml
 install -m 0644 -o root -g root "${SOURCE_DIR}/docs/deployment.md" /usr/share/doc/rtmp-server/deployment.md
 cp -a "${SOURCE_DIR}/admin/dist/." /var/www/streamforge/
@@ -461,6 +632,7 @@ else
   CADDY_SITE=":80"
 fi
 cat > /etc/caddy/Caddyfile <<EOF
+# Managed by StreamForge install-linux.sh
 ${CADDY_SITE} {
     encode zstd gzip
 
@@ -525,6 +697,7 @@ if [[ -n "${DOMAIN}" ]]; then ADMIN_URL="https://${DOMAIN}"; fi
 printf '\n\033[1;32mStreamForge installation complete.\033[0m\n'
 printf '  Admin panel:      %s\n' "${ADMIN_URL}"
 printf '  RTMP origin:      rtmp://%s:1935\n' "${PUBLIC_HOST}"
+printf '  Install mode:     %s\n' "$(if [[ "${FRESH_INSTALL}" == "1" ]]; then printf 'full clean install'; else printf 'in-place install'; fi)"
 printf '  Network device:   %s\n' "${PRIMARY_INTERFACE}"
 printf '  Link bandwidth:   %s Mbps — %s\n' "${BANDWIDTH_MBIT}" "${BANDWIDTH_SOURCE}"
 printf '  Media workers:    %s\n' "${WORKERS}"

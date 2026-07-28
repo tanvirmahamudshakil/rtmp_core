@@ -18,6 +18,13 @@ cd rtmp_core
 sudo env RTMP_BANDWIDTH_MBIT=auto bash scripts/install-linux.sh
 ```
 
+The installer performs a full clean install by default. On every run it stops
+and removes the previous StreamForge services, binaries, configuration,
+database, stream keys, recordings, backups, web assets and production build
+artefacts before rebuilding everything and generating fresh secrets. Missing
+items are skipped. Set `RTMP_FRESH_INSTALL=0` only when an intentional
+in-place upgrade must preserve the existing data and credentials.
+
 With no domain, the installer detects the VPS primary IPv4 address and serves
 the panel over HTTP on that IP. Add `RTMP_DOMAIN=stream.example.com` when DNS
 is ready to let Caddy provision HTTPS automatically.
