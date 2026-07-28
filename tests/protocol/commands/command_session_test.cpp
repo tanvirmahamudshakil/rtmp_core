@@ -201,8 +201,13 @@ TEST_F(CommandSessionTest, PlayProducesPlayStartStatus) {
         stream_id, {Amf0Value::string("play"), Amf0Value::number(0), Amf0Value::null(),
                     Amf0Value::string("good-key")}));
 
-    ASSERT_EQ(outgoing.size(), 1u);
-    auto values = decode_outgoing(outgoing[0]);
+    // A "Stream Begin" User Control Message must precede the Play.Start
+    // onStatus so VLC/librtmp begins rendering (see handle_play).
+    ASSERT_EQ(outgoing.size(), 2u);
+    EXPECT_EQ(outgoing[0].message_type_id, static_cast<std::uint8_t>(MessageTypeId::UserControlMessage));
+    EXPECT_EQ(outgoing[0].payload[0], std::byte{0}); // StreamBegin event type (high byte)
+    EXPECT_EQ(outgoing[0].payload[1], std::byte{0}); // StreamBegin event type (low byte)
+    auto values = decode_outgoing(outgoing[1]);
     EXPECT_EQ(values[0].as_string(), "onStatus");
     EXPECT_EQ(values[3].find("code")->as_string(), "NetStream.Play.Start");
     EXPECT_EQ(session.stream_state(stream_id), NetStreamState::Playing);
@@ -501,14 +506,16 @@ TEST_F(CommandSessionTest, NewViewerReceivesCachedGopAndSequenceHeaders) {
         view_stream_id, {Amf0Value::string("play"), Amf0Value::number(0), Amf0Value::null(),
                           Amf0Value::string("good-key")}));
 
-    // Expect: onStatus (Play.Start), then AVC sequence header, then the two
-    // cached GOP video frames (keyframe, interframe) — in that order.
-    ASSERT_EQ(viewer_outgoing.size(), 4u);
-    EXPECT_EQ(viewer_outgoing[1].message_type_id, static_cast<std::uint8_t>(MessageTypeId::Video));
-    EXPECT_EQ(viewer_outgoing[1].payload[1], static_cast<std::byte>(0x00)); // sequence header
-    EXPECT_EQ(viewer_outgoing[2].payload[1], static_cast<std::byte>(0x01));
-    EXPECT_EQ(viewer_outgoing[2].payload[2], static_cast<std::byte>(0xBB)); // keyframe
-    EXPECT_EQ(viewer_outgoing[3].payload[2], static_cast<std::byte>(0xCC)); // interframe
+    // Expect: Stream Begin (User Control), onStatus (Play.Start), then AVC
+    // sequence header, then the two cached GOP video frames (keyframe,
+    // interframe) — in that order.
+    ASSERT_EQ(viewer_outgoing.size(), 5u);
+    EXPECT_EQ(viewer_outgoing[0].message_type_id, static_cast<std::uint8_t>(MessageTypeId::UserControlMessage));
+    EXPECT_EQ(viewer_outgoing[2].message_type_id, static_cast<std::uint8_t>(MessageTypeId::Video));
+    EXPECT_EQ(viewer_outgoing[2].payload[1], static_cast<std::byte>(0x00)); // sequence header
+    EXPECT_EQ(viewer_outgoing[3].payload[1], static_cast<std::byte>(0x01));
+    EXPECT_EQ(viewer_outgoing[3].payload[2], static_cast<std::byte>(0xBB)); // keyframe
+    EXPECT_EQ(viewer_outgoing[4].payload[2], static_cast<std::byte>(0xCC)); // interframe
 }
 
 TEST_F(CommandSessionTest, PublisherDisconnectEndsViewerSessionCleanly) {
@@ -677,7 +684,8 @@ TEST_F(CommandSessionTest, PlaybackAuthorizerAllowingAPlayRequestStripsTheQueryF
         1, {Amf0Value::string("play"), Amf0Value::number(0), Amf0Value::null(),
             Amf0Value::string("alpha?token=abc&expires=123")}));
 
-    ASSERT_EQ(outgoing.size(), 1u);
+    // Stream Begin (User Control) precedes the Play.Start onStatus.
+    ASSERT_EQ(outgoing.size(), 2u);
     auto values = decode_outgoing(outgoing.back());
     ASSERT_GE(values.size(), 4u);
     EXPECT_EQ(values[3].find("code")->as_string(), "NetStream.Play.Start");

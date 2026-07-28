@@ -28,6 +28,32 @@ std::string string_arg(const Amf0Value& v, std::string fallback = {}) {
     return v.is_string() ? v.as_string() : std::move(fallback);
 }
 
+// RTMP User Control Message (type 4) event type. Only StreamBegin (0) is
+// produced here; the connection session handles PingRequest/PingResponse.
+constexpr std::uint16_t kUserControlStreamBegin = 0;
+
+// Builds a "Stream Begin" User Control Message for `message_stream_id`.
+// Every mainstream RTMP client (VLC/librtmp, ffmpeg, Flash) waits for this
+// event before it starts rendering the play stream, so it must be sent
+// before the NetStream.Play.Start onStatus. The payload is a 2-byte
+// big-endian event type followed by the 4-byte big-endian stream ID that
+// has become functional. It rides the protocol-control chunk stream
+// (csid 2, message stream 0), same as every other User Control Message.
+RtmpMessage make_stream_begin(std::uint32_t message_stream_id) {
+    RtmpMessage message;
+    message.chunk_stream_id = chunk::kProtocolControlChunkStreamId;
+    message.message_stream_id = chunk::kProtocolControlMessageStreamId;
+    message.message_type_id = static_cast<std::uint8_t>(MessageTypeId::UserControlMessage);
+    message.payload.reserve(6);
+    message.payload.push_back(static_cast<std::byte>((kUserControlStreamBegin >> 8) & 0xFF));
+    message.payload.push_back(static_cast<std::byte>(kUserControlStreamBegin & 0xFF));
+    message.payload.push_back(static_cast<std::byte>((message_stream_id >> 24) & 0xFF));
+    message.payload.push_back(static_cast<std::byte>((message_stream_id >> 16) & 0xFF));
+    message.payload.push_back(static_cast<std::byte>((message_stream_id >> 8) & 0xFF));
+    message.payload.push_back(static_cast<std::byte>(message_stream_id & 0xFF));
+    return message;
+}
+
 } // namespace
 
 namespace {
@@ -368,6 +394,12 @@ void CommandSession::handle_play(const Amf0Command& command, std::uint32_t messa
     slot.state = NetStreamState::Playing;
     slot.stream_key = stream_key;
     slot.stream_id = stream_id_registry_->resolve(app_name_, stream_key);
+
+    // Signal the stream is now live *before* NetStream.Play.Start and before
+    // any cached-GOP media the subscribe() below replays. Without this, VLC/
+    // librtmp accepts the connection and the onStatus but never starts
+    // rendering — the "publish works, play produces no output" symptom.
+    if (outgoing_handler_) outgoing_handler_(make_stream_begin(message_stream_id));
 
     send_status(message_stream_id, "status", "NetStream.Play.Start", "Started playing " + stream_key + ".");
 
