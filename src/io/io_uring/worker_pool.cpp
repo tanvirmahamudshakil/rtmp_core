@@ -73,6 +73,7 @@ core::Result<void> WorkerPool::run() {
 
     for (std::uint32_t i = 0; i < count; ++i) {
         IoUringEventLoop* loop_ptr = workers_[i].loop.get();
+        if (stop_requested_.load(std::memory_order_acquire)) loop_ptr->stop();
         workers_[i].thread = std::thread([loop_ptr, i, pin, hardware]() {
             if (pin) {
                 // Task 12 ("may be configurable but must not be mandatory"):
@@ -102,6 +103,12 @@ core::Result<void> WorkerPool::run() {
 }
 
 void WorkerPool::stop() {
+    stop_requested_.store(true, std::memory_order_release);
+    // run() constructs workers on the calling thread before publishing
+    // workers_ready_. If shutdown arrives during that initialization,
+    // iterating workers_ here would race the vector mutation. run() checks
+    // stop_requested_ before starting each completed worker instead.
+    if (!workers_ready_.load(std::memory_order_acquire)) return;
     for (auto& worker : workers_) {
         if (worker.loop) worker.loop->stop();
     }

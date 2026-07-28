@@ -103,11 +103,19 @@ TEST(WorkerPoolTest, RunAcceptsRealConnectionsThenStopsGracefully) {
         EXPECT_TRUE(static_cast<bool>(result));
     });
 
-    // Give both workers' rings time to bind/listen before connecting.
-    std::this_thread::sleep_for(std::chrono::milliseconds(200));
-
     int accepted = 0;
-    for (int i = 0; i < 8; ++i) {
+    // Context capability probing can take a few hundred milliseconds on a
+    // cold or virtualized kernel. Retry readiness instead of assuming a
+    // fixed 200 ms startup time, then make enough connections to exercise
+    // SO_REUSEPORT distribution across both workers.
+    for (int attempt = 0; attempt < 40 && accepted == 0; ++attempt) {
+        if (connect_to(config.rtmp_bind_address, config.rtmp_port)) {
+            ++accepted;
+        } else {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+    }
+    for (int i = accepted; i < 8; ++i) {
         if (connect_to(config.rtmp_bind_address, config.rtmp_port)) ++accepted;
     }
     EXPECT_GT(accepted, 0);

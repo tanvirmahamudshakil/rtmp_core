@@ -74,6 +74,7 @@ private:
     std::unique_ptr<CrossWorkerRouter> router_;
     std::vector<Worker> workers_;
     std::atomic<bool> workers_ready_{false};
+    std::atomic<bool> stop_requested_{false};
 };
 
 } // namespace rtmp_server::io::io_uring

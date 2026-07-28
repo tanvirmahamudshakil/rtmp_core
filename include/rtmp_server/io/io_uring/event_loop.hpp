@@ -77,7 +77,7 @@ public:
     // Thread-safe: marks the loop for graceful shutdown. Actual teardown
     // (per docs/rtmp_promot.md "Graceful Shutdown") happens on the loop
     // thread on its next completion-processing iteration.
-    void stop() noexcept { stopping_.store(true); }
+    void stop() noexcept;
     [[nodiscard]] bool is_stopping() const noexcept { return stopping_.load(); }
 
     // Phase 7: installs the shared metrics registry for this worker. Must be
@@ -211,6 +211,7 @@ private:
     observability::Metrics* metrics_ = nullptr;
     CrossWorkerRouter::WorkerId worker_id_;
     CrossWorkerRouter* router_;
+    int router_wake_fd_ = -1;
     bool enable_reuseport_;
     EventLoopServices services_;
     std::uint64_t pending_router_poll_operation_id_ = 0;
@@ -220,6 +221,10 @@ private:
     std::atomic<bool> stopping_{false};
     bool shutdown_initiated_ = false;
     std::chrono::steady_clock::time_point shutdown_deadline_{};
+    // Connection IDs are shared with the process-wide StreamRegistry, so a
+    // worker-local sequence alone is not unique. The top byte identifies the
+    // worker; the remaining 56 bits are this worker's monotonically
+    // increasing sequence.
     std::uint64_t next_connection_id_ = 1;
     std::uint64_t next_generation_ = 1;
     std::uint64_t pending_accept_operation_id_ = 0;

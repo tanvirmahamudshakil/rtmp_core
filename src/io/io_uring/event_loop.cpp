@@ -42,6 +42,7 @@ IoUringEventLoop::IoUringEventLoop(IoUringContext context, core::ServerConfig co
                    protocol::commands::QueueLimits{/*max_bytes=*/0, /*max_packets=*/0}),
       worker_id_(worker_id),
       router_(router),
+      router_wake_fd_(router != nullptr ? router->wake_fd(worker_id) : -1),
       enable_reuseport_(enable_reuseport),
       services_(std::move(services)) {
     set_metrics(services_.metrics);
@@ -59,6 +60,19 @@ IoUringEventLoop::IoUringEventLoop(IoUringContext context, core::ServerConfig co
         });
         live_fanout_.set_stream_end_hook(
             [this](protocol::commands::StreamId stream_id) { router_->on_stream_end(stream_id); });
+    }
+}
+
+void IoUringEventLoop::stop() noexcept {
+    stopping_.store(true);
+
+    // io_uring_submit_and_wait() may otherwise remain blocked when an idle
+    // service receives SIGTERM. WorkerPool supplies a per-worker eventfd via
+    // CrossWorkerRouter; writing it is async-signal-safe and completes the
+    // already-armed poll so the loop observes stopping_ immediately.
+    if (router_wake_fd_ >= 0) {
+        const std::uint64_t one = 1;
+        [[maybe_unused]] const auto written = ::write(router_wake_fd_, &one, sizeof(one));
     }
 }
 
@@ -488,7 +502,11 @@ void IoUringEventLoop::handle_accept_completion(const OperationContext& /*op*/, 
     int keepalive = 1;
     ::setsockopt(client_fd, SOL_SOCKET, SO_KEEPALIVE, &keepalive, sizeof(keepalive));
 
-    auto connection_id = next_connection_id_++;
+    constexpr std::uint64_t kWorkerIdShift = 56;
+    constexpr std::uint64_t kLocalIdMask = (std::uint64_t{1} << kWorkerIdShift) - 1;
+    const auto local_connection_id = next_connection_id_++ & kLocalIdMask;
+    const auto connection_id = ((static_cast<std::uint64_t>(worker_id_) + 1) << kWorkerIdShift) |
+                               local_connection_id;
     auto generation = next_generation_++;
     auto connection = std::make_shared<TcpConnection>(*this, core::FileDescriptor(client_fd),
                                                         connection_id, generation, client_ip);

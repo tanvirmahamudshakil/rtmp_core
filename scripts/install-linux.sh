@@ -122,7 +122,7 @@ awk -v value="${RESOURCE_SIZING_MBIT}" 'BEGIN { exit !(value >= 0.05 && value <=
 remove_managed_path() {
   local target="$1"
   case "${target}" in
-    "${SOURCE_DIR}/build/production" | \
+    "${SOURCE_DIR}/build" | \
     "${SOURCE_DIR}/admin/node_modules" | \
     "${SOURCE_DIR}/admin/dist" | \
     /etc/rtmp-server | \
@@ -156,8 +156,8 @@ remove_managed_path() {
 }
 
 remove_streamforge_ufw_rules() {
-  command -v ufw >/dev/null 2>&1 || return
-  ufw status 2>/dev/null | grep -q '^Status: active' || return
+  command -v ufw >/dev/null 2>&1 || return 0
+  ufw status 2>/dev/null | grep -q '^Status: active' || return 0
 
   local rule_number
   while read -r rule_number; do
@@ -179,8 +179,17 @@ remove_streamforge_ufw_rules() {
 stop_and_disable_unit() {
   local unit="$1"
   if systemctl is-active --quiet "${unit}"; then
-    systemctl stop "${unit}" ||
-      die "Could not stop ${unit}; refusing to remove files used by a running service."
+    if ! systemctl stop "${unit}"; then
+      # A service whose graceful stop exceeded TimeoutStopSec can return a
+      # failure even after systemd has killed the final process. That state is
+      # safe to clean. Refuse only when a live MainPID still exists.
+      local main_pid
+      main_pid="$(systemctl show --property MainPID --value "${unit}" 2>/dev/null || printf '0')"
+      if [[ "${main_pid}" =~ ^[1-9][0-9]*$ ]] && kill -0 "${main_pid}" 2>/dev/null; then
+        die "Could not stop ${unit}; refusing to remove files used by PID ${main_pid}."
+      fi
+      log "${unit} required a forced systemd stop; no process remains, continuing cleanup"
+    fi
   fi
   systemctl disable "${unit}" >/dev/null 2>&1 || true
 }
@@ -232,7 +241,7 @@ clean_previous_install() {
     /etc/logrotate.d/rtmp-server \
     /usr/local/sbin/rtmp-network-tune \
     /root/streamforge-credentials.txt \
-    "${SOURCE_DIR}/build/production" \
+    "${SOURCE_DIR}/build" \
     "${SOURCE_DIR}/admin/node_modules" \
     "${SOURCE_DIR}/admin/dist"; do
     remove_managed_path "${target}"
@@ -523,6 +532,7 @@ OOMScoreAdjust=200
 OOMPolicy=stop
 StateDirectory=rtmp-server
 ConfigurationDirectory=rtmp-server
+ConfigurationDirectoryMode=0750
 ProtectSystem=strict
 ProtectHome=true
 ReadWritePaths=/var/lib/rtmp-server
@@ -658,6 +668,8 @@ ${CADDY_SITE} {
     }
 }
 EOF
+chown root:root /etc/caddy/Caddyfile
+chmod 0644 /etc/caddy/Caddyfile
 caddy validate --config /etc/caddy/Caddyfile
 
 if command -v ufw >/dev/null 2>&1 && [[ "${CONFIGURE_FIREWALL}" == "1" ]] &&
