@@ -459,23 +459,33 @@ function ApplicationsPage({
   return (
     <>
       <div className="section-intro">
-        <div><h2>Organize your streams</h2><p>Use applications to group streams by event, product or customer.</p></div>
+        <div>
+          <span className="eyebrow">APPLICATION LIBRARY</span>
+          <h2>Your applications</h2>
+          <p>{applications.length} {applications.length === 1 ? "application" : "applications"} created · grouped by namespace</p>
+        </div>
         <button className="primary-button" onClick={openCreate}><Plus size={17} /> New application</button>
       </div>
       <section className="application-grid">
         {applications.map((app, index) => {
           const appStreams = streams.filter((stream) => stream.application === app.name);
           const live = appStreams.filter((stream) => stream.is_live).length;
+          const viewers = appStreams.reduce((sum, stream) => sum + (stream.viewer_count ?? 0), 0);
           return (
             <article className="application-card" key={app.name}>
-              <div className={`app-icon tone-${index % 4}`}><AppWindow size={21} /></div>
-              <StatusPill live={app.enabled} label={app.enabled ? "Enabled" : "Disabled"} />
-              <h3>{app.name}</h3>
-              <code>rtmp://origin:1935/{app.name}</code>
+              <div className="app-card-head">
+                <div className={`app-icon tone-${index % 4}`}><AppWindow size={20} /></div>
+                <StatusPill live={app.enabled} label={app.enabled ? "Enabled" : "Disabled"} />
+              </div>
+              <div className="app-card-title">
+                <span>Application {String(index + 1).padStart(2, "0")}</span>
+                <h3>{app.name}</h3>
+              </div>
+              <div className="app-endpoint"><RadioTower size={14} /><code>/{app.name}</code></div>
               <div className="app-stats">
                 <div><strong>{appStreams.length}</strong><span>Streams</span></div>
-                <div><strong>{live}</strong><span>Live now</span></div>
-                <div><strong>{compact(appStreams.reduce((sum, stream) => sum + (stream.viewer_count ?? 0), 0))}</strong><span>Viewers</span></div>
+                <div><strong className={live ? "live-number" : ""}>{live}</strong><span>Live now</span></div>
+                <div><strong>{compact(viewers)}</strong><span>Viewers</span></div>
               </div>
             </article>
           );
