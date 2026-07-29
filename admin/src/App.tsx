@@ -3,7 +3,6 @@ import {
   AppWindow,
   ArrowDownToLine,
   ArrowUpRight,
-  BarChart3,
   Check,
   ChevronRight,
   CircleGauge,
@@ -12,8 +11,8 @@ import {
   Cpu,
   Database,
   FileVideo,
-  Gauge,
   HardDrive,
+  House,
   Layers3,
   Menu,
   MoreHorizontal,
@@ -34,23 +33,23 @@ import {
   Unplug,
   Users,
   Video,
+  Workflow,
   X,
   Zap
 } from "lucide-react";
 import { FormEvent, ReactNode, useCallback, useEffect, useMemo, useState } from "react";
 import { Application, ControlClient, Snapshot, Stream, StreamSetup } from "./api";
 
-type Page = "overview" | "streams" | "applications" | "capacity" | "system";
+type Page = "home" | "applications" | "transcode" | "server";
 type Notice = { type: "success" | "error"; message: string } | null;
 
 const EMPTY_SNAPSHOT: Snapshot = { applications: [], streams: [], metrics: {}, health: "offline" };
 const absoluteUrl = (path: string) => new URL(path, window.location.origin).toString();
 const pageTitles: Record<Page, { title: string; subtitle: string }> = {
-  overview: { title: "Overview", subtitle: "Your live service at a glance" },
-  streams: { title: "Streams", subtitle: "Create and monitor every stream" },
-  applications: { title: "Applications", subtitle: "Organize streams into simple namespaces" },
-  capacity: { title: "Capacity", subtitle: "Plan direct delivery without a CDN" },
-  system: { title: "System", subtitle: "Server health and resource usage" }
+  home: { title: "Home", subtitle: "Live delivery overview and network activity" },
+  applications: { title: "Application", subtitle: "Manage applications, streams and playback links" },
+  transcode: { title: "Transcode", subtitle: "Your transcoding workspace" },
+  server: { title: "Server", subtitle: "Origin health, resources and delivery capacity" }
 };
 
 const metric = (snapshot: Snapshot, name: string) => snapshot.metrics[name] ?? 0;
@@ -189,11 +188,10 @@ function Sidebar({
   close: () => void;
 }) {
   const nav: { page: Page; label: string; icon: ReactNode }[] = [
-    { page: "overview", label: "Overview", icon: <BarChart3 size={18} /> },
-    { page: "streams", label: "Streams", icon: <Radio size={18} /> },
-    { page: "applications", label: "Applications", icon: <Layers3 size={18} /> },
-    { page: "capacity", label: "Capacity planner", icon: <Gauge size={18} /> },
-    { page: "system", label: "System", icon: <Server size={18} /> }
+    { page: "home", label: "Home", icon: <House size={18} /> },
+    { page: "applications", label: "Application", icon: <Layers3 size={18} /> },
+    { page: "transcode", label: "Transcode", icon: <Workflow size={18} /> },
+    { page: "server", label: "Server", icon: <Server size={18} /> }
   ];
   return (
     <>
@@ -221,8 +219,8 @@ function Sidebar({
         </nav>
         <div className="sidebar-spacer" />
         <div className="edge-card">
-          <div className="edge-icon"><CloudOff size={18} /></div>
-          <div><strong>Direct origin</strong><span>Serving viewers without a CDN</span></div>
+          <div className="edge-icon"><RadioTower size={18} /></div>
+          <div><strong>C++ media origin</strong><span>RTMP ingest · HLS delivery</span></div>
           <StatusPill live label="Ready" />
         </div>
         <div className="sidebar-version">StreamForge v1.0 · C++23</div>
@@ -314,7 +312,7 @@ function Overview({
         <article className="panel traffic-panel">
           <div className="panel-heading">
             <div><span className="eyebrow">BANDWIDTH</span><h2>Network headroom</h2></div>
-            <button className="subtle-button" onClick={() => onNavigate("capacity")}>
+            <button className="subtle-button" onClick={() => onNavigate("server")}>
               Open planner <ChevronRight size={16} />
             </button>
           </div>
@@ -366,7 +364,7 @@ function Overview({
       <section className="panel">
         <div className="panel-heading">
           <div><span className="eyebrow">LIVE NOW</span><h2>Top streams</h2></div>
-          <button className="subtle-button" onClick={() => onNavigate("streams")}>View all streams <ChevronRight size={16} /></button>
+          <button className="subtle-button" onClick={() => onNavigate("applications")}>View all streams <ChevronRight size={16} /></button>
         </div>
         <StreamTable streams={(liveStreams.length ? liveStreams : snapshot.streams).slice(0, 5)} onAction={onStreamAction} compactMode />
       </section>
@@ -634,11 +632,32 @@ function SystemPage({ snapshot }: { snapshot: Snapshot }) {
   );
 }
 
+function TranscodePage() {
+  return (
+    <section className="transcode-placeholder">
+      <div className="transcode-visual" aria-hidden="true">
+        <span className="transcode-node input"><RadioTower size={23} /></span>
+        <span className="transcode-line first" />
+        <span className="transcode-core"><Workflow size={30} /></span>
+        <span className="transcode-line second" />
+        <span className="transcode-node output"><Video size={23} /></span>
+      </div>
+      <span className="placeholder-badge">WORKSPACE READY</span>
+      <h2>Transcode controls will live here</h2>
+      <p>This page is intentionally clean for now. When you share the transcoding workflow and controls, they can be added without changing the rest of the panel.</p>
+      <div className="placeholder-meta">
+        <span><Check size={15} /> Navigation ready</span>
+        <span><Check size={15} /> Responsive layout ready</span>
+      </div>
+    </section>
+  );
+}
+
 function App() {
   const demo = new URLSearchParams(window.location.search).get("demo") === "1";
   const [client] = useState(() => new ControlClient(demo));
   const [snapshot, setSnapshot] = useState<Snapshot>(EMPTY_SNAPSHOT);
-  const [page, setPage] = useState<Page>("overview");
+  const [page, setPage] = useState<Page>("home");
   const [loading, setLoading] = useState(false);
   const [notice, setNotice] = useState<Notice>(null);
   const [mobileNav, setMobileNav] = useState(false);
@@ -749,24 +768,33 @@ function App() {
             {demo && <span className="demo-badge"><SquareActivity size={14} /> Demo data</span>}
             <div className="node-status"><span className="pulse" /><div><strong>Origin node</strong><small>{snapshot.health === "online" ? "Online" : "Connecting…"}</small></div></div>
             <IconButton label="Refresh data" onClick={() => refresh()}><RefreshCw className={loading ? "spin" : ""} size={17} /></IconButton>
-            <button className="primary-button desktop-create" onClick={() => setCreateType("stream")}><Plus size={17} /> New stream</button>
+            {page === "applications" && <button className="primary-button desktop-create" onClick={() => setCreateType("stream")}><Plus size={17} /> New stream</button>}
           </div>
         </header>
         <div className="content">
-          {page === "overview" && <Overview snapshot={snapshot} history={history} bandwidth={bandwidth} onNavigate={setPage} onStreamAction={streamAction} />}
-          {page === "streams" && <StreamsPage streams={sortedStreams} onAction={streamAction} openCreate={() => setCreateType("stream")} />}
-          {page === "applications" && <ApplicationsPage applications={snapshot.applications} streams={snapshot.streams} openCreate={() => setCreateType("application")} />}
-          {page === "capacity" && (
-            <CapacityPage
-              bandwidth={bandwidth}
-              setBandwidth={setBandwidth}
-              currentEgress={currentEgress}
-              viewers={viewers}
-              measuredBitrateMbps={measuredBitrateMbps}
-              measuredBitrateSource={measuredBitrateSource}
-            />
+          {page === "home" && <Overview snapshot={snapshot} history={history} bandwidth={bandwidth} onNavigate={setPage} onStreamAction={streamAction} />}
+          {page === "applications" && (
+            <div className="workspace-stack">
+              <ApplicationsPage applications={snapshot.applications} streams={snapshot.streams} openCreate={() => setCreateType("application")} />
+              <div className="workspace-divider"><span>STREAMS</span><strong>Application streams</strong><p>Create, monitor and manage every RTMP/HLS stream.</p></div>
+              <StreamsPage streams={sortedStreams} onAction={streamAction} openCreate={() => setCreateType("stream")} />
+            </div>
           )}
-          {page === "system" && <SystemPage snapshot={snapshot} />}
+          {page === "transcode" && <TranscodePage />}
+          {page === "server" && (
+            <div className="workspace-stack">
+              <SystemPage snapshot={snapshot} />
+              <div className="workspace-divider"><span>CAPACITY</span><strong>Delivery planner</strong><p>Estimate safe direct-origin viewer capacity from the available uplink.</p></div>
+              <CapacityPage
+                bandwidth={bandwidth}
+                setBandwidth={setBandwidth}
+                currentEgress={currentEgress}
+                viewers={viewers}
+                measuredBitrateMbps={measuredBitrateMbps}
+                measuredBitrateSource={measuredBitrateSource}
+              />
+            </div>
+          )}
         </div>
       </main>
 
