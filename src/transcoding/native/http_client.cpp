@@ -2,6 +2,7 @@
 
 #include <curl/curl.h>
 
+#include <algorithm>
 #include <mutex>
 
 #include "rtmp_server/core/error.hpp"
@@ -27,6 +28,42 @@ std::size_t write_cb(char* ptr, std::size_t size, std::size_t nmemb, void* userd
     const auto* begin = reinterpret_cast<const std::byte*>(ptr);
     out->insert(out->end(), begin, begin + bytes);
     return bytes;
+}
+
+struct PeekState {
+    std::vector<std::byte>* out;
+    std::size_t max_bytes;
+};
+
+// Collects up to max_bytes, then returns a short count to make curl abort the
+// transfer with CURLE_WRITE_ERROR — the intended way to stop early.
+std::size_t peek_write_cb(char* ptr, std::size_t size, std::size_t nmemb, void* userdata) {
+    auto* state = static_cast<PeekState*>(userdata);
+    const std::size_t bytes = size * nmemb;
+    const auto* begin = reinterpret_cast<const std::byte*>(ptr);
+    if (state->out->size() >= state->max_bytes) return 0;
+    const std::size_t take = std::min(bytes, state->max_bytes - state->out->size());
+    state->out->insert(state->out->end(), begin, begin + take);
+    return state->out->size() >= state->max_bytes ? 0 : bytes;
+}
+
+struct StreamState {
+    const HttpClient::ChunkHandler* on_chunk;
+    const std::function<bool()>* should_continue;
+};
+
+std::size_t stream_write_cb(char* ptr, std::size_t size, std::size_t nmemb, void* userdata) {
+    auto* state = static_cast<StreamState*>(userdata);
+    const std::size_t bytes = size * nmemb;
+    if (state->should_continue && !(*state->should_continue)()) return 0;
+    const auto* begin = reinterpret_cast<const std::byte*>(ptr);
+    if (!(*state->on_chunk)(std::span<const std::byte>(begin, bytes))) return 0;
+    return bytes;
+}
+
+int stream_progress_cb(void* userdata, curl_off_t, curl_off_t, curl_off_t, curl_off_t) {
+    auto* state = static_cast<StreamState*>(userdata);
+    return (state->should_continue && !(*state->should_continue)()) ? 1 : 0;
 }
 
 } // namespace
@@ -57,6 +94,72 @@ core::Result<void> HttpClient::get(const std::string& url, std::vector<std::byte
     curl_easy_setopt(curl, CURLOPT_USERAGENT, "rtmp_core-source-transcoder/1.0");
 
     const CURLcode code = curl_easy_perform(curl);
+    if (code != CURLE_OK) return http_error(std::string("HTTP GET failed: ") + curl_easy_strerror(code));
+
+    long status = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
+    if (status < 200 || status >= 300) {
+        return http_error("HTTP GET returned status " + std::to_string(status) + " for " + url);
+    }
+    return {};
+}
+
+core::Result<void> HttpClient::peek(const std::string& url, std::size_t max_bytes,
+                                    std::vector<std::byte>& out) {
+    if (handle_ == nullptr) return http_error("curl handle not initialized");
+    out.clear();
+    auto* curl = static_cast<CURL*>(handle_);
+    curl_easy_reset(curl);
+    PeekState state{&out, max_bytes};
+    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, peek_write_cb);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &state);
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 5L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, static_cast<long>(timeout_.count()));
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
+    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, "rtmp_core-source-transcoder/1.0");
+
+    const CURLcode code = curl_easy_perform(curl);
+    // A short write from peek_write_cb (i.e. we already have max_bytes) is the
+    // expected way this transfer ends; only a genuine transport failure with
+    // nothing captured is an error.
+    if (code != CURLE_OK && code != CURLE_WRITE_ERROR) {
+        return http_error(std::string("HTTP GET failed: ") + curl_easy_strerror(code));
+    }
+    if (out.empty()) return http_error("empty response from " + url);
+    return {};
+}
+
+core::Result<void> HttpClient::stream(const std::string& url,
+                                      const std::function<bool()>& should_continue,
+                                      const ChunkHandler& on_chunk) {
+    if (handle_ == nullptr) return http_error("curl handle not initialized");
+    auto* curl = static_cast<CURL*>(handle_);
+    curl_easy_reset(curl);
+    StreamState state{&on_chunk, &should_continue};
+    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, stream_write_cb);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &state);
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 5L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 0L); // a live feed has no natural end
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
+    // Abort a connection that has effectively stalled, so a dead upstream
+    // doesn't pin this worker thread forever.
+    curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 1L);
+    curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME, 30L);
+    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, "rtmp_core-source-transcoder/1.0");
+    // Poll should_continue even while no bytes are arriving, so stop() is
+    // responsive on an idle-but-open connection.
+    curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
+    curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, stream_progress_cb);
+    curl_easy_setopt(curl, CURLOPT_XFERINFODATA, &state);
+
+    const CURLcode code = curl_easy_perform(curl);
+    if (code == CURLE_ABORTED_BY_CALLBACK || code == CURLE_WRITE_ERROR) return {}; // caller asked to stop
     if (code != CURLE_OK) return http_error(std::string("HTTP GET failed: ") + curl_easy_strerror(code));
 
     long status = 0;

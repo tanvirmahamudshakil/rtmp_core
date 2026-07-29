@@ -47,7 +47,11 @@ public:
 
 private:
     void run();
-    [[nodiscard]] std::string resolve_media_url(HttpClient& http, std::string& detail_out);
+    // Classifies source_url_: a bounded HLS playlist (master or media, resolved
+    // to media_url_out) or a continuous raw HTTP-TS live feed (raw_ts_out set,
+    // media_url_out == source_url_) — the two shapes this puller can ingest.
+    [[nodiscard]] bool resolve_source(HttpClient& http, std::string& media_url_out, bool& raw_ts_out,
+                                      std::string& detail_out);
     void set_detail(std::string detail);
 
     std::string source_url_;

@@ -15,6 +15,16 @@ using observability::LogLevel;
 bool ends_with(const std::string& s, std::string_view suffix) {
     return s.size() >= suffix.size() && s.compare(s.size() - suffix.size(), suffix.size(), suffix) == 0;
 }
+
+// Many IPTV/CDN panels answer an .m3u8-shaped URL with a redirect straight to
+// a continuously-flowing raw MPEG-TS body (no playlist, connection never
+// closes on its own) rather than an HLS playlist. Detect that from a small
+// peek by checking for the TS sync byte at packet boundaries.
+bool looks_like_raw_ts(std::span<const std::byte> data) {
+    if (data.empty() || static_cast<unsigned char>(data[0]) != 0x47) return false;
+    if (data.size() > 188 && static_cast<unsigned char>(data[188]) != 0x47) return false;
+    return true;
+}
 } // namespace
 
 HlsSourcePuller::HlsSourcePuller(std::string source_url, std::vector<PullerRendition> renditions,
@@ -50,27 +60,51 @@ std::string HlsSourcePuller::detail() const {
     return detail_;
 }
 
-std::string HlsSourcePuller::resolve_media_url(HttpClient& http, std::string& detail_out) {
+bool HlsSourcePuller::resolve_source(HttpClient& http, std::string& media_url_out, bool& raw_ts_out,
+                                     std::string& detail_out) {
+    // A bounded peek tells us the source's shape without downloading a
+    // never-ending raw-TS body in full (that download would simply time out).
+    std::vector<std::byte> peeked;
+    if (auto r = http.peek(source_url_, 4096, peeked); !r) {
+        detail_out = r.error().message();
+        return false;
+    }
+    if (looks_like_raw_ts(peeked)) {
+        media_url_out = source_url_;
+        raw_ts_out = true;
+        return true;
+    }
+
+    // Otherwise this is HLS playlist text — small and bounded, safe to fetch whole.
     std::vector<std::byte> body;
     if (auto r = http.get(source_url_, body); !r) {
         detail_out = r.error().message();
-        return {};
+        return false;
     }
     const std::string_view text(reinterpret_cast<const char*>(body.data()), body.size());
-    if (!is_master_playlist(text)) return source_url_; // already a media playlist / TS
+    raw_ts_out = false;
+    if (!is_master_playlist(text)) {
+        media_url_out = source_url_; // already a media playlist
+        return true;
+    }
     const auto variants = parse_master_playlist(text, source_url_);
     const std::string chosen = select_variant(variants, 0);
-    if (chosen.empty()) detail_out = "master playlist has no variants";
-    return chosen;
+    if (chosen.empty()) {
+        detail_out = "master playlist has no variants";
+        return false;
+    }
+    media_url_out = chosen;
+    return true;
 }
 
 void HlsSourcePuller::run() {
     HttpClient http;
 
     std::string detail;
-    const std::string media_url = resolve_media_url(http, detail);
-    if (media_url.empty()) {
-        set_detail(detail.empty() ? "could not resolve source playlist" : detail);
+    std::string media_url;
+    bool raw_ts = false;
+    if (!resolve_source(http, media_url, raw_ts, detail)) {
+        set_detail(detail.empty() ? "could not resolve source" : detail);
         status_.store(PullerStatus::Error);
         running_.store(false);
         return;
@@ -122,10 +156,45 @@ void HlsSourcePuller::run() {
     status_.store(PullerStatus::Running);
     set_detail("running");
 
-    std::unordered_set<std::uint64_t> seen; // segment sequence numbers already pulled
     std::mutex sleep_mutex;
     std::condition_variable sleep_cv;
     int consecutive_errors = 0;
+
+    if (raw_ts) {
+        // No playlist, no discrete segments: one open GET streams TS packets
+        // indefinitely. Feed the demuxer as chunks arrive and reconnect (with
+        // backoff) if the connection stalls or drops.
+        while (running_.load()) {
+            bool received_any = false;
+            auto result = http.stream(
+                media_url, [this] { return running_.load(); },
+                [&](std::span<const std::byte> chunk) -> bool {
+                    if (!running_.load()) return false;
+                    received_any = true;
+                    static_cast<void>(demux.feed(chunk));
+                    return true;
+                });
+            if (!running_.load()) break;
+
+            set_detail(result ? "source connection closed; reconnecting"
+                              : result.error().message());
+            consecutive_errors = received_any ? 0 : consecutive_errors + 1;
+            if (consecutive_errors >= 5) {
+                status_.store(PullerStatus::Error);
+                break;
+            }
+            std::unique_lock lock(sleep_mutex);
+            sleep_cv.wait_for(lock, std::chrono::seconds(2), [&] { return !running_.load(); });
+        }
+
+        for (auto& segmenter : segmenters) segmenter->finalize();
+        for (auto& rendition : renditions_) rendition.store->mark_ended();
+        if (status_.load() == PullerStatus::Running) status_.store(PullerStatus::Stopped);
+        running_.store(false);
+        return;
+    }
+
+    std::unordered_set<std::uint64_t> seen; // segment sequence numbers already pulled
 
     while (running_.load()) {
         std::vector<std::byte> playlist_bytes;
