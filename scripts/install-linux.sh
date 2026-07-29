@@ -25,6 +25,11 @@
 #   RTMP_ENABLE_FAIR_QUEUE       1 (default) enables CAKE up to 10 Gbps and
 #                                high-throughput fq above it.
 #   RTMP_CONFIGURE_FIREWALL      1 (default) adds rules only if UFW is active.
+#   RTMP_CONFIGURE_DNS            1 (default) adds public resolvers (Cloudflare,
+#                                Google, Quad9) as systemd-resolved fallback DNS
+#                                so source-transcode pulls of an external HLS/RTMP
+#                                URL still resolve if the provider's own DNS
+#                                fails or blocks a niche domain.
 #   RTMP_WORKERS                 Worker count; default min(nproc, 16).
 #   RTMP_MAX_CONNECTIONS_PER_IP  Per-source safety limit (default 1000).
 #   RTMP_FRESH_INSTALL           1 (default) removes every prior StreamForge
@@ -83,6 +88,7 @@ PROTOCOL_OVERHEAD_PERCENT="${RTMP_PROTOCOL_OVERHEAD_PERCENT:-5}"
 MAX_CONNECTIONS_PER_IP="${RTMP_MAX_CONNECTIONS_PER_IP:-1000}"
 ENABLE_FAIR_QUEUE="${RTMP_ENABLE_FAIR_QUEUE:-1}"
 CONFIGURE_FIREWALL="${RTMP_CONFIGURE_FIREWALL:-1}"
+CONFIGURE_DNS="${RTMP_CONFIGURE_DNS:-1}"
 FORCE_ROTATE="${RTMP_FORCE_ROTATE_SECRETS:-0}"
 FRESH_INSTALL="${RTMP_FRESH_INSTALL:-1}"
 ENABLE_TRANSCODING="${RTMP_ENABLE_TRANSCODING:-1}"
@@ -114,6 +120,7 @@ fi
   die "RTMP_MAX_CONNECTIONS_PER_IP is outside the supported range."
 [[ "${ENABLE_FAIR_QUEUE}" =~ ^[01]$ ]] || die "RTMP_ENABLE_FAIR_QUEUE must be 0 or 1."
 [[ "${CONFIGURE_FIREWALL}" =~ ^[01]$ ]] || die "RTMP_CONFIGURE_FIREWALL must be 0 or 1."
+[[ "${CONFIGURE_DNS}" =~ ^[01]$ ]] || die "RTMP_CONFIGURE_DNS must be 0 or 1."
 [[ "${FORCE_ROTATE}" =~ ^[01]$ ]] || die "RTMP_FORCE_ROTATE_SECRETS must be 0 or 1."
 [[ "${FRESH_INSTALL}" =~ ^[01]$ ]] || die "RTMP_FRESH_INSTALL must be 0 or 1."
 [[ "${ENABLE_TRANSCODING}" =~ ^[01]$ ]] || die "RTMP_ENABLE_TRANSCODING must be 0 or 1."
@@ -637,6 +644,26 @@ if modprobe tcp_bbr 2>/dev/null && sysctl -n net.ipv4.tcp_available_congestion_c
 fi
 sysctl --system >/dev/null
 
+if [[ "${CONFIGURE_DNS}" == "1" ]] && command -v systemctl >/dev/null 2>&1 &&
+   systemctl list-unit-files systemd-resolved.service >/dev/null 2>&1; then
+  log "Adding public fallback DNS resolvers (source-transcode jobs pull external URLs by hostname)"
+  RESOLVED_CONF=/etc/systemd/resolved.conf
+  FALLBACK_LINE="FallbackDNS=1.1.1.1 8.8.8.8 9.9.9.9"
+  if [[ -r "${RESOLVED_CONF}" ]] && grep -q '^FallbackDNS=' "${RESOLVED_CONF}"; then
+    sed -i "s/^FallbackDNS=.*/${FALLBACK_LINE}/" "${RESOLVED_CONF}"
+  elif [[ -r "${RESOLVED_CONF}" ]] && grep -q '^\[Resolve\]' "${RESOLVED_CONF}"; then
+    sed -i "/^\[Resolve\]/a ${FALLBACK_LINE}" "${RESOLVED_CONF}"
+  else
+    printf '[Resolve]\n%s\n' "${FALLBACK_LINE}" >> "${RESOLVED_CONF}"
+  fi
+  systemctl enable --now systemd-resolved.service >/dev/null 2>&1 || true
+  resolvectl flush-caches >/dev/null 2>&1 || true
+  systemctl restart systemd-resolved.service
+else
+  [[ "${CONFIGURE_DNS}" == "1" ]] &&
+    log "systemd-resolved not present; skipping fallback DNS configuration"
+fi
+
 log "Configuring NIC ${PRIMARY_INTERFACE}"
 ethtool -K "${PRIMARY_INTERFACE}" gro on gso on tso on >/dev/null 2>&1 || true
 if [[ "${ENABLE_FAIR_QUEUE}" == "1" ]]; then
@@ -787,6 +814,11 @@ if [[ "${ENABLE_FAIR_QUEUE}" == "1" ]]; then
   fi
 else
   printf '  Fair queue:       disabled by RTMP_ENABLE_FAIR_QUEUE=0\n'
+fi
+if [[ "${CONFIGURE_DNS}" == "1" ]]; then
+  printf '  Fallback DNS:     1.1.1.1, 8.8.8.8, 9.9.9.9 (via systemd-resolved)\n'
+else
+  printf '  Fallback DNS:     disabled by RTMP_CONFIGURE_DNS=0\n'
 fi
 printf '  Install details:  %s\n\n' "${CREDENTIALS}"
 printf 'Next: open the panel directly, create a stream, then copy its one RTMP URL for both input and output.\n'

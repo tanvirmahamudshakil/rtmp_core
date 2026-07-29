@@ -286,6 +286,10 @@ HttpResponse ManagementApi::route(const HttpRequest& request, const std::string&
             auto [application, name] = split_stream_id(parts[3]);
             return handle_delete_source_job(application, name);
         }
+        if (parts.size() == 4 && request.method == "PATCH") {
+            auto [application, name] = split_stream_id(parts[3]);
+            return handle_patch_source_job(application, name, request);
+        }
     }
     // Expected shapes: ["v1","applications"], ["v1","streams"],
     // ["v1","streams", "<id>"], ["v1","streams","<id>","<action>"].
@@ -414,6 +418,24 @@ HttpResponse ManagementApi::handle_delete_source_job(std::string_view applicatio
                                   error_body("request_failed", result.error().message(), ""));
     }
     return HttpResponse::json(200, R"({"deleted":true})");
+}
+
+HttpResponse ManagementApi::handle_patch_source_job(std::string_view application, std::string_view name,
+                                                    const HttpRequest& request) {
+    if (!source_job_enabled_setter_) return HttpResponse::json(503, R"({"error":"transcoding_unavailable"})");
+    auto fields = parse_flat_json(request.body);
+    auto it = fields.find("enabled");
+    if (it == fields.end()) {
+        return HttpResponse::json(400, error_body("validation_error", "no recognized fields in body", ""));
+    }
+    const bool enable = it->second == "true";
+    auto result = source_job_enabled_setter_(application, name, enable);
+    audit(enable ? "enable_source_job" : "disable_source_job", application, name, result.ok());
+    if (!result) {
+        return HttpResponse::json(http_status_for(result.error().code()),
+                                  error_body("request_failed", result.error().message(), ""));
+    }
+    return HttpResponse::json(200, std::move(result).value());
 }
 
 HttpResponse ManagementApi::handle_health_live() { return HttpResponse::json(200, R"({"status":"live"})"); }

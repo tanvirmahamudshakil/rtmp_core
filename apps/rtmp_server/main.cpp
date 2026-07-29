@@ -494,7 +494,8 @@ int main(int argc, char** argv) {
            << esc(job.application) << R"(","name":")" << esc(job.name) << R"(","source_url":")"
            << esc(job.source_url) << R"(","template_name":")" << esc(job.template_name)
            << R"(","master_hls_path":")" << esc(job.master_hls_path) << R"(","status":")"
-           << esc(job.status) << R"(","detail":")" << esc(job.detail) << R"(","outputs":[)";
+           << esc(job.status) << R"(","detail":")" << esc(job.detail) << R"(","enabled":)"
+           << (job.enabled ? "true" : "false") << R"(,"outputs":[)";
         for (std::size_t i = 0; i < job.renditions.size(); ++i) {
             const auto& r = job.renditions[i];
             if (i) os << ',';
@@ -575,6 +576,14 @@ int main(int argc, char** argv) {
                                                 "no such source job");
             }
             return {};
+        },
+        [&source_job_manager, source_job_json](
+            std::string_view application, std::string_view name,
+            bool enabled) -> rtmp_server::core::Result<std::string> {
+            auto snapshot = source_job_manager.set_enabled(std::string(application),
+                                                            std::string(name), enabled);
+            if (!snapshot) return snapshot.error();
+            return source_job_json(snapshot.value());
         });
 #endif
 

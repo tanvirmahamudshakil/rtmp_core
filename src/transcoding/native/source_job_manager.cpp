@@ -38,32 +38,20 @@ std::string SourceJobManager::master_path(const std::string& application,
 }
 
 void SourceJobManager::teardown_locked(Job& job) {
-    if (job.puller) job.puller->stop();
+    if (job.puller) {
+        job.puller->stop();
+        job.puller.reset();
+    }
     if (hooks_.unregister_store) {
         for (const auto& stream : job.output_streams) {
             hooks_.unregister_store(job.config.application, stream);
         }
     }
+    job.output_streams.clear();
 }
 
-core::Result<SourceJobSnapshot> SourceJobManager::create(const SourceJobConfig& config) {
-    if (config.name.empty()) return job_error("source job requires an output name");
-    if (config.source_url.empty()) return job_error("source job requires a source URL");
-    if (config.renditions.empty()) return job_error("source job requires at least one rendition");
-    for (const auto& rendition : config.renditions) {
-        if (rendition.output_stream.empty()) return job_error("every rendition needs an output stream name");
-    }
-
-    std::lock_guard lock(mutex_);
-    const std::string key = key_of(config.application, config.name);
-    if (auto it = jobs_.find(key); it != jobs_.end()) {
-        teardown_locked(it->second); // replace an existing job with the same name
-        jobs_.erase(it);
-    }
-
-    Job job;
-    job.config = config;
-
+void SourceJobManager::start_locked(Job& job) {
+    const auto& config = job.config;
     std::vector<PullerRendition> puller_renditions;
     std::vector<hls::Rendition> master_renditions;
     puller_renditions.reserve(config.renditions.size());
@@ -89,19 +77,63 @@ core::Result<SourceJobSnapshot> SourceJobManager::create(const SourceJobConfig& 
     job.puller = std::make_unique<HlsSourcePuller>(config.source_url, std::move(puller_renditions),
                                                    config.fps);
     job.puller->start();
+    job.enabled = true;
+}
 
+SourceJobSnapshot SourceJobManager::snapshot_locked(const Job& job) const {
     SourceJobSnapshot snapshot;
-    snapshot.application = config.application;
-    snapshot.name = config.name;
-    snapshot.source_url = config.source_url;
-    snapshot.template_name = config.template_name;
-    snapshot.master_hls_path = master_path(config.application, config.name);
-    snapshot.status = status_text(job.puller->status());
-    snapshot.detail = job.puller->detail();
-    snapshot.renditions = config.renditions;
+    snapshot.application = job.config.application;
+    snapshot.name = job.config.name;
+    snapshot.source_url = job.config.source_url;
+    snapshot.template_name = job.config.template_name;
+    snapshot.master_hls_path = master_path(job.config.application, job.config.name);
+    snapshot.enabled = job.enabled;
+    snapshot.status = job.enabled ? (job.puller ? status_text(job.puller->status()) : "stopped")
+                                  : "disabled";
+    snapshot.detail = job.puller ? job.puller->detail() : "";
+    snapshot.renditions = job.config.renditions;
+    return snapshot;
+}
+
+core::Result<SourceJobSnapshot> SourceJobManager::create(const SourceJobConfig& config) {
+    if (config.name.empty()) return job_error("source job requires an output name");
+    if (config.source_url.empty()) return job_error("source job requires a source URL");
+    if (config.renditions.empty()) return job_error("source job requires at least one rendition");
+    for (const auto& rendition : config.renditions) {
+        if (rendition.output_stream.empty()) return job_error("every rendition needs an output stream name");
+    }
+
+    std::lock_guard lock(mutex_);
+    const std::string key = key_of(config.application, config.name);
+    if (auto it = jobs_.find(key); it != jobs_.end()) {
+        teardown_locked(it->second); // replace an existing job with the same name
+        jobs_.erase(it);
+    }
+
+    Job job;
+    job.config = config;
+    start_locked(job);
+    auto snapshot = snapshot_locked(job);
 
     jobs_.emplace(key, std::move(job));
     return snapshot;
+}
+
+core::Result<SourceJobSnapshot> SourceJobManager::set_enabled(const std::string& application,
+                                                              const std::string& name, bool enabled) {
+    std::lock_guard lock(mutex_);
+    auto it = jobs_.find(key_of(application, name));
+    if (it == jobs_.end()) return job_error("no such source job");
+    Job& job = it->second;
+    if (job.enabled == enabled) return snapshot_locked(job);
+
+    if (enabled) {
+        start_locked(job); // restart the pull/transcode pipeline from stored config
+    } else {
+        teardown_locked(job); // stop pulling/transcoding; source's HLS output disappears
+        job.enabled = false;
+    }
+    return snapshot_locked(job);
 }
 
 bool SourceJobManager::remove(const std::string& application, const std::string& name) {
@@ -118,16 +150,7 @@ std::vector<SourceJobSnapshot> SourceJobManager::list(const std::string& applica
     std::vector<SourceJobSnapshot> result;
     for (const auto& [key, job] : jobs_) {
         if (!application.empty() && job.config.application != application) continue;
-        SourceJobSnapshot snapshot;
-        snapshot.application = job.config.application;
-        snapshot.name = job.config.name;
-        snapshot.source_url = job.config.source_url;
-        snapshot.template_name = job.config.template_name;
-        snapshot.master_hls_path = master_path(job.config.application, job.config.name);
-        snapshot.status = job.puller ? status_text(job.puller->status()) : "stopped";
-        snapshot.detail = job.puller ? job.puller->detail() : "";
-        snapshot.renditions = job.config.renditions;
-        result.push_back(std::move(snapshot));
+        result.push_back(snapshot_locked(job));
     }
     return result;
 }

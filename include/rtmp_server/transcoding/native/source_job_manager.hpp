@@ -33,6 +33,7 @@ struct SourceJobSnapshot {
     std::string master_hls_path;
     std::string status;
     std::string detail;
+    bool enabled = true;
     std::vector<RenditionSpec> renditions;
 };
 
@@ -61,6 +62,12 @@ public:
     // Starts (or replaces) a job. The output base name is unique per application.
     [[nodiscard]] core::Result<SourceJobSnapshot> create(const SourceJobConfig& config);
     [[nodiscard]] bool remove(const std::string& application, const std::string& name);
+    // Toggles a job without dropping its configuration: disabling stops the
+    // puller and unregisters its segment stores (source stops transcoding,
+    // its HLS output disappears); enabling restarts the pull/transcode
+    // pipeline from the stored config, mirroring StreamManager::set_enabled.
+    [[nodiscard]] core::Result<SourceJobSnapshot> set_enabled(const std::string& application,
+                                                              const std::string& name, bool enabled);
     [[nodiscard]] std::vector<SourceJobSnapshot> list(const std::string& application) const;
     void stop_all();
 
@@ -69,11 +76,14 @@ private:
         SourceJobConfig config;
         std::unique_ptr<HlsSourcePuller> puller;
         std::vector<std::string> output_streams; // registered stream keys
+        bool enabled = true;
     };
 
     [[nodiscard]] std::string master_path(const std::string& application,
                                           const std::string& name) const;
     void teardown_locked(Job& job);
+    void start_locked(Job& job);
+    [[nodiscard]] SourceJobSnapshot snapshot_locked(const Job& job) const;
 
     Hooks hooks_;
     std::string route_prefix_;

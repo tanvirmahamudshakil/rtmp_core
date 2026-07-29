@@ -74,6 +74,8 @@ public:
         std::string_view template_name, std::string_view rules)>;
     using SourceJobRemover =
         std::function<core::Result<void>(std::string_view application, std::string_view name)>;
+    using SourceJobEnabledSetter = std::function<core::Result<std::string>(
+        std::string_view application, std::string_view name, bool enabled)>;
 
     ManagementApi(management::StreamManager& manager, ManagementApiOptions options);
 
@@ -98,10 +100,11 @@ public:
         transcoding_assignment_remover_ = std::move(remover);
     }
     void set_source_job_handlers(SourceJobsProvider provider, SourceJobCreator creator,
-                                 SourceJobRemover remover) {
+                                 SourceJobRemover remover, SourceJobEnabledSetter enabled_setter = {}) {
         source_jobs_provider_ = std::move(provider);
         source_job_creator_ = std::move(creator);
         source_job_remover_ = std::move(remover);
+        source_job_enabled_setter_ = std::move(enabled_setter);
     }
 
     // Suitable for HttpServer::set_handler directly.
@@ -131,6 +134,8 @@ private:
     [[nodiscard]] HttpResponse handle_create_source_job(const HttpRequest& request);
     [[nodiscard]] HttpResponse handle_delete_source_job(std::string_view application,
                                                         std::string_view name);
+    [[nodiscard]] HttpResponse handle_patch_source_job(std::string_view application, std::string_view name,
+                                                       const HttpRequest& request);
     [[nodiscard]] HttpResponse handle_list_transcoding_assignments(const HttpRequest& request);
     [[nodiscard]] HttpResponse handle_put_transcoding_assignment(std::string_view application,
                                                                   std::string_view source_stream,
@@ -157,6 +162,7 @@ private:
     SourceJobsProvider source_jobs_provider_;
     SourceJobCreator source_job_creator_;
     SourceJobRemover source_job_remover_;
+    SourceJobEnabledSetter source_job_enabled_setter_;
 
     struct FailureWindow {
         std::size_t count = 0;

@@ -752,6 +752,19 @@ function ApplicationDetailPage({
     }
   };
 
+  const toggleSourceTranscode = async (job: SourceTranscodeJob) => {
+    setSourceBusy(true);
+    try {
+      const updated = await client.patchSourceTranscode(job, !job.enabled);
+      setSourceJobs((current) => current.map((item) => (item.id === job.id ? updated : item)));
+      onNotify("success", updated.enabled ? `Resumed ${job.name}.` : `Disabled ${job.name}. Source transcoding stopped.`);
+    } catch (error) {
+      onNotify("error", error instanceof Error ? error.message : "Could not update the source transcode.");
+    } finally {
+      setSourceBusy(false);
+    }
+  };
+
   const removeSourceTranscode = async (job: SourceTranscodeJob) => {
     setSourceBusy(true);
     try {
@@ -856,6 +869,7 @@ function ApplicationDetailPage({
                     <span className="stream-avatar"><Workflow size={17} /></span>
                     <div><strong>{job.name}</strong><small title={job.source_url}>{job.source_url}</small></div>
                     <StatusPill live={job.status === "running"} label={job.status === "running" ? "Live" : job.status} />
+                    <span className={job.enabled ? "enabled-text" : "disabled-text"}>{job.enabled ? "Enabled" : "Disabled"}</span>
                   </div>
                   <div className="rendition-list">
                     {job.outputs.map((output) => (
@@ -873,6 +887,9 @@ function ApplicationDetailPage({
                   </div>
                   {job.detail && <div className="assignment-empty"><Layers3 size={19} /><span>{job.detail}</span></div>}
                   <div className="assignment-actions">
+                    <button className="secondary-button" disabled={sourceBusy} onClick={() => toggleSourceTranscode(job)}>
+                      <SlidersHorizontal size={15} /> {job.enabled ? "Disable" : "Enable"}
+                    </button>
                     <button className="secondary-button danger-text" disabled={sourceBusy} onClick={() => removeSourceTranscode(job)}><Trash2 size={15} /> Stop</button>
                   </div>
                 </article>

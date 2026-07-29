@@ -45,8 +45,9 @@ export type SourceTranscodeJob = {
   template_name: string;
   master_hls_path: string;
   outputs: TranscodingOutput[];
-  status: "starting" | "running" | "error";
+  status: "starting" | "running" | "error" | "stopped" | "disabled";
   detail?: string;
+  enabled: boolean;
 };
 
 export type Snapshot = {
@@ -352,7 +353,8 @@ export class ControlClient {
         template_name: templateName,
         master_hls_path: `/hls/${application}/${name}/master.m3u8`,
         outputs,
-        status: "running"
+        status: "running",
+        enabled: true
       };
       demoSourceJobs = [...demoSourceJobs.filter((item) => item.id !== job.id), job];
       return job;
@@ -380,6 +382,18 @@ export class ControlClient {
       throw new ApiError(message, response.status, response.headers.get("X-Request-Id") ?? undefined);
     }
     return response.json() as Promise<SourceTranscodeJob>;
+  }
+
+  async patchSourceTranscode(job: SourceTranscodeJob, enabled: boolean): Promise<SourceTranscodeJob> {
+    if (this.demo) {
+      const status = enabled ? "running" : "disabled";
+      demoSourceJobs = demoSourceJobs.map((item) => (item.id === job.id ? { ...item, enabled, status } : item));
+      return { ...job, enabled, status };
+    }
+    return this.request<SourceTranscodeJob>(`/v1/transcoding/source-jobs/${encodeURIComponent(job.id)}`, {
+      method: "PATCH",
+      body: JSON.stringify({ enabled })
+    });
   }
 
   async removeSourceTranscode(job: SourceTranscodeJob): Promise<void> {
