@@ -326,7 +326,12 @@ HttpResponse HlsHttpHandler::handle(const HttpRequest& request) {
     {
         std::lock_guard lock(mutex_);
         const auto it = streams_.find(application + "/" + stream);
-        if (it == streams_.end() || !it->second.store) {
+        // A master playlist name (e.g. a source-transcode job's output base
+        // name) only ever gets a `renditions` entry — its segments live under
+        // each rendition's own stream key, so it never has a `store`. Only
+        // media-playlist/segment requests need one.
+        const bool needs_store = resource != "master.m3u8";
+        if (it == streams_.end() || (needs_store && !it->second.store)) {
             stats_.not_found += 1;
             auto response = plain(404, "stream not found");
             response.headers["Cache-Control"] = "no-store";
