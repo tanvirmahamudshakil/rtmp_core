@@ -2,6 +2,7 @@ import {
   Activity,
   AppWindow,
   ArrowDownToLine,
+  ArrowLeft,
   ArrowUpRight,
   Check,
   ChevronRight,
@@ -22,7 +23,6 @@ import {
   RadioTower,
   RefreshCw,
   Router,
-  Search,
   Server,
   Settings2,
   ShieldCheck,
@@ -37,10 +37,29 @@ import {
   X,
   Zap
 } from "lucide-react";
-import { FormEvent, ReactNode, useCallback, useEffect, useMemo, useState } from "react";
-import { Application, ControlClient, Snapshot, Stream, StreamSetup } from "./api";
+import { FormEvent, ReactNode, useCallback, useEffect, useState } from "react";
+import { Application, ControlClient, Snapshot, Stream } from "./api";
 
 type Page = "home" | "applications" | "transcode" | "server";
+type ApplicationTab = "playback" | "transcoding";
+type VideoCodec = "H.263" | "H.264" | "H.265" | "VP8" | "VP9" | "Passthrough" | "Disabled";
+type EncodingImplementation = "Automatic" | "Software" | "Hardware GPU";
+type EncodingPreset = {
+  id: string;
+  name: string;
+  outgoingStreamName: string;
+  description: string;
+  videoCodec: VideoCodec;
+  videoBitrate: number;
+  implementation: EncodingImplementation;
+  gpuMode: "first" | "specific";
+  gpuId: number | null;
+};
+type TranscodingTemplate = {
+  id: string;
+  name: string;
+  presets: EncodingPreset[];
+};
 type Notice = { type: "success" | "error"; message: string } | null;
 
 const EMPTY_SNAPSHOT: Snapshot = { applications: [], streams: [], metrics: {}, health: "offline" };
@@ -50,6 +69,21 @@ const pageTitles: Record<Page, { title: string; subtitle: string }> = {
   applications: { title: "Application", subtitle: "Manage applications, streams and playback links" },
   transcode: { title: "Transcode", subtitle: "Your transcoding workspace" },
   server: { title: "Server", subtitle: "Origin health, resources and delivery capacity" }
+};
+const applicationTabs: { id: ApplicationTab; label: string }[] = [
+  { id: "playback", label: "Playback URLs" },
+  { id: "transcoding", label: "Transcoding" }
+];
+const videoCodecs: VideoCodec[] = ["H.263", "H.264", "H.265", "VP8", "VP9", "Passthrough", "Disabled"];
+const transcodingStorageKey = "streamforge-transcoding-templates";
+const newLocalId = () => globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+const loadTranscodingTemplates = (): TranscodingTemplate[] => {
+  try {
+    const stored = JSON.parse(localStorage.getItem(transcodingStorageKey) ?? "[]");
+    return Array.isArray(stored) ? stored : [];
+  } catch {
+    return [];
+  }
 };
 
 const metric = (snapshot: Snapshot, name: string) => snapshot.metrics[name] ?? 0;
@@ -150,28 +184,6 @@ function Modal({
         </div>
         {children}
       </section>
-    </div>
-  );
-}
-
-function CopyField({ label, value }: { label: string; value: string }) {
-  const [copied, setCopied] = useState(false);
-  const copy = async () => {
-    try {
-      await copyText(value);
-      setCopied(true);
-      window.setTimeout(() => setCopied(false), 1500);
-    } catch {}
-  };
-  return (
-    <div className="copy-block">
-      <div className="copy-label"><span>{label}</span></div>
-      <div className="copy-field">
-        <code>{value}</code>
-        <IconButton label={`Copy ${label}`} onClick={copy}>
-          {copied ? <Check size={17} /> : <Copy size={17} />}
-        </IconButton>
-      </div>
     </div>
   );
 }
@@ -382,7 +394,7 @@ function StreamTable({
   compactMode?: boolean;
 }) {
   if (!streams.length) {
-    return <div className="empty-state"><Radio size={28} /><strong>No streams yet</strong><span>Create a stream to get one RTMP URL for both input and output.</span></div>;
+    return <div className="empty-state"><Radio size={28} /><strong>No streams available</strong><span>Streams matching this view will appear here automatically.</span></div>;
   }
   return (
     <div className="table-wrap">
@@ -414,47 +426,16 @@ function StreamTable({
   );
 }
 
-function StreamsPage({
-  streams,
-  onAction,
-  openCreate
-}: {
-  streams: Stream[];
-  onAction: (stream: Stream, action: string) => void;
-  openCreate: () => void;
-}) {
-  const [query, setQuery] = useState("");
-  const [filter, setFilter] = useState<"all" | "live" | "idle">("all");
-  const shown = streams.filter((stream) => {
-    const matches = `${stream.application} ${stream.name}`.toLowerCase().includes(query.toLowerCase());
-    return matches && (filter === "all" || (filter === "live" ? stream.is_live : !stream.is_live));
-  });
-  return (
-    <section className="panel">
-      <div className="toolbar">
-        <div className="search-field"><Search size={17} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search streams…" /></div>
-        <div className="segmented" role="group" aria-label="Filter streams">
-          {(["all", "live", "idle"] as const).map((option) => (
-            <button key={option} className={filter === option ? "active" : ""} onClick={() => setFilter(option)}>
-              {option === "all" ? `All ${streams.length}` : option === "live" ? "Live now" : "Idle"}
-            </button>
-          ))}
-        </div>
-        <button className="primary-button" onClick={openCreate}><Plus size={17} /> New stream</button>
-      </div>
-      <StreamTable streams={shown} onAction={onAction} />
-    </section>
-  );
-}
-
 function ApplicationsPage({
   applications,
   streams,
-  openCreate
+  openCreate,
+  onOpen
 }: {
   applications: Application[];
   streams: Stream[];
   openCreate: () => void;
+  onOpen: (application: Application) => void;
 }) {
   return (
     <>
@@ -472,10 +453,10 @@ function ApplicationsPage({
           const live = appStreams.filter((stream) => stream.is_live).length;
           const viewers = appStreams.reduce((sum, stream) => sum + (stream.viewer_count ?? 0), 0);
           return (
-            <article className="application-card" key={app.name}>
+            <button type="button" className="application-card" key={app.name} onClick={() => onOpen(app)}>
               <div className="app-card-head">
                 <div className={`app-icon tone-${index % 4}`}><AppWindow size={20} /></div>
-                <StatusPill live={app.enabled} label={app.enabled ? "Enabled" : "Disabled"} />
+                <span className="app-card-status"><StatusPill live={app.enabled} label={app.enabled ? "Enabled" : "Disabled"} /><ChevronRight size={16} /></span>
               </div>
               <div className="app-card-title">
                 <span>Application {String(index + 1).padStart(2, "0")}</span>
@@ -487,12 +468,116 @@ function ApplicationsPage({
                 <div><strong className={live ? "live-number" : ""}>{live}</strong><span>Live now</span></div>
                 <div><strong>{compact(viewers)}</strong><span>Viewers</span></div>
               </div>
-            </article>
+            </button>
           );
         })}
         {!applications.length && <div className="empty-state full"><Layers3 size={30} /><strong>No applications</strong><span>Create the first namespace before adding a stream.</span></div>}
       </section>
     </>
+  );
+}
+
+function ApplicationDetailPage({
+  application,
+  streams,
+  activeTab,
+  setActiveTab,
+  onBack
+}: {
+  application: Application;
+  streams: Stream[];
+  activeTab: ApplicationTab;
+  setActiveTab: (tab: ApplicationTab) => void;
+  onBack: () => void;
+}) {
+  const applicationStreams = streams.filter((stream) => stream.application === application.name);
+  const [copiedUrl, setCopiedUrl] = useState<string | null>(null);
+  const copyUrl = async (url: string) => {
+    await copyText(url);
+    setCopiedUrl(url);
+    window.setTimeout(() => setCopiedUrl((current) => current === url ? null : current), 1500);
+  };
+
+  const renderTab = () => {
+    if (activeTab === "playback") {
+      return (
+        <section className="playback-workspace">
+          <div className="playback-heading">
+            <div><span className="eyebrow">AUTOMATICALLY GENERATED · NO TOKEN</span><h2>Playback URLs</h2><p>Every stream gets one direct RTMP URL and one smooth HLS .m3u8 playlist URL.</p></div>
+            <span className="panel-count">{applicationStreams.length} streams</span>
+          </div>
+          <div className="playback-grid">
+            {applicationStreams.map((stream) => {
+              const hlsUrl = absoluteUrl(stream.hls_path);
+              return (
+                <article className="playback-card" key={`${stream.application}:${stream.name}`}>
+                  <div className="playback-card-head">
+                    <span className="stream-avatar"><Video size={17} /></span>
+                    <div><strong>{stream.name}</strong><small>/{stream.application}/{stream.name}</small></div>
+                    <StatusPill live={stream.is_live} />
+                  </div>
+                  <div className="playback-url-row">
+                    <span>RTMP</span><code title={stream.rtmp_url}>{stream.rtmp_url}</code>
+                    <IconButton label="Copy RTMP playback URL" onClick={() => copyUrl(stream.rtmp_url)}>
+                      {copiedUrl === stream.rtmp_url ? <Check size={16} /> : <Copy size={16} />}
+                    </IconButton>
+                  </div>
+                  <div className="playback-url-row recommended">
+                    <span>M3U8</span><code title={hlsUrl}>{hlsUrl}</code>
+                    <IconButton label="Copy HLS m3u8 playback URL" onClick={() => copyUrl(hlsUrl)}>
+                      {copiedUrl === hlsUrl ? <Check size={16} /> : <Copy size={16} />}
+                    </IconButton>
+                  </div>
+                  <div className="playback-card-foot"><Users size={14} /> {compact(stream.viewer_count ?? 0)} viewers <b>HLS recommended</b></div>
+                </article>
+              );
+            })}
+            {!applicationStreams.length && (
+              <div className="empty-state full"><Radio size={28} /><strong>No playback URLs yet</strong><span>Playback links will appear when streams are registered for this application.</span></div>
+            )}
+          </div>
+        </section>
+      );
+    }
+    return (
+      <section className="application-feature-placeholder">
+        <span className="feature-icon"><Workflow size={24} /></span>
+        <span className="placeholder-badge">TRANSCODING</span>
+        <h2>Transcoding workspace</h2>
+        <p>This tab is ready for the transcoding profiles and controls you will provide later.</p>
+        <small>{application.name} / transcoding</small>
+      </section>
+    );
+  };
+
+  return (
+    <div className="application-detail">
+      <section className="application-detail-header">
+        <div className="application-detail-title">
+          <button className="back-button" type="button" onClick={onBack}><ArrowLeft size={17} /> Applications</button>
+          <div className="application-title-row">
+            <span className="app-icon tone-0"><AppWindow size={22} /></span>
+            <div><span className="eyebrow">APPLICATION</span><h2>{application.name}</h2><p>RTMP namespace /{application.name}</p></div>
+            <StatusPill live={application.enabled} label={application.enabled ? "Enabled" : "Disabled"} />
+          </div>
+        </div>
+        <div className="application-tabs" role="tablist" aria-label={`${application.name} sections`}>
+          {applicationTabs.map((tab) => (
+            <button
+              type="button"
+              role="tab"
+              aria-selected={activeTab === tab.id}
+              className={activeTab === tab.id ? "active" : ""}
+              key={tab.id}
+              onClick={() => setActiveTab(tab.id)}
+            >
+              {tab.label}
+            </button>
+          ))}
+        </div>
+      </section>
+      <div className="application-tab-panel" role="tabpanel">{renderTab()}</div>
+    </div>
   );
 }
 
@@ -642,24 +727,195 @@ function SystemPage({ snapshot }: { snapshot: Snapshot }) {
   );
 }
 
-function TranscodePage() {
+function NewTemplateModal({ onClose, onAdd }: { onClose: () => void; onAdd: (name: string) => void }) {
+  const [name, setName] = useState("");
   return (
-    <section className="transcode-placeholder">
-      <div className="transcode-visual" aria-hidden="true">
-        <span className="transcode-node input"><RadioTower size={23} /></span>
-        <span className="transcode-line first" />
-        <span className="transcode-core"><Workflow size={30} /></span>
-        <span className="transcode-line second" />
-        <span className="transcode-node output"><Video size={23} /></span>
+    <Modal title="Add new template" description="Give this transcoding template a clear name." onClose={onClose}>
+      <form className="modal-form" onSubmit={(event: FormEvent) => {
+        event.preventDefault();
+        onAdd(name.trim());
+      }}>
+        <label htmlFor="template-name">Template Name *
+          <input id="template-name" autoFocus required value={name} onChange={(event) => setName(event.target.value)} placeholder="For example: Sports HD" />
+          <small>You can add one or more encoding presets inside this template.</small>
+        </label>
+        <div className="modal-actions">
+          <button type="button" className="secondary-button" onClick={onClose}>Cancel</button>
+          <button className="primary-button" disabled={!name.trim()}><Plus size={17} /> Add template</button>
+        </div>
+      </form>
+    </Modal>
+  );
+}
+
+function NewPresetModal({ onClose, onAdd }: { onClose: () => void; onAdd: (preset: EncodingPreset) => void }) {
+  const [name, setName] = useState("");
+  const [outgoingStreamName, setOutgoingStreamName] = useState("");
+  const [description, setDescription] = useState("");
+  const [videoCodec, setVideoCodec] = useState<VideoCodec>("H.264");
+  const [videoBitrate, setVideoBitrate] = useState("2500000");
+  const [implementation, setImplementation] = useState<EncodingImplementation>("Automatic");
+  const [gpuMode, setGpuMode] = useState<"first" | "specific">("first");
+  const [gpuId, setGpuId] = useState("0");
+  return (
+    <Modal title="Add encoding preset" description="Configure the outgoing video encoding profile." onClose={onClose} wide>
+      <form className="modal-form preset-form" onSubmit={(event: FormEvent) => {
+        event.preventDefault();
+        onAdd({
+          id: newLocalId(),
+          name: name.trim(),
+          outgoingStreamName: outgoingStreamName.trim(),
+          description: description.trim(),
+          videoCodec,
+          videoBitrate: Math.max(0, Number(videoBitrate) || 0),
+          implementation,
+          gpuMode,
+          gpuId: gpuMode === "specific" ? Math.max(0, Number(gpuId) || 0) : null
+        });
+      }}>
+        <div className="two-fields preset-basics">
+          <label htmlFor="preset-name">Preset Name *
+            <input id="preset-name" autoFocus required value={name} onChange={(event) => setName(event.target.value)} placeholder="1080p Main" />
+          </label>
+          <label htmlFor="outgoing-stream-name">Outgoing Stream Name *
+            <input id="outgoing-stream-name" required value={outgoingStreamName} onChange={(event) => setOutgoingStreamName(event.target.value)} placeholder="live_1080p" />
+          </label>
+        </div>
+        <label htmlFor="preset-description">Description
+          <textarea id="preset-description" value={description} onChange={(event) => setDescription(event.target.value)} placeholder="Describe where this preset will be used…" />
+        </label>
+
+        <div className="form-section-heading"><span><Video size={17} /></span><div><strong>Video Settings</strong><small>Codec, bitrate and encoding hardware</small></div></div>
+        <div className="preset-video-grid">
+          <label htmlFor="video-codec">Video Codec
+            <select id="video-codec" value={videoCodec} onChange={(event) => setVideoCodec(event.target.value as VideoCodec)}>
+              {videoCodecs.map((codec) => <option key={codec}>{codec}</option>)}
+            </select>
+          </label>
+          <label htmlFor="video-bitrate">Video Bitrate
+            <div className="field-with-unit">
+              <input id="video-bitrate" type="number" min="0" step="1000" value={videoBitrate} onChange={(event) => setVideoBitrate(event.target.value)} />
+              <span>bps</span>
+            </div>
+            <small>Bits per second (bps)</small>
+          </label>
+          <label htmlFor="encoding-implementation">Encoding Implementation
+            <select id="encoding-implementation" value={implementation} onChange={(event) => setImplementation(event.target.value as EncodingImplementation)}>
+              <option>Automatic</option>
+              <option>Software</option>
+              <option>Hardware GPU</option>
+            </select>
+          </label>
+        </div>
+
+        <fieldset className="gpu-fieldset">
+          <legend>GPU ID</legend>
+          <label className="radio-option">
+            <input type="radio" name="gpu-mode" checked={gpuMode === "first"} onChange={() => setGpuMode("first")} />
+            <span><strong>Use first available GPU</strong><small>Automatically select an available compatible GPU.</small></span>
+          </label>
+          <label className="radio-option">
+            <input type="radio" name="gpu-mode" checked={gpuMode === "specific"} onChange={() => setGpuMode("specific")} />
+            <span><strong>Use GPU ID:</strong><small>Select one specific GPU for this preset.</small></span>
+            <input className="gpu-id-input" aria-label="GPU ID" type="number" min="0" value={gpuId} disabled={gpuMode !== "specific"} onChange={(event) => setGpuId(event.target.value)} />
+          </label>
+        </fieldset>
+
+        <div className="modal-actions">
+          <button type="button" className="secondary-button" onClick={onClose}>Cancel</button>
+          <button className="primary-button" disabled={!name.trim() || !outgoingStreamName.trim()}><Plus size={17} /> Add preset</button>
+        </div>
+      </form>
+    </Modal>
+  );
+}
+
+function TranscodePage() {
+  const [templates, setTemplates] = useState<TranscodingTemplate[]>(loadTranscodingTemplates);
+  const [selectedTemplateId, setSelectedTemplateId] = useState<string | null>(null);
+  const [showTemplateModal, setShowTemplateModal] = useState(false);
+  const [showPresetModal, setShowPresetModal] = useState(false);
+  const selectedTemplate = templates.find((template) => template.id === selectedTemplateId) ?? null;
+
+  useEffect(() => {
+    localStorage.setItem(transcodingStorageKey, JSON.stringify(templates));
+  }, [templates]);
+
+  const addTemplate = (name: string) => {
+    const template: TranscodingTemplate = { id: newLocalId(), name, presets: [] };
+    setTemplates((current) => [...current, template]);
+    setShowTemplateModal(false);
+  };
+  const addPreset = (preset: EncodingPreset) => {
+    if (!selectedTemplateId) return;
+    setTemplates((current) => current.map((template) =>
+      template.id === selectedTemplateId ? { ...template, presets: [...template.presets, preset] } : template
+    ));
+    setShowPresetModal(false);
+  };
+
+  if (selectedTemplate) {
+    return (
+      <div className="template-detail">
+        <section className="template-detail-header">
+          <button className="back-button" type="button" onClick={() => setSelectedTemplateId(null)}><ArrowLeft size={17} /> Transcoding templates</button>
+          <div className="template-title-row">
+            <span className="template-large-icon"><Workflow size={24} /></span>
+            <div><span className="eyebrow">TRANSCODING TEMPLATE</span><h2>{selectedTemplate.name}</h2><p>{selectedTemplate.presets.length} encoding presets configured</p></div>
+          </div>
+          <div className="template-tabs"><button className="active" type="button">Encoding Presets</button></div>
+        </section>
+        <section className="preset-workspace">
+          <div className="preset-workspace-heading">
+            <div><span className="eyebrow">OUTPUT PROFILES</span><h2>Encoding Presets</h2><p>Create one preset for every outgoing stream rendition.</p></div>
+            <button className="primary-button" onClick={() => setShowPresetModal(true)}><Plus size={17} /> Add Preset</button>
+          </div>
+          <div className="preset-grid">
+            {selectedTemplate.presets.map((preset) => (
+              <article className="preset-card" key={preset.id}>
+                <div className="preset-card-head"><span><Video size={18} /></span><div><strong>{preset.name}</strong><small>{preset.outgoingStreamName}</small></div><b>{preset.videoCodec}</b></div>
+                {preset.description && <p>{preset.description}</p>}
+                <div className="preset-card-stats">
+                  <div><span>Video bitrate</span><strong>{preset.videoBitrate ? `${preset.videoBitrate.toLocaleString()} bps` : "Automatic"}</strong></div>
+                  <div><span>Implementation</span><strong>{preset.implementation}</strong></div>
+                  <div><span>GPU</span><strong>{preset.gpuMode === "first" ? "First available" : `GPU ${preset.gpuId}`}</strong></div>
+                </div>
+              </article>
+            ))}
+            {!selectedTemplate.presets.length && (
+              <div className="empty-state full preset-empty"><SlidersHorizontal size={30} /><strong>No encoding presets</strong><span>Add the first output profile for this template.</span></div>
+            )}
+          </div>
+        </section>
+        {showPresetModal && <NewPresetModal onClose={() => setShowPresetModal(false)} onAdd={addPreset} />}
       </div>
-      <span className="placeholder-badge">WORKSPACE READY</span>
-      <h2>Transcode controls will live here</h2>
-      <p>This page is intentionally clean for now. When you share the transcoding workflow and controls, they can be added without changing the rest of the panel.</p>
-      <div className="placeholder-meta">
-        <span><Check size={15} /> Navigation ready</span>
-        <span><Check size={15} /> Responsive layout ready</span>
+    );
+  }
+
+  return (
+    <div className="transcode-template-page">
+      <div className="section-intro">
+        <div><span className="eyebrow">TRANSCODING</span><h2>Templates</h2><p>Create reusable encoding presets for your outgoing streams.</p></div>
+        <button className="primary-button" onClick={() => setShowTemplateModal(true)}><Plus size={17} /> Add New Template</button>
       </div>
-    </section>
+      <section className="template-grid">
+        {templates.map((template, index) => (
+          <button className="template-card" type="button" key={template.id} onClick={() => setSelectedTemplateId(template.id)}>
+            <div className={`template-icon tone-${index % 4}`}><Workflow size={22} /></div>
+            <span className="template-open"><ChevronRight size={17} /></span>
+            <span className="template-label">Template {String(index + 1).padStart(2, "0")}</span>
+            <h3>{template.name}</h3>
+            <p>{template.presets.length ? `${template.presets.length} encoding presets` : "No presets configured yet"}</p>
+            <div className="template-card-foot"><span><Cpu size={14} /> Encoding template</span><b>{template.presets.length}</b></div>
+          </button>
+        ))}
+        {!templates.length && (
+          <div className="empty-state full template-empty"><Workflow size={31} /><strong>No transcoding templates</strong><span>Create a template, then add one or more encoding presets.</span><button className="primary-button" onClick={() => setShowTemplateModal(true)}><Plus size={17} /> Add New Template</button></div>
+        )}
+      </section>
+      {showTemplateModal && <NewTemplateModal onClose={() => setShowTemplateModal(false)} onAdd={addTemplate} />}
+      <div className="storage-note"><Database size={16} /><span>Template drafts are saved in this browser until the transcoding server API is connected.</span></div>
+    </div>
   );
 }
 
@@ -668,11 +924,12 @@ function App() {
   const [client] = useState(() => new ControlClient(demo));
   const [snapshot, setSnapshot] = useState<Snapshot>(EMPTY_SNAPSHOT);
   const [page, setPage] = useState<Page>("home");
+  const [selectedApplication, setSelectedApplication] = useState<Application | null>(null);
+  const [applicationTab, setApplicationTab] = useState<ApplicationTab>("playback");
   const [loading, setLoading] = useState(false);
   const [notice, setNotice] = useState<Notice>(null);
   const [mobileNav, setMobileNav] = useState(false);
-  const [createType, setCreateType] = useState<"stream" | "application" | null>(null);
-  const [setup, setSetup] = useState<{ title: string; data: StreamSetup } | null>(null);
+  const [createType, setCreateType] = useState<"application" | null>(null);
   const [actionStream, setActionStream] = useState<Stream | null>(null);
   const [pendingDelete, setPendingDelete] = useState<Stream | null>(null);
   const [bandwidth, setBandwidthState] = useState(() => Number(localStorage.getItem("streamforge-bandwidth")) || 10000);
@@ -761,15 +1018,20 @@ function App() {
   const measuredBitrateSource = viewers > 0 && currentEgress > 0
     ? "Measured from delivered egress per active viewer."
     : "Measured from OBS/transcoder ingress per active publisher.";
-  const title = pageTitles[page];
-  const sortedStreams = useMemo(
-    () => [...snapshot.streams].sort((a, b) => (b.viewer_count ?? 0) - (a.viewer_count ?? 0)),
-    [snapshot.streams]
-  );
+  const title = page === "applications" && selectedApplication
+    ? { title: selectedApplication.name, subtitle: "Application configuration and live activity" }
+    : pageTitles[page];
+  const navigate = (nextPage: Page) => {
+    setPage(nextPage);
+    if (nextPage === "applications") {
+      setSelectedApplication(null);
+      setApplicationTab("playback");
+    }
+  };
 
   return (
     <div className="app-shell">
-      <Sidebar page={page} setPage={setPage} open={mobileNav} close={() => setMobileNav(false)} />
+      <Sidebar page={page} setPage={navigate} open={mobileNav} close={() => setMobileNav(false)} />
       <main className="main-shell">
         <header className="topbar">
           <button className="menu-button" aria-label="Open navigation" onClick={() => setMobileNav(true)}><Menu size={21} /></button>
@@ -778,17 +1040,31 @@ function App() {
             {demo && <span className="demo-badge"><SquareActivity size={14} /> Demo data</span>}
             <div className="node-status"><span className="pulse" /><div><strong>Origin node</strong><small>{snapshot.health === "online" ? "Online" : "Connecting…"}</small></div></div>
             <IconButton label="Refresh data" onClick={() => refresh()}><RefreshCw className={loading ? "spin" : ""} size={17} /></IconButton>
-            {page === "applications" && <button className="primary-button desktop-create" onClick={() => setCreateType("stream")}><Plus size={17} /> New stream</button>}
           </div>
         </header>
         <div className="content">
-          {page === "home" && <Overview snapshot={snapshot} history={history} bandwidth={bandwidth} onNavigate={setPage} onStreamAction={streamAction} />}
+          {page === "home" && <Overview snapshot={snapshot} history={history} bandwidth={bandwidth} onNavigate={navigate} onStreamAction={streamAction} />}
           {page === "applications" && (
-            <div className="workspace-stack">
-              <ApplicationsPage applications={snapshot.applications} streams={snapshot.streams} openCreate={() => setCreateType("application")} />
-              <div className="workspace-divider"><span>STREAMS</span><strong>Application streams</strong><p>Create, monitor and manage every RTMP/HLS stream.</p></div>
-              <StreamsPage streams={sortedStreams} onAction={streamAction} openCreate={() => setCreateType("stream")} />
-            </div>
+            selectedApplication
+              ? <ApplicationDetailPage
+                  application={selectedApplication}
+                  streams={snapshot.streams}
+                  activeTab={applicationTab}
+                  setActiveTab={setApplicationTab}
+                  onBack={() => {
+                    setSelectedApplication(null);
+                    setApplicationTab("playback");
+                  }}
+                />
+              : <ApplicationsPage
+                  applications={snapshot.applications}
+                  streams={snapshot.streams}
+                  openCreate={() => setCreateType("application")}
+                  onOpen={(application) => {
+                    setSelectedApplication(application);
+                    setApplicationTab("playback");
+                  }}
+                />
           )}
           {page === "transcode" && <TranscodePage />}
           {page === "server" && (
@@ -815,28 +1091,6 @@ function App() {
           onClose={() => setCreateType(null)}
           onSubmit={(name) => perform(async () => { await client.createApplication(name); setCreateType(null); }, "Application created.")}
         />
-      )}
-      {createType === "stream" && (
-        <CreateStreamModal
-          applications={snapshot.applications}
-          onClose={() => setCreateType(null)}
-          onSubmit={(application, name, recording) =>
-            perform(async () => {
-              const data = await client.createStream(application, name, recording);
-              setCreateType(null);
-              setSetup({ title: "Stream is ready", data });
-            }, "Stream created.")
-          }
-        />
-      )}
-      {setup && (
-        <Modal title={setup.title} description="Publish through RTMP. For many viewers, use the segmented HLS playback link. Neither link requires a token." onClose={() => setSetup(null)} wide>
-          <div className="setup-fields">
-            <CopyField label="RTMP input / direct playback" value={setup.data.rtmp_url} />
-            <CopyField label="Smooth segmented playback (recommended)" value={absoluteUrl(setup.data.hls_path)} />
-          </div>
-          <div className="modal-actions"><button className="primary-button" onClick={() => setSetup(null)}>Done</button></div>
-        </Modal>
       )}
       {actionStream && (
         <Modal title={actionStream.name} description={`${actionStream.application} / ${actionStream.name}`} onClose={() => setActionStream(null)}>
@@ -880,33 +1134,6 @@ function CreateApplicationModal({ onClose, onSubmit }: { onClose: () => void; on
       <form className="modal-form" onSubmit={(event: FormEvent) => { event.preventDefault(); onSubmit(name.trim()); }}>
         <label htmlFor="application-name">Application name<input id="application-name" autoFocus required pattern="[A-Za-z0-9_-]+" value={name} onChange={(event) => setName(event.target.value)} placeholder="for example: live" /><small>Letters, numbers, underscores and hyphens only.</small></label>
         <div className="modal-actions"><button type="button" className="secondary-button" onClick={onClose}>Cancel</button><button className="primary-button" disabled={!name.trim()}><Plus size={17} /> Create application</button></div>
-      </form>
-    </Modal>
-  );
-}
-
-function CreateStreamModal({
-  applications,
-  onClose,
-  onSubmit
-}: {
-  applications: Application[];
-  onClose: () => void;
-  onSubmit: (application: string, name: string, recording: boolean) => void;
-}) {
-  const [application, setApplication] = useState(applications.find((app) => app.enabled)?.name ?? "");
-  const [name, setName] = useState("");
-  const [recording, setRecording] = useState(false);
-  return (
-    <Modal title="Create stream" description="Creates one universal RTMP link for both input and output. No secret key is required." onClose={onClose}>
-      <form className="modal-form" onSubmit={(event: FormEvent) => { event.preventDefault(); onSubmit(application, name.trim(), recording); }}>
-        <div className="two-fields">
-          <label htmlFor="stream-application">Application<select id="stream-application" required value={application} onChange={(event) => setApplication(event.target.value)}><option value="">Select…</option>{applications.filter((app) => app.enabled).map((app) => <option key={app.name}>{app.name}</option>)}</select></label>
-          <label htmlFor="stream-name">Public stream name<input id="stream-name" autoFocus required pattern="[A-Za-z0-9_-]+" value={name} onChange={(event) => setName(event.target.value)} placeholder="main-stage" /></label>
-        </div>
-        <label className="toggle-row"><span><FileVideo size={18} /><span><strong>Request recording policy</strong><small>Stores the per-stream policy; the direct installer keeps the runtime recorder disabled.</small></span></span><input type="checkbox" checked={recording} onChange={(event) => setRecording(event.target.checked)} /></label>
-        {!applications.length && <div className="form-error">Create an application before creating a stream.</div>}
-        <div className="modal-actions"><button type="button" className="secondary-button" onClick={onClose}>Cancel</button><button className="primary-button" disabled={!application || !name.trim()}><Plus size={17} /> Create stream</button></div>
       </form>
     </Modal>
   );
