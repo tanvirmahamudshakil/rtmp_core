@@ -90,7 +90,7 @@ std::string stream_json(const management::Stream& stream) {
     std::ostringstream os;
     os << R"({"application":")" << json_escape(stream.application) << R"(","name":")" << json_escape(stream.name)
        << R"(","enabled":)" << (stream.enabled ? "true" : "false") << R"(,"recording_enabled":)"
-       << (stream.recording_enabled ? "true" : "false") << R"(,"playback_url":")" << json_escape(stream.playback_url)
+       << (stream.recording_enabled ? "true" : "false") << R"(,"rtmp_url":")" << json_escape(stream.playback_url)
        << "\"}";
     return os.str();
 }
@@ -397,17 +397,7 @@ HttpResponse ManagementApi::handle_create_stream(const HttpRequest& request) {
         return HttpResponse::json(http_status_for(result.error().code()),
                                    error_body("request_failed", result.error().message(), ""));
     }
-    const auto& created = result.value();
-    std::string obs_server_url = created.playback_url;
-    if (const auto slash = obs_server_url.rfind('/'); slash != std::string::npos) {
-        obs_server_url.resize(slash);
-    }
-    std::ostringstream os;
-    os << R"({"stream":)" << stream_json(created.stream) << R"(,"publish_name":")"
-       << json_escape(created.stream.name) << R"(","publish_url":")" << json_escape(obs_server_url)
-       << R"(","playback_url":")"
-       << json_escape(created.playback_url) << "\"}";
-    return HttpResponse::json(201, os.str());
+    return HttpResponse::json(201, stream_json(result.value().stream));
 }
 
 HttpResponse ManagementApi::handle_get_stream(std::string_view application, std::string_view name) {

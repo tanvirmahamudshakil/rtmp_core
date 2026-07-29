@@ -499,7 +499,7 @@ Pre-live viewer safety ceiling: ${MAX_VIEWERS}
 Generated: $(date -u +%Y-%m-%dT%H:%M:%SZ)
 
 The admin panel and RTMP playback are open and require no access token.
-Use the public stream name in OBS's Stream Key field.
+Each stream has one full RTMP URL used for both publisher input and viewer output.
 EOF
 chmod 0600 "${CREDENTIALS}"
 
@@ -731,4 +731,4 @@ else
   printf '  Fair queue:       disabled by RTMP_ENABLE_FAIR_QUEUE=0\n'
 fi
 printf '  Install details:  %s\n\n' "${CREDENTIALS}"
-printf 'Next: open the panel directly, create an application and stream, then use the stream name in OBS.\n'
+printf 'Next: open the panel directly, create a stream, then copy its one RTMP URL for both input and output.\n'

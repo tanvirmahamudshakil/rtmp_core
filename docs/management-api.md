@@ -1,10 +1,10 @@
 # Management HTTP API (Phase 5)
 
 > Current production mode is intentionally open-access. The server does not
-> require a bearer header, stream creation returns `publish_name` rather than
-> a secret key, and publish-key rotation/playback-token routes are not
-> exposed. Historical Phase 5 authentication details below describe optional
-> library capability, not the deployed `apps/rtmp_server` behavior.
+> require a bearer header, and every stream exposes one `rtmp_url` used for
+> both publishing and playback. Publish-key rotation/playback-token routes
+> are not exposed. Historical Phase 5 authentication details below describe
+> optional library capability, not the deployed `apps/rtmp_server` behavior.
 
 ## Why hand-rolled instead of a vendored library
 
@@ -51,9 +51,9 @@ could still vendor a library if the endpoint surface grows.
 | GET  | `/metrics`                                  | Open. Prometheus-text-ish `name value` lines from `observability::Metrics`. |
 | POST | `/v1/applications`                          | `{"name":"..."}` |
 | GET  | `/v1/applications`                          | Paginated. |
-| POST | `/v1/streams`                               | `{"application":"...","name":"...","recording_enabled":bool}`. Response includes `publish_name`/`publish_url`/`playback_url`. |
+| POST | `/v1/streams`                               | `{"application":"...","name":"...","recording_enabled":bool}`. Response includes one universal `rtmp_url` for input and output. |
 | GET  | `/v1/streams?application=...`               | Paginated by `application` query param (required). |
-| GET  | `/v1/streams/{application}:{name}`          | Never includes the raw key. |
+| GET  | `/v1/streams/{application}:{name}`          | Includes the universal `rtmp_url`; never includes a secret key. |
 | PATCH| `/v1/streams/{application}:{name}`          | `{"enabled":bool}` and/or `{"recording_enabled":bool}`. |
 | GET  | `/v1/streams/{application}:{name}/status`   | Requires a `StreamRegistry`/`LiveFanout` to be wired via `set_registry`/`set_fanout`; 503 otherwise (see Known limitations). |
 | GET  | `/v1/streams/{application}:{name}/viewers`  | Same payload as `status` (viewer_count is part of it). |

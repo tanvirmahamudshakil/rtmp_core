@@ -79,19 +79,17 @@ After installation:
 1. Open the admin panel directly; no sign-in is required.
 2. Create an application such as `live`.
 3. Create a stream such as `main-stage`.
-4. Configure OBS:
-
-   ```text
-   Service:    Custom
-   Server:     rtmp://stream.example.com:1935/live
-   Stream Key: main-stage
-   ```
-
-5. Play the public stream:
+4. Copy the stream's universal RTMP URL:
 
    ```text
    rtmp://stream.example.com:1935/live/main-stage
    ```
+
+5. Use that exact URL as both the publisher destination and viewer source.
+   Clients such as ffmpeg accept it directly. If an encoder UI forces separate
+   fields, split the same URL at the final slash (`Server:
+   rtmp://stream.example.com:1935/live`, `Stream Key: main-stage`); this does
+   not create a second server-side URL.
 
 ## Capacity reality
 

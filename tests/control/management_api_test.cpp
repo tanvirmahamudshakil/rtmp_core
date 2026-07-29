@@ -78,7 +78,7 @@ TEST(ManagementApiTest, CreateAndListApplications) {
     EXPECT_NE(list.body.find("\"live\""), std::string::npos);
 }
 
-TEST(ManagementApiTest, CreateStreamReturnsOpenPublishNameAndUrls) {
+TEST(ManagementApiTest, CreateStreamReturnsOneUniversalRtmpUrl) {
     StreamManager manager(manager_options());
     ManagementApi api(manager, api_options());
     ASSERT_EQ(api.handle(authed("POST", "/v1/applications", R"({"name":"live"})")).status, 201);
@@ -86,15 +86,18 @@ TEST(ManagementApiTest, CreateStreamReturnsOpenPublishNameAndUrls) {
     auto create = api.handle(authed("POST", "/v1/streams", R"({"application":"live","name":"alpha"})"));
     ASSERT_EQ(create.status, 201);
     EXPECT_EQ(create.body.find("stream_key"), std::string::npos);
-    EXPECT_NE(create.body.find(R"("publish_name":"alpha")"), std::string::npos);
-    EXPECT_NE(create.body.find(R"("publish_url":"rtmp://localhost:1935/live")"), std::string::npos);
+    EXPECT_EQ(create.body.find("publish_name"), std::string::npos);
+    EXPECT_EQ(create.body.find("publish_url"), std::string::npos);
+    EXPECT_EQ(create.body.find("playback_url"), std::string::npos);
+    EXPECT_NE(create.body.find(R"("rtmp_url":"rtmp://localhost:1935/live/alpha")"), std::string::npos);
+    EXPECT_EQ(create.body.find(R"("stream":)"), std::string::npos);
 
     auto get = api.handle(authed("GET", "/v1/streams/live:alpha"));
     EXPECT_EQ(get.status, 200);
     EXPECT_EQ(get.body.find("stream_key"), std::string::npos); // never leaked from GET
-    // The reusable public playback URL is exposed on every read so the panel
-    // can show/copy the VLC link at any time, not only at creation.
-    EXPECT_NE(get.body.find("playback_url"), std::string::npos);
+    // The same URL is exposed on every read for publishers and viewers.
+    EXPECT_EQ(get.body.find("playback_url"), std::string::npos);
+    EXPECT_NE(get.body.find("rtmp_url"), std::string::npos);
     EXPECT_NE(get.body.find("/live/alpha"), std::string::npos);
 }
 

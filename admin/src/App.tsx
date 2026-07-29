@@ -382,7 +382,7 @@ function StreamTable({
   compactMode?: boolean;
 }) {
   if (!streams.length) {
-    return <div className="empty-state"><Radio size={28} /><strong>No streams yet</strong><span>Create a stream, then use its public name in OBS.</span></div>;
+    return <div className="empty-state"><Radio size={28} /><strong>No streams yet</strong><span>Create a stream to get one RTMP URL for both input and output.</span></div>;
   }
   return (
     <div className="table-wrap">
@@ -400,7 +400,7 @@ function StreamTable({
               <td><span className={stream.enabled ? "enabled-text" : "disabled-text"}>{stream.enabled ? "Enabled" : "Disabled"}</span></td>
               <td>
                 <div className="row-actions">
-                  {stream.playback_url && <IconButton label="Copy playback URL" onClick={() => copyText(stream.playback_url!)}><Copy size={16} /></IconButton>}
+                  <IconButton label="Copy universal RTMP URL" onClick={() => copyText(stream.rtmp_url)}><Copy size={16} /></IconButton>
                   {!compactMode && <IconButton label={stream.enabled ? "Disable stream" : "Enable stream"} onClick={() => onAction(stream, "toggle")}><SlidersHorizontal size={16} /></IconButton>}
                   <IconButton label="More stream actions" onClick={() => onAction(stream, "more")}><MoreHorizontal size={17} /></IconButton>
                 </div>
@@ -788,11 +788,9 @@ function App() {
         />
       )}
       {setup && (
-        <Modal title={setup.title} description="Use the same public stream name for publishing and playback. No token is required." onClose={() => setSetup(null)} wide>
+        <Modal title={setup.title} description="Use this same RTMP link for both publisher input and viewer output. No token is required." onClose={() => setSetup(null)} wide>
           <div className="setup-fields">
-            <CopyField label="OBS stream name" value={setup.data.publish_name} />
-            {setup.data.publish_url && <CopyField label="OBS server URL" value={setup.data.publish_url} />}
-            {setup.data.playback_url && <CopyField label="Playback URL" value={setup.data.playback_url} />}
+            <CopyField label="Universal RTMP URL" value={setup.data.rtmp_url} />
           </div>
           <div className="modal-actions"><button className="primary-button" onClick={() => setSetup(null)}>Done</button></div>
         </Modal>
@@ -837,7 +835,7 @@ function CreateStreamModal({
   const [name, setName] = useState("");
   const [recording, setRecording] = useState(false);
   return (
-    <Modal title="Create stream" description="The public stream name will also be used in OBS. No secret key is required." onClose={onClose}>
+    <Modal title="Create stream" description="Creates one universal RTMP link for both input and output. No secret key is required." onClose={onClose}>
       <form className="modal-form" onSubmit={(event: FormEvent) => { event.preventDefault(); onSubmit(application, name.trim(), recording); }}>
         <div className="two-fields">
           <label htmlFor="stream-application">Application<select id="stream-application" required value={application} onChange={(event) => setApplication(event.target.value)}><option value="">Select…</option>{applications.filter((app) => app.enabled).map((app) => <option key={app.name}>{app.name}</option>)}</select></label>
