@@ -174,6 +174,10 @@ void CrossWorkerRouter::on_stream_end(WorkerId source_worker, StreamId stream_id
         {
             std::lock_guard<std::mutex> lock(queue.mutex);
             queue.waiting_for_keyframe.erase(stream_id.raw());
+            // Replace any already-queued end marker atomically with the new
+            // prioritized marker below. Leaving the coalescing bit set while
+            // erasing its frame would lose a repeated teardown notification.
+            queue.queued_stream_ends.erase(stream_id.raw());
             for (auto it = queue.frames.begin(); it != queue.frames.end();) {
                 if (it->stream_id == stream_id) {
                     queue.queued_bytes -= std::min(queue.queued_bytes, it->frame.payload.size());
