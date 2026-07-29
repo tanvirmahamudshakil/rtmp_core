@@ -73,7 +73,7 @@ button:focus-visible, input:focus-visible, select:focus-visible {
   font-weight: 750;
   letter-spacing: .12em;
 }
-.sidebar nav button, .logout-button { border: 0; background: transparent; cursor: pointer; }
+.sidebar nav button { border: 0; background: transparent; cursor: pointer; }
 .sidebar nav button {
   position: relative;
   min-height: 46px;
@@ -115,17 +115,6 @@ button:focus-visible, input:focus-visible, select:focus-visible {
 .edge-card strong { margin-top: 1px; font-size: 12px; }
 .edge-card span { margin-top: 3px; color: #8490a3; font-size: 10px; line-height: 1.35; }
 .edge-card .status-pill { grid-column: 2; width: max-content; }
-.logout-button {
-  min-height: 42px;
-  padding: 0 11px;
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  color: #8792a5;
-  border-radius: 9px;
-  font-size: 12px;
-}
-.logout-button:hover { color: #fff; background: rgba(255, 255, 255, .045); }
 .sidebar-version { padding: 10px 11px 0; color: #525e72; font-size: 9px; }
 
 .main-shell { min-width: 0; min-height: 100vh; margin-left: 248px; }
@@ -661,25 +650,11 @@ tbody tr:hover { background: #fcfcfd; }
 .toggle-row small { margin-top: 4px; color: var(--muted); font-size: 9px; }
 .toggle-row > input { width: 36px; height: 20px; margin: 0; accent-color: var(--accent); }
 .modal-actions { margin-top: 23px; display: flex; justify-content: flex-end; gap: 9px; }
-.secret-warning {
-  margin: 21px 24px 0;
-  padding: 12px 13px;
-  display: flex;
-  align-items: center;
-  gap: 9px;
-  color: #b54708;
-  background: #fff8f1;
-  border: 1px solid #fde2cf;
-  border-radius: 9px;
-  font-size: 10px;
-}
-.secret-fields { padding: 20px 24px 0; display: grid; gap: 15px; }
+.setup-fields { padding: 20px 24px 0; display: grid; gap: 15px; }
 .copy-label { margin-bottom: 7px; display: flex; justify-content: space-between; align-items: center; color: var(--soft); font-size: 10px; font-weight: 700; }
-.text-action { display: flex; align-items: center; gap: 5px; color: var(--muted); background: transparent; border: 0; cursor: pointer; font-size: 9px; }
 .copy-field { min-height: 44px; padding: 4px 4px 4px 12px; display: flex; align-items: center; gap: 8px; background: #f8fafc; border: 1px solid #dce2ea; border-radius: 9px; }
 .copy-field code { flex: 1; overflow: hidden; color: #344054; font-size: 10px; white-space: nowrap; text-overflow: ellipsis; }
 .copy-field .icon-button { flex: none; width: 34px; height: 34px; }
-.expiry-note { margin: 15px 24px 0; color: var(--muted); font-size: 10px; }
 .modal > .modal-actions { padding: 0 24px 23px; }
 .action-menu { padding: 9px 13px 15px; }
 .action-menu > button { width: 100%; min-height: 70px; padding: 11px; display: flex; align-items: center; gap: 12px; color: var(--muted); background: transparent; border: 0; border-bottom: 1px solid #edf0f4; border-radius: 9px; cursor: pointer; text-align: left; }
@@ -715,58 +690,8 @@ tbody tr:hover { background: #fcfcfd; }
 .toast.error { border-left-color: var(--danger); }
 .toast.error svg { color: var(--danger); }
 
-.login-shell { min-height: 100vh; display: grid; grid-template-columns: 1.05fr .95fr; position: relative; overflow: hidden; background: #fff; }
-.login-grid {
-  position: absolute;
-  inset: 0 47% 0 0;
-  opacity: .12;
-  background-image: linear-gradient(#7b8799 1px, transparent 1px), linear-gradient(90deg, #7b8799 1px, transparent 1px);
-  background-size: 48px 48px;
-  mask-image: linear-gradient(105deg, black, transparent 90%);
-}
-.login-brand {
-  position: relative;
-  z-index: 1;
-  padding: clamp(34px, 5vw, 72px);
-  display: flex;
-  flex-direction: column;
-  color: #fff;
-  background: #111827;
-}
-.login-brand::after {
-  content: "";
-  position: absolute;
-  width: 360px;
-  height: 360px;
-  left: 18%;
-  top: 38%;
-  background: rgba(244, 119, 33, .1);
-  border-radius: 50%;
-  filter: blur(80px);
-}
-.login-brand .brand-mark { width: 46px; height: 46px; }
-.login-brand .brand-lockup strong { font-size: 18px; }
-.login-statement { position: relative; z-index: 1; margin: auto 0; max-width: 700px; }
-.login-statement h1 { margin: 0; font-size: clamp(44px, 5.6vw, 76px); line-height: 1.01; letter-spacing: -.06em; }
-.login-statement p { max-width: 520px; margin: 24px 0 0; color: #a7b0bf; font-size: 14px; line-height: 1.7; }
-.login-points { position: relative; z-index: 1; display: flex; flex-wrap: wrap; gap: 22px; color: #a7b0bf; font-size: 11px; }
-.login-points span { display: flex; align-items: center; gap: 8px; }
-.login-points svg { color: #ff9b57; }
-.login-panel { position: relative; z-index: 2; padding: 36px; display: grid; place-items: center; background: #fff; }
-.login-card { width: min(390px, 100%); }
-.login-card-icon { width: 46px; height: 46px; margin-bottom: 23px; display: grid; place-items: center; color: var(--accent); background: var(--accent-soft); border-radius: 12px; }
-.login-card h2 { margin: 0; font-size: 28px; letter-spacing: -.04em; }
-.login-card > p { margin: 10px 0 28px; color: var(--muted); font-size: 12px; line-height: 1.55; }
-.login-card > label { display: block; margin-bottom: 8px; color: var(--soft); font-size: 11px; font-weight: 700; }
-.password-field { height: 46px; padding: 0 12px; display: flex; align-items: center; gap: 10px; color: #98a2b3; background: #fff; border: 1px solid #d8dfe8; border-radius: 9px; }
-.password-field:focus-within { border-color: #f4a26a; box-shadow: 0 0 0 3px rgba(244, 119, 33, .1); }
-.password-field input { flex: 1; min-width: 0; color: #17202e; background: transparent; border: 0; outline: 0; font-size: 12px; }
-.password-field button { display: grid; place-items: center; color: var(--muted); background: transparent; border: 0; cursor: pointer; }
-.login-button { width: 100%; height: 45px; margin-top: 15px; }
-.login-card > small { display: block; margin-top: 14px; color: #98a2b3; font-size: 9px; line-height: 1.5; text-align: center; }
-.form-error, .demo-note { margin-top: 12px; padding: 11px 12px; border-radius: 8px; font-size: 10px; }
+.form-error { margin-top: 12px; padding: 11px 12px; border-radius: 8px; font-size: 10px; }
 .form-error { color: #b42340; background: #fff1f3; border: 1px solid #ffd5dc; }
-.demo-note { display: flex; align-items: center; gap: 8px; color: #6941c6; background: #f4f0ff; border: 1px solid #e5dbff; }
 
 .spin { animation: spin .85s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
@@ -789,10 +714,6 @@ tbody tr:hover { background: #fcfcfd; }
   .topbar { padding: 0 20px; }
   .content { padding: 24px 20px 42px; }
   .node-status, .desktop-create { display: none; }
-  .login-shell { grid-template-columns: 1fr; }
-  .login-brand { min-height: 44vh; }
-  .login-panel { padding-block: 50px; }
-  .login-points { display: none; }
   .system-grid { grid-template-columns: 1fr; }
 }
 
@@ -821,9 +742,6 @@ tbody tr:hover { background: #fcfcfd; }
   .system-banner { align-items: flex-start; flex-wrap: wrap; }
   .system-banner > .status-pill { margin-left: 72px; }
   .telemetry-grid { grid-template-columns: 1fr; }
-  .login-brand { min-height: 42vh; padding: 28px 24px; }
-  .login-statement h1 { font-size: 42px; }
-  .login-panel { padding: 42px 24px; }
   .modal-backdrop { padding: 12px; }
   .modal-heading, .modal-form { padding-left: 18px; padding-right: 18px; }
   .toast { right: 14px; bottom: 14px; left: 14px; max-width: none; }

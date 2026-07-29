@@ -7,20 +7,14 @@ import {
   Check,
   ChevronRight,
   CircleGauge,
-  Clipboard,
   CloudOff,
   Copy,
   Cpu,
   Database,
-  Eye,
-  EyeOff,
   FileVideo,
   Gauge,
   HardDrive,
-  KeyRound,
   Layers3,
-  LockKeyhole,
-  LogOut,
   Menu,
   MoreHorizontal,
   Network,
@@ -43,7 +37,7 @@ import {
   Zap
 } from "lucide-react";
 import { FormEvent, ReactNode, useCallback, useEffect, useMemo, useState } from "react";
-import { ApiError, Application, ControlClient, Snapshot, Stream, StreamSecret } from "./api";
+import { Application, ControlClient, Snapshot, Stream, StreamSetup } from "./api";
 
 type Page = "overview" | "streams" | "applications" | "capacity" | "system";
 type Notice = { type: "success" | "error"; message: string } | null;
@@ -51,7 +45,7 @@ type Notice = { type: "success" | "error"; message: string } | null;
 const EMPTY_SNAPSHOT: Snapshot = { applications: [], streams: [], metrics: {}, health: "offline" };
 const pageTitles: Record<Page, { title: string; subtitle: string }> = {
   overview: { title: "Overview", subtitle: "Your live service at a glance" },
-  streams: { title: "Streams", subtitle: "Create, monitor and secure every stream" },
+  streams: { title: "Streams", subtitle: "Create and monitor every stream" },
   applications: { title: "Applications", subtitle: "Organize streams into simple namespaces" },
   capacity: { title: "Capacity", subtitle: "Plan direct delivery without a CDN" },
   system: { title: "System", subtitle: "Server health and resource usage" }
@@ -145,7 +139,7 @@ function Modal({
       >
         <div className="modal-heading">
           <div>
-            <span className="eyebrow">SECURE CONTROL</span>
+            <span className="eyebrow">STREAM CONTROL</span>
             <h2 id="modal-title">{title}</h2>
             {description && <p>{description}</p>}
           </div>
@@ -159,45 +153,20 @@ function Modal({
   );
 }
 
-function CopyField({ label, value, secret = false }: { label: string; value: string; secret?: boolean }) {
-  const [visible, setVisible] = useState(!secret);
+function CopyField({ label, value }: { label: string; value: string }) {
   const [copied, setCopied] = useState(false);
   const copy = async () => {
     try {
-      if (navigator.clipboard && window.isSecureContext) {
-        await navigator.clipboard.writeText(value);
-      } else {
-        const fallback = document.createElement("textarea");
-        fallback.value = value;
-        fallback.setAttribute("readonly", "");
-        fallback.style.position = "fixed";
-        fallback.style.opacity = "0";
-        document.body.appendChild(fallback);
-        fallback.select();
-        const copied = document.execCommand("copy");
-        fallback.remove();
-        if (!copied) throw new Error("Clipboard access is unavailable.");
-      }
+      await copyText(value);
       setCopied(true);
       window.setTimeout(() => setCopied(false), 1500);
-    } catch {
-      // Plain HTTP and strict browser policies can deny the Clipboard API.
-      // Reveal the selectable value so the operator can still copy it.
-      setVisible(true);
-    }
+    } catch {}
   };
   return (
     <div className="copy-block">
-      <div className="copy-label">
-        <span>{label}</span>
-        {secret && (
-          <button type="button" className="text-action" onClick={() => setVisible((current) => !current)}>
-            {visible ? <EyeOff size={14} /> : <Eye size={14} />} {visible ? "Hide" : "Reveal"}
-          </button>
-        )}
-      </div>
+      <div className="copy-label"><span>{label}</span></div>
       <div className="copy-field">
-        <code>{visible ? value : "••••••••••••••••••••••••••••••••"}</code>
+        <code>{value}</code>
         <IconButton label={`Copy ${label}`} onClick={copy}>
           {copied ? <Check size={17} /> : <Copy size={17} />}
         </IconButton>
@@ -206,96 +175,14 @@ function CopyField({ label, value, secret = false }: { label: string; value: str
   );
 }
 
-function Login({
-  onLogin,
-  loading,
-  error,
-  demo
-}: {
-  onLogin: (token: string) => void;
-  loading: boolean;
-  error: string;
-  demo: boolean;
-}) {
-  const [token, setToken] = useState(demo ? "demo-session" : "");
-  const [show, setShow] = useState(false);
-  return (
-    <main className="login-shell">
-      <div className="login-grid" aria-hidden="true" />
-      <section className="login-brand">
-        <div className="brand-lockup large">
-          <div className="brand-mark">
-            <RadioTower size={25} />
-          </div>
-          <div>
-            <strong>StreamForge</strong>
-            <span>CONTROL PLANE</span>
-          </div>
-        </div>
-        <div className="login-statement">
-          <span className="eyebrow">STREAMFORGE CONTROL</span>
-          <h1>Live streaming,<br />simply managed.</h1>
-          <p>
-            Publish securely, watch audience growth and keep your origin healthy
-            from one focused dashboard.
-          </p>
-        </div>
-        <div className="login-points">
-          <span><ShieldCheck size={16} /> Secure by default</span>
-          <span><Network size={16} /> Clear bandwidth visibility</span>
-        </div>
-      </section>
-      <section className="login-panel">
-        <form
-          className="login-card"
-          onSubmit={(event) => {
-            event.preventDefault();
-            onLogin(token.trim());
-          }}
-        >
-          <div className="login-card-icon"><LockKeyhole size={22} /></div>
-          <span className="eyebrow">WELCOME BACK</span>
-          <h2>Sign in to StreamForge</h2>
-          <p>Enter the admin token created during server setup.</p>
-          <label htmlFor="admin-token">Admin bearer token</label>
-          <div className="password-field">
-            <KeyRound size={18} />
-            <input
-              id="admin-token"
-              autoFocus
-              autoComplete="current-password"
-              type={show ? "text" : "password"}
-              value={token}
-              onChange={(event) => setToken(event.target.value)}
-              placeholder="Paste your 64-character token"
-            />
-            <button type="button" title={show ? "Hide token" : "Show token"} onClick={() => setShow((value) => !value)}>
-              {show ? <EyeOff size={17} /> : <Eye size={17} />}
-            </button>
-          </div>
-          {error && <div className="form-error">{error}</div>}
-          {demo && <div className="demo-note"><SquareActivity size={16} /> Preview mode is using safe demo data.</div>}
-          <button className="primary-button login-button" disabled={!token.trim() || loading}>
-            {loading ? <RefreshCw className="spin" size={17} /> : <ArrowUpRight size={17} />}
-            {loading ? "Checking access…" : "Continue to dashboard"}
-          </button>
-          <small>Your token stays in this browser tab and is never bundled with the app.</small>
-        </form>
-      </section>
-    </main>
-  );
-}
-
 function Sidebar({
   page,
   setPage,
-  onLogout,
   open,
   close
 }: {
   page: Page;
   setPage: (page: Page) => void;
-  onLogout: () => void;
   open: boolean;
   close: () => void;
 }) {
@@ -336,9 +223,6 @@ function Sidebar({
           <div><strong>Direct origin</strong><span>Serving viewers without a CDN</span></div>
           <StatusPill live label="Ready" />
         </div>
-        <button className="logout-button" onClick={onLogout}>
-          <LogOut size={17} /> Sign out
-        </button>
         <div className="sidebar-version">StreamForge v1.0 · C++23</div>
       </aside>
     </>
@@ -469,7 +353,7 @@ function Overview({
             <StatusPill live={snapshot.health === "online"} label={snapshot.health === "online" ? "Operational" : "Degraded"} />
           </div>
           <div className="health-list">
-            <div><span className="health-icon good"><ShieldCheck size={18} /></span><p><strong>Authentication</strong><small>{compact(metric(snapshot, "authentication_failures"))} rejected attempts</small></p><b>Protected</b></div>
+            <div><span className="health-icon good"><ShieldCheck size={18} /></span><p><strong>Connection limits</strong><small>Per-IP and per-stream safety limits</small></p><b>Active</b></div>
             <div><span className="health-icon good"><Database size={18} /></span><p><strong>SQLite control store</strong><small>Readiness check passed</small></p><b>Ready</b></div>
             <div><span className="health-icon good"><HardDrive size={18} /></span><p><strong>Outbound queue</strong><small>{bytes(metric(snapshot, "outbound_queue_bytes"))} pending</small></p><b>Stable</b></div>
             <div><span className={`health-icon ${metric(snapshot, "slow_viewer_evictions") > 10 ? "warn" : "good"}`}><Unplug size={18} /></span><p><strong>Slow viewers</strong><small>Automatic backpressure policy</small></p><b>{compact(metric(snapshot, "slow_viewer_evictions"))} evicted</b></div>
@@ -498,7 +382,7 @@ function StreamTable({
   compactMode?: boolean;
 }) {
   if (!streams.length) {
-    return <div className="empty-state"><Radio size={28} /><strong>No streams yet</strong><span>Create a stream to receive a secure publish key.</span></div>;
+    return <div className="empty-state"><Radio size={28} /><strong>No streams yet</strong><span>Create a stream, then use its public name in OBS.</span></div>;
   }
   return (
     <div className="table-wrap">
@@ -517,7 +401,6 @@ function StreamTable({
               <td>
                 <div className="row-actions">
                   {stream.playback_url && <IconButton label="Copy playback URL" onClick={() => copyText(stream.playback_url!)}><Copy size={16} /></IconButton>}
-                  {!compactMode && <IconButton label="Create playback token" onClick={() => onAction(stream, "token")}><KeyRound size={16} /></IconButton>}
                   {!compactMode && <IconButton label={stream.enabled ? "Disable stream" : "Enable stream"} onClick={() => onAction(stream, "toggle")}><SlidersHorizontal size={16} /></IconButton>}
                   <IconButton label="More stream actions" onClick={() => onAction(stream, "more")}><MoreHorizontal size={17} /></IconButton>
                 </div>
@@ -709,7 +592,7 @@ function SystemPage({ snapshot }: { snapshot: Snapshot }) {
   const items = [
     ["RTMP transport", "io_uring / SO_REUSEPORT", "Operational", <Zap size={19} />],
     ["Control database", "SQLite WAL · local disk", "Ready", <Database size={19} />],
-    ["Management API", "Bearer token protected", "Protected", <ShieldCheck size={19} />],
+    ["Management API", "Direct panel access", "Open", <ShieldCheck size={19} />],
     ["Media delivery", "Direct origin · no CDN", "Active", <Network size={19} />]
   ];
   return (
@@ -736,13 +619,13 @@ function SystemPage({ snapshot }: { snapshot: Snapshot }) {
             <div><span>Egress total</span><strong>{bytes(metric(snapshot, "egress_bytes_total"))}</strong></div>
             <div><span>Ingress total</span><strong>{bytes(metric(snapshot, "ingress_bytes_total"))}</strong></div>
             <div><span>Dropped video</span><strong>{compact(metric(snapshot, "dropped_video_frames"))}</strong></div>
-            <div><span>Auth rejected</span><strong>{compact(metric(snapshot, "authentication_failures"))}</strong></div>
+            <div><span>Active streams</span><strong>{compact(metric(snapshot, "active_streams"))}</strong></div>
           </div>
         </section>
       </div>
       <section className="panel config-note">
         <Settings2 size={21} />
-        <div><strong>Server-owned configuration</strong><span>Kernel limits, listener queues, worker count and interface shaping are managed by the Linux installer. Secrets stay in <code>/etc/rtmp-server/rtmp-server.env</code> with restricted permissions.</span></div>
+        <div><strong>Server-owned configuration</strong><span>Kernel limits, listener queues, worker count and interface shaping are managed by the Linux installer in <code>/etc/rtmp-server</code>.</span></div>
       </section>
     </>
   );
@@ -750,20 +633,14 @@ function SystemPage({ snapshot }: { snapshot: Snapshot }) {
 
 function App() {
   const demo = new URLSearchParams(window.location.search).get("demo") === "1";
-  const initialToken = demo ? "demo-session" : sessionStorage.getItem("streamforge-token") ?? "";
-  const [client, setClient] = useState<ControlClient | null>(() =>
-    initialToken ? new ControlClient(initialToken, demo) : null
-  );
-  const [authenticated, setAuthenticated] = useState(Boolean(initialToken));
-  const [loginLoading, setLoginLoading] = useState(false);
-  const [loginError, setLoginError] = useState("");
+  const [client] = useState(() => new ControlClient(demo));
   const [snapshot, setSnapshot] = useState<Snapshot>(EMPTY_SNAPSHOT);
   const [page, setPage] = useState<Page>("overview");
   const [loading, setLoading] = useState(false);
   const [notice, setNotice] = useState<Notice>(null);
   const [mobileNav, setMobileNav] = useState(false);
   const [createType, setCreateType] = useState<"stream" | "application" | null>(null);
-  const [secret, setSecret] = useState<{ title: string; data: StreamSecret; tokenExpires?: number } | null>(null);
+  const [setup, setSetup] = useState<{ title: string; data: StreamSetup } | null>(null);
   const [actionStream, setActionStream] = useState<Stream | null>(null);
   const [bandwidth, setBandwidthState] = useState(() => Number(localStorage.getItem("streamforge-bandwidth")) || 10000);
   const [history, setHistory] = useState<number[]>(demo ? [5200, 5400, 5310, 5710, 5890, 6030, 6210, 6150, 6420, 6615] : []);
@@ -774,18 +651,13 @@ function App() {
   };
 
   const refresh = useCallback(async (activeClient = client, quiet = false) => {
-    if (!activeClient) return;
     if (!quiet) setLoading(true);
     try {
       const next = await activeClient.snapshot();
       setSnapshot(next);
       setHistory((current) => [...current, metric(next, "active_viewers")].slice(-24));
     } catch (error) {
-      if (error instanceof ApiError && error.status === 401) {
-        sessionStorage.removeItem("streamforge-token");
-        setAuthenticated(false);
-        setLoginError("Your admin session expired. Sign in again.");
-      } else if (!quiet) {
+      if (!quiet) {
         setNotice({ type: "error", message: error instanceof Error ? error.message : "Could not refresh server data." });
       }
     } finally {
@@ -794,11 +666,10 @@ function App() {
   }, [client]);
 
   useEffect(() => {
-    if (!authenticated || !client) return;
     refresh(client);
     const interval = window.setInterval(() => refresh(client, true), 5000);
     return () => window.clearInterval(interval);
-  }, [authenticated, client, refresh]);
+  }, [client, refresh]);
 
   useEffect(() => {
     if (!notice) return;
@@ -826,29 +697,6 @@ function App() {
     };
   }, []);
 
-  const login = async (nextToken: string) => {
-    setLoginLoading(true);
-    setLoginError("");
-    const nextClient = new ControlClient(nextToken, demo);
-    try {
-      await nextClient.validate();
-      if (!demo) sessionStorage.setItem("streamforge-token", nextToken);
-      setClient(nextClient);
-      setAuthenticated(true);
-    } catch (error) {
-      setLoginError(error instanceof ApiError && error.status === 401 ? "That admin token was not accepted." : "The server could not be reached.");
-    } finally {
-      setLoginLoading(false);
-    }
-  };
-
-  const logout = () => {
-    sessionStorage.removeItem("streamforge-token");
-    setClient(null);
-    setAuthenticated(false);
-    setSnapshot(EMPTY_SNAPSHOT);
-  };
-
   const notify = (type: "success" | "error", message: string) => setNotice({ type, message });
   const perform = async (work: () => Promise<unknown>, message: string) => {
     try {
@@ -861,14 +709,8 @@ function App() {
   };
 
   const streamAction = (stream: Stream, action: string) => {
-    if (!client) return;
     if (action === "toggle") {
       perform(() => client.patchStream(stream, { enabled: !stream.enabled }), `Stream ${stream.enabled ? "disabled" : "enabled"}.`);
-    } else if (action === "token") {
-      perform(async () => {
-        const result = await client.playbackToken(stream, 3600);
-        setSecret({ title: "Signed playback token", data: { stream_key: result.token }, tokenExpires: result.expires_at });
-      }, "Playback token created.");
     } else {
       setActionStream(stream);
     }
@@ -892,11 +734,9 @@ function App() {
     [snapshot.streams]
   );
 
-  if (!authenticated) return <Login onLogin={login} loading={loginLoading} error={loginError} demo={demo} />;
-
   return (
     <div className="app-shell">
-      <Sidebar page={page} setPage={setPage} onLogout={logout} open={mobileNav} close={() => setMobileNav(false)} />
+      <Sidebar page={page} setPage={setPage} open={mobileNav} close={() => setMobileNav(false)} />
       <main className="main-shell">
         <header className="topbar">
           <button className="menu-button" aria-label="Open navigation" onClick={() => setMobileNav(true)}><Menu size={21} /></button>
@@ -928,13 +768,13 @@ function App() {
 
       {notice && <div className={`toast ${notice.type}`}>{notice.type === "success" ? <Check size={18} /> : <X size={18} />}<span>{notice.message}</span></div>}
 
-      {createType === "application" && client && (
+      {createType === "application" && (
         <CreateApplicationModal
           onClose={() => setCreateType(null)}
           onSubmit={(name) => perform(async () => { await client.createApplication(name); setCreateType(null); }, "Application created.")}
         />
       )}
-      {createType === "stream" && client && (
+      {createType === "stream" && (
         <CreateStreamModal
           applications={snapshot.applications}
           onClose={() => setCreateType(null)}
@@ -942,29 +782,29 @@ function App() {
             perform(async () => {
               const data = await client.createStream(application, name, recording);
               setCreateType(null);
-              setSecret({ title: "Stream is ready", data });
-            }, "Stream created securely.")
+              setSetup({ title: "Stream is ready", data });
+            }, "Stream created.")
           }
         />
       )}
-      {secret && (
-        <Modal title={secret.title} description="Copy this sensitive value now. The server will not reveal it again." onClose={() => setSecret(null)} wide>
-          <div className="secret-warning"><LockKeyhole size={18} /><span>One-time secret · store it in your password manager</span></div>
-          <div className="secret-fields">
-            <CopyField label={secret.tokenExpires ? "Playback token" : "Publish key"} value={secret.data.stream_key} secret />
-            {secret.data.publish_url && <CopyField label="OBS server URL" value={secret.data.publish_url} />}
-            {secret.data.playback_url && <CopyField label="Playback URL" value={secret.data.playback_url} />}
+      {setup && (
+        <Modal title={setup.title} description="Use the same public stream name for publishing and playback. No token is required." onClose={() => setSetup(null)} wide>
+          <div className="setup-fields">
+            <CopyField label="OBS stream name" value={setup.data.publish_name} />
+            {setup.data.publish_url && <CopyField label="OBS server URL" value={setup.data.publish_url} />}
+            {setup.data.playback_url && <CopyField label="Playback URL" value={setup.data.playback_url} />}
           </div>
-          {secret.tokenExpires && <p className="expiry-note">Expires {new Date(secret.tokenExpires * 1000).toLocaleString()}.</p>}
-          <div className="modal-actions"><button className="primary-button" onClick={() => setSecret(null)}>I have stored it safely</button></div>
+          <div className="modal-actions"><button className="primary-button" onClick={() => setSetup(null)}>Done</button></div>
         </Modal>
       )}
-      {actionStream && client && (
+      {actionStream && (
         <Modal title={actionStream.name} description={`${actionStream.application} / ${actionStream.name}`} onClose={() => setActionStream(null)}>
           <div className="action-menu">
-            <button onClick={() => { setActionStream(null); streamAction(actionStream, "token"); }}><span><KeyRound size={18} /></span><div><strong>Issue playback token</strong><small>Generate a signed URL credential valid for one hour</small></div><ChevronRight size={17} /></button>
-            <button onClick={() => perform(async () => { const data = await client.rotateKey(actionStream); setActionStream(null); setSecret({ title: "Publish key rotated", data }); }, "Old publish key revoked.")}><span><RefreshCw size={18} /></span><div><strong>Rotate publish key</strong><small>Immediately invalidate the previous publishing secret</small></div><ChevronRight size={17} /></button>
-            <button onClick={() => perform(() => client.patchStream(actionStream, { recording_enabled: !actionStream.recording_enabled }), `Recording policy ${actionStream.recording_enabled ? "disabled" : "requested"}.`)}><span><FileVideo size={18} /></span><div><strong>{actionStream.recording_enabled ? "Disable" : "Request"} recording policy</strong><small>Persist the desired policy; runtime recording must also be enabled on the server</small></div><ChevronRight size={17} /></button>
+            <button onClick={() => {
+              const stream = actionStream;
+              setActionStream(null);
+              perform(() => client.patchStream(stream, { recording_enabled: !stream.recording_enabled }), `Recording policy ${stream.recording_enabled ? "disabled" : "requested"}.`);
+            }}><span><FileVideo size={18} /></span><div><strong>{actionStream.recording_enabled ? "Disable" : "Request"} recording policy</strong><small>Persist the desired policy; runtime recording must also be enabled on the server</small></div><ChevronRight size={17} /></button>
           </div>
         </Modal>
       )}
@@ -997,7 +837,7 @@ function CreateStreamModal({
   const [name, setName] = useState("");
   const [recording, setRecording] = useState(false);
   return (
-    <Modal title="Create a secure stream" description="A one-time publish key will be generated after creation." onClose={onClose}>
+    <Modal title="Create stream" description="The public stream name will also be used in OBS. No secret key is required." onClose={onClose}>
       <form className="modal-form" onSubmit={(event: FormEvent) => { event.preventDefault(); onSubmit(application, name.trim(), recording); }}>
         <div className="two-fields">
           <label htmlFor="stream-application">Application<select id="stream-application" required value={application} onChange={(event) => setApplication(event.target.value)}><option value="">Select…</option>{applications.filter((app) => app.enabled).map((app) => <option key={app.name}>{app.name}</option>)}</select></label>

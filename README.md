@@ -1,9 +1,9 @@
 # StreamForge RTMP Server
 
-A self-hosted C++23 RTMP origin for Linux, built on `io_uring`, with a secure
-web control plane. It accepts OBS/encoder publishing, validates hashed stream
-keys, fans H.264/AAC RTMP media to viewers, persists application and stream
-configuration in SQLite, and exports Prometheus metrics.
+A self-hosted C++23 RTMP origin for Linux, built on `io_uring`, with a direct
+web control plane. It accepts OBS/encoder publishing by public stream name,
+fans H.264/AAC RTMP media to viewers without playback credentials, persists
+application and stream configuration in SQLite, and exports Prometheus metrics.
 
 This deployment is designed for direct origin delivery. It does not require
 or configure a CDN.
@@ -69,28 +69,28 @@ link automatically instead of starting from a hard-coded UI value.
 
 After installation:
 
-- Admin credential: `/root/streamforge-credentials.txt`
+- Install details: `/root/streamforge-credentials.txt`
 - Admin panel: `http://VPS_IP` without a domain, otherwise `https://RTMP_DOMAIN`
 - RTMP origin: `rtmp://VPS_IP:1935` without a domain, otherwise `rtmp://RTMP_DOMAIN:1935`
 - Service logs: `journalctl -u rtmp-server -f`
 
 ## Operator flow
 
-1. Sign in to the admin panel with the generated bearer token.
+1. Open the admin panel directly; no sign-in is required.
 2. Create an application such as `live`.
-3. Create a stream and copy its one-time publish key.
+3. Create a stream such as `main-stage`.
 4. Configure OBS:
 
    ```text
    Service:    Custom
    Server:     rtmp://stream.example.com:1935/live
-   Stream Key: <one-time key from the panel>
+   Stream Key: main-stage
    ```
 
 5. Play the public stream:
 
    ```text
-   rtmp://stream.example.com:1935/live/STREAM_NAME
+   rtmp://stream.example.com:1935/live/main-stage
    ```
 
 ## Capacity reality
@@ -158,10 +158,10 @@ port 1935.
 
 ## Current scope
 
-Implemented: RTMP handshake/chunk/AMF0 pipeline, publish/play fan-out, GOP
-cache, slow-viewer backpressure, multi-worker routing, hashed publish keys,
-signed playback tokens, SQLite control state, management HTTP API, metrics,
-audit records, and the Linux deployment stack.
+Implemented: RTMP handshake/chunk/AMF0 pipeline, open-name publish/play
+fan-out, GOP cache, slow-viewer backpressure, multi-worker routing, SQLite
+control state, open management HTTP API, metrics, audit records, and the
+Linux deployment stack.
 
 Not included: transcoding, WebRTC, SRT, clustering, multi-node state
 replication, or a CDN. HLS and recording components exist in the library but

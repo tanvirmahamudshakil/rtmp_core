@@ -20,6 +20,7 @@ StreamManager::Options manager_options() {
 ManagementApiOptions api_options() {
     ManagementApiOptions options;
     options.admin_token = "admin-secret-token";
+    options.require_authentication = true;
     return options;
 }
 
@@ -45,15 +46,15 @@ TEST(ManagementApiTest, HealthLiveNeedsNoAuth) {
     EXPECT_EQ(response.status, 200);
 }
 
-TEST(ManagementApiTest, MutatingRoutesRequireBearerToken) {
+TEST(ManagementApiTest, ControlPlaneIsOpenByDefault) {
     StreamManager manager(manager_options());
-    ManagementApi api(manager, api_options());
+    ManagementApi api(manager, ManagementApiOptions{});
     HttpRequest r;
     r.method = "POST";
     r.path = "/v1/applications";
     r.body = R"({"name":"live"})";
     auto response = api.handle(r);
-    EXPECT_EQ(response.status, 401);
+    EXPECT_EQ(response.status, 201);
 }
 
 TEST(ManagementApiTest, WrongTokenIsRejected) {
@@ -77,14 +78,16 @@ TEST(ManagementApiTest, CreateAndListApplications) {
     EXPECT_NE(list.body.find("\"live\""), std::string::npos);
 }
 
-TEST(ManagementApiTest, CreateStreamReturnsRawKeyOnlyOnce) {
+TEST(ManagementApiTest, CreateStreamReturnsOpenPublishNameAndUrls) {
     StreamManager manager(manager_options());
     ManagementApi api(manager, api_options());
     ASSERT_EQ(api.handle(authed("POST", "/v1/applications", R"({"name":"live"})")).status, 201);
 
     auto create = api.handle(authed("POST", "/v1/streams", R"({"application":"live","name":"alpha"})"));
     ASSERT_EQ(create.status, 201);
-    EXPECT_NE(create.body.find("stream_key"), std::string::npos);
+    EXPECT_EQ(create.body.find("stream_key"), std::string::npos);
+    EXPECT_NE(create.body.find(R"("publish_name":"alpha")"), std::string::npos);
+    EXPECT_NE(create.body.find(R"("publish_url":"rtmp://localhost:1935/live")"), std::string::npos);
 
     auto get = api.handle(authed("GET", "/v1/streams/live:alpha"));
     EXPECT_EQ(get.status, 200);
@@ -125,7 +128,7 @@ TEST(ManagementApiTest, PatchDisablesAStream) {
     EXPECT_NE(patch.body.find("\"enabled\":false"), std::string::npos);
 }
 
-TEST(ManagementApiTest, RotateKeyReturnsANewKey) {
+TEST(ManagementApiTest, PublishKeyRotationRouteIsNotExposedInOpenMode) {
     StreamManager manager(manager_options());
     ManagementApi api(manager, api_options());
     ASSERT_EQ(api.handle(authed("POST", "/v1/applications", R"({"name":"live"})")).status, 201);
@@ -133,19 +136,17 @@ TEST(ManagementApiTest, RotateKeyReturnsANewKey) {
     ASSERT_EQ(created.status, 201);
 
     auto rotate = api.handle(authed("POST", "/v1/streams/live:alpha/rotate-publish-key"));
-    EXPECT_EQ(rotate.status, 200);
-    EXPECT_NE(rotate.body.find("stream_key"), std::string::npos);
+    EXPECT_EQ(rotate.status, 404);
 }
 
-TEST(ManagementApiTest, PlaybackTokenEndpointIssuesAVerifiableToken) {
+TEST(ManagementApiTest, PlaybackTokenRouteIsNotExposedInOpenMode) {
     StreamManager manager(manager_options());
     ManagementApi api(manager, api_options());
     ASSERT_EQ(api.handle(authed("POST", "/v1/applications", R"({"name":"live"})")).status, 201);
     ASSERT_EQ(api.handle(authed("POST", "/v1/streams", R"({"application":"live","name":"alpha"})")).status, 201);
 
     auto token_response = api.handle(authed("POST", "/v1/streams/live:alpha/playback-token", R"({"ttl_seconds":60})"));
-    EXPECT_EQ(token_response.status, 200);
-    EXPECT_NE(token_response.body.find("\"token\""), std::string::npos);
+    EXPECT_EQ(token_response.status, 404);
 }
 
 TEST(ManagementApiTest, StatusWithoutRegistryWiredReturnsServiceUnavailable) {

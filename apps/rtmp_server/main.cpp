@@ -120,8 +120,18 @@ int main(int argc, char** argv) {
 
     rtmp_server::io::io_uring::EventLoopServices services;
     services.metrics = &metrics;
-    services.key_validator = authenticator.key_validator();
-    services.stream_id_resolver = authenticator.stream_id_resolver();
+    // Open publishing: OBS/ffmpeg publishes with the public stream name,
+    // not a secret credential. Requiring an existing enabled application and
+    // stream preserves deterministic routing and the operator's disable
+    // control without adding authentication.
+    services.key_validator =
+        [&stream_manager](std::string_view application, std::string_view stream_name) {
+            const auto app = stream_manager.find_application(application);
+            const auto stream = stream_manager.find_stream(application, stream_name);
+            return app && app->enabled && stream && stream->enabled;
+        };
+    // The publish argument is already the canonical public fan-out name.
+    services.stream_id_resolver = {};
     services.playback_authorizer = authenticator.playback_authorizer();
     services.viewer_attached_handler =
         [&authenticator](std::string_view application, std::string_view stream_name) {
@@ -141,8 +151,8 @@ int main(int argc, char** argv) {
 
     // Open control plane: the management API is served without a bearer-token
     // check so hitting the web panel drops the operator straight into the
-    // dashboard. Anyone who can reach this endpoint can create/delete/rotate
-    // streams — keep it behind loopback + the reverse proxy as documented.
+    // dashboard. Anyone who can reach this endpoint can create, disable and
+    // disconnect streams.
     rtmp_server::control::ManagementApiOptions management_options{config.api_authentication_secret};
     management_options.require_authentication = false;
     rtmp_server::control::ManagementApi management_api(stream_manager, management_options);

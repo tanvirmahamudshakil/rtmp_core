@@ -6,10 +6,10 @@ set -Eeuo pipefail
 # to the RTMP server.
 #
 # Required:
-#   PUBLISH_KEY=... PLAYBACK_NAME=... SERVER_HOST=...
+#   PLAYBACK_NAME=... SERVER_HOST=...
 #
 # Example:
-#   SERVER_HOST=10.0.0.10 PUBLISH_KEY=... PLAYBACK_NAME=concert \
+#   SERVER_HOST=10.0.0.10 PLAYBACK_NAME=concert \
 #   VIEWERS=1000 DURATION=300 bash scripts/load-test.sh
 
 BUILD_DIR="${BUILD_DIR:-./build/release}"
@@ -17,7 +17,6 @@ LOADGEN="${LOADGEN:-${BUILD_DIR}/apps/rtmp_load_gen/rtmp_load_gen}"
 SERVER_HOST="${SERVER_HOST:-}"
 SERVER_PORT="${SERVER_PORT:-1935}"
 APPLICATION="${APPLICATION:-live}"
-PUBLISH_KEY="${PUBLISH_KEY:-}"
 PLAYBACK_NAME="${PLAYBACK_NAME:-}"
 VIEWERS="${VIEWERS:-1000}"
 DURATION="${DURATION:-300}"
@@ -31,10 +30,6 @@ ABRUPT_DISCONNECTS="${ABRUPT_DISCONNECTS:-0}"
 
 [[ -n "${SERVER_HOST}" ]] || {
   printf 'SERVER_HOST is required\n' >&2
-  exit 2
-}
-[[ -n "${PUBLISH_KEY}" ]] || {
-  printf 'PUBLISH_KEY is required\n' >&2
   exit 2
 }
 [[ -n "${PLAYBACK_NAME}" ]] || {
@@ -54,7 +49,7 @@ exec "${LOADGEN}" \
   --host "${SERVER_HOST}" \
   --port "${SERVER_PORT}" \
   --app "${APPLICATION}" \
-  --publish-key "${PUBLISH_KEY}" \
+  --publish-name "${PLAYBACK_NAME}" \
   --playback-name "${PLAYBACK_NAME}" \
   --publishers 1 \
   --viewers "${VIEWERS}" \

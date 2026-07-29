@@ -1,5 +1,10 @@
 # Authentication (Phase 5)
 
+> Current production behavior supersedes this historical phase document:
+> admin HTTP, publishing, and playback require no credentials. Application
+> and stream enabled-state checks plus connection/viewer limits remain as
+> resource controls, not authentication.
+
 ## Components
 
 - `management::StreamManager` — domain model (Application/Stream), hashed

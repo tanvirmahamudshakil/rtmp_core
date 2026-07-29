@@ -73,7 +73,7 @@ ScenarioReport run_scenario(const ScenarioConfig& config) {
          config.publishers != 1)) {
         report.clients_failed = config.publishers + report.viewers_requested;
         report.failure_reasons.push_back(
-            "publish_key and playback_name must both be set and require publishers=1");
+            "publish name and playback name must both be set and require publishers=1");
         return report;
     }
 

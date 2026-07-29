@@ -54,7 +54,6 @@ separate Linux generator host:
 
 ```bash
 SERVER_HOST=10.0.0.10 \
-PUBLISH_KEY='<one-time stream publish key>' \
 PLAYBACK_NAME='concert' \
 APPLICATION='live' \
 VIEWERS=1000 \

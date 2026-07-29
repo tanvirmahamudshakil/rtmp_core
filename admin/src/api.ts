@@ -13,16 +13,11 @@ export type Stream = {
   viewer_count?: number;
 };
 
-export type StreamSecret = {
+export type StreamSetup = {
   stream?: Stream;
-  stream_key: string;
+  publish_name: string;
   publish_url?: string;
   playback_url?: string;
-};
-
-export type PlaybackToken = {
-  token: string;
-  expires_at: number;
 };
 
 export type Snapshot = {
@@ -73,7 +68,6 @@ const demoMetrics: Record<string, number> = {
   dropped_video_frames: 14,
   dropped_audio_frames: 0,
   slow_viewer_evictions: 2,
-  authentication_failures: 7,
   process_memory_bytes: 1288490188,
   worker_cpu_usage: 6720,
   gop_cache_bytes: 38482944
@@ -94,7 +88,6 @@ function parsePrometheus(text: string): Record<string, number> {
 
 export class ControlClient {
   constructor(
-    private token: string,
     public readonly demo = false,
     private baseUrl = "/api"
   ) {}
@@ -105,7 +98,6 @@ export class ControlClient {
       headers: {
         Accept: "application/json",
         ...(init.body ? { "Content-Type": "application/json" } : {}),
-        Authorization: `Bearer ${this.token}`,
         ...init.headers
       }
     });
@@ -121,11 +113,6 @@ export class ControlClient {
     }
     const text = await response.text();
     return (text ? JSON.parse(text) : {}) as T;
-  }
-
-  async validate(): Promise<void> {
-    if (this.demo) return;
-    await this.request<ListResponse<Application>>("/v1/applications?limit=1");
   }
 
   async snapshot(): Promise<Snapshot> {
@@ -163,7 +150,7 @@ export class ControlClient {
     let metrics: Record<string, number> = {};
     try {
       const response = await fetch(`${this.baseUrl}/metrics`, {
-        headers: { Authorization: `Bearer ${this.token}` }
+        headers: { Accept: "text/plain" }
       });
       if (response.ok) metrics = parsePrometheus(await response.text());
     } catch {
@@ -185,18 +172,18 @@ export class ControlClient {
     });
   }
 
-  async createStream(application: string, name: string, recording: boolean): Promise<StreamSecret> {
+  async createStream(application: string, name: string, recording: boolean): Promise<StreamSetup> {
     if (this.demo) {
       const stream = { application, name, enabled: true, recording_enabled: recording, playback_url: demoPlayback(application, name), is_live: false, viewer_count: 0 };
       demoStreams = [...demoStreams, stream];
       return {
         stream,
-        stream_key: `sf_${crypto.randomUUID().replaceAll("-", "")}`,
+        publish_name: name,
         publish_url: `rtmp://stream.example.com:1935/${application}`,
         playback_url: `rtmp://stream.example.com:1935/${application}/${name}`
       };
     }
-    return this.request<StreamSecret>("/v1/streams", {
+    return this.request<StreamSetup>("/v1/streams", {
       method: "POST",
       body: JSON.stringify({ application, name, recording_enabled: recording })
     });
@@ -213,27 +200,6 @@ export class ControlClient {
       method: "PATCH",
       body: JSON.stringify(fields)
     });
-  }
-
-  async rotateKey(stream: Stream): Promise<StreamSecret> {
-    if (this.demo) return { stream_key: `sf_${crypto.randomUUID().replaceAll("-", "")}` };
-    return this.request<StreamSecret>(
-      `/v1/streams/${encodeURIComponent(`${stream.application}:${stream.name}`)}/rotate-publish-key`,
-      { method: "POST" }
-    );
-  }
-
-  async playbackToken(stream: Stream, ttlSeconds: number): Promise<PlaybackToken> {
-    if (this.demo) {
-      return {
-        token: `eyJzZiI6IiR7${crypto.randomUUID().replaceAll("-", "")}`,
-        expires_at: Math.floor(Date.now() / 1000) + ttlSeconds
-      };
-    }
-    return this.request<PlaybackToken>(
-      `/v1/streams/${encodeURIComponent(`${stream.application}:${stream.name}`)}/playback-token`,
-      { method: "POST", body: JSON.stringify({ ttl_seconds: ttlSeconds }) }
-    );
   }
 
   async disconnect(stream: Stream, target: "publisher" | "viewers"): Promise<void> {

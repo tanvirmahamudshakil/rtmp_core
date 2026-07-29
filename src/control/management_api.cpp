@@ -275,8 +275,6 @@ HttpResponse ManagementApi::route(const HttpRequest& request, const std::string&
         }
         if (parts.size() == 4 && request.method == "POST") {
             auto [application, name] = split_stream_id(parts[2]);
-            if (parts[3] == "rotate-publish-key") return handle_rotate_key(application, name);
-            if (parts[3] == "playback-token") return handle_playback_token(application, name, request);
             if (parts[3] == "disconnect-publisher") return handle_disconnect_publisher(application, name);
             if (parts[3] == "disconnect-viewers") return handle_disconnect_viewers(application, name);
         }
@@ -400,9 +398,14 @@ HttpResponse ManagementApi::handle_create_stream(const HttpRequest& request) {
                                    error_body("request_failed", result.error().message(), ""));
     }
     const auto& created = result.value();
+    std::string obs_server_url = created.playback_url;
+    if (const auto slash = obs_server_url.rfind('/'); slash != std::string::npos) {
+        obs_server_url.resize(slash);
+    }
     std::ostringstream os;
-    os << R"({"stream":)" << stream_json(created.stream) << R"(,"stream_key":")" << json_escape(created.stream_key)
-       << R"(","publish_url":")" << json_escape(created.publish_url) << R"(","playback_url":")"
+    os << R"({"stream":)" << stream_json(created.stream) << R"(,"publish_name":")"
+       << json_escape(created.stream.name) << R"(","publish_url":")" << json_escape(obs_server_url)
+       << R"(","playback_url":")"
        << json_escape(created.playback_url) << "\"}";
     return HttpResponse::json(201, os.str());
 }
@@ -438,39 +441,6 @@ HttpResponse ManagementApi::handle_patch_stream(std::string_view application, st
     auto stream = manager_.find_stream(application, name);
     if (!stream) return HttpResponse::json(404, error_body("not_found", "no such stream", ""));
     return HttpResponse::json(200, stream_json(*stream));
-}
-
-HttpResponse ManagementApi::handle_rotate_key(std::string_view application, std::string_view name) {
-    auto result = manager_.rotate_key(application, name);
-    audit("rotate_key", application, name, result.ok());
-    if (!result.ok()) {
-        return HttpResponse::json(http_status_for(result.error().code()),
-                                   error_body("request_failed", result.error().message(), ""));
-    }
-    std::ostringstream os;
-    os << R"({"stream_key":")" << json_escape(result.value()) << "\"}";
-    return HttpResponse::json(200, os.str());
-}
-
-HttpResponse ManagementApi::handle_playback_token(std::string_view application, std::string_view name,
-                                                     const HttpRequest& request) {
-    auto stream = manager_.find_stream(application, name);
-    if (!stream) return HttpResponse::json(404, error_body("not_found", "no such stream", ""));
-
-    auto fields = parse_flat_json(request.body);
-    std::int64_t ttl_seconds = 3600;
-    if (auto it = fields.find("ttl_seconds"); it != fields.end()) {
-        std::from_chars(it->second.data(), it->second.data() + it->second.size(), ttl_seconds);
-    }
-    auto now = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch())
-                   .count();
-    std::int64_t expires_at = now + ttl_seconds;
-    std::string token = manager_.sign_playback_token(application, name, expires_at);
-    audit("sign_playback_token", application, name, true);
-
-    std::ostringstream os;
-    os << R"({"token":")" << json_escape(token) << R"(","expires_at":)" << expires_at << "}";
-    return HttpResponse::json(200, os.str());
 }
 
 HttpResponse ManagementApi::handle_status(std::string_view application, std::string_view name) {

@@ -493,13 +493,13 @@ StreamForge Control
 ===================
 Admin URL: $(if [[ -n "${DOMAIN}" ]]; then printf 'https://%s' "${DOMAIN}"; else printf 'http://%s' "${PRIMARY_IP}"; fi)
 RTMP origin: rtmp://${PUBLIC_HOST}:1935
-Admin token: ${ADMIN_TOKEN}
 Capacity bandwidth: ${BANDWIDTH_MBIT} Mbps (${BANDWIDTH_SOURCE})
 Bitrate mode: $(if [[ "${BITRATE_MODE}" == "auto" ]]; then printf 'OBS/transcoder passthrough, measured while live'; else printf 'manual capacity override (%s Mbps)' "${EXPECTED_STREAM_MBIT}"; fi)
 Pre-live viewer safety ceiling: ${MAX_VIEWERS}
 Generated: $(date -u +%Y-%m-%dT%H:%M:%SZ)
 
-Keep this file private. The admin token controls stream creation and key rotation.
+The admin panel and RTMP playback are open and require no access token.
+Use the public stream name in OBS's Stream Key field.
 EOF
 chmod 0600 "${CREDENTIALS}"
 
@@ -730,5 +730,5 @@ if [[ "${ENABLE_FAIR_QUEUE}" == "1" ]]; then
 else
   printf '  Fair queue:       disabled by RTMP_ENABLE_FAIR_QUEUE=0\n'
 fi
-printf '  Admin credential: %s\n\n' "${CREDENTIALS}"
-printf 'Next: sign in, create an application, then create a stream and copy its one-time publish key.\n'
+printf '  Install details:  %s\n\n' "${CREDENTIALS}"
+printf 'Next: open the panel directly, create an application and stream, then use the stream name in OBS.\n'

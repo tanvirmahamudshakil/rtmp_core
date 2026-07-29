@@ -1,5 +1,11 @@
 # Management HTTP API (Phase 5)
 
+> Current production mode is intentionally open-access. The server does not
+> require a bearer header, stream creation returns `publish_name` rather than
+> a secret key, and publish-key rotation/playback-token routes are not
+> exposed. Historical Phase 5 authentication details below describe optional
+> library capability, not the deployed `apps/rtmp_server` behavior.
+
 ## Why hand-rolled instead of a vendored library
 
 No HTTP server library was vendored anywhere in this repository before this
@@ -31,9 +37,8 @@ could still vendor a library if the endpoint surface grows.
   event-loop thread (section 3.6).
 - `control::ManagementApi` (`include/rtmp_server/control/management_api.hpp`,
   `src/control/management_api.cpp`) — routes requests onto
-  `management::StreamManager`, with bearer-token auth (constant-time
-  compare via `core::constant_time_equals`), per-IP auth-failure rate
-  limiting, structured JSON errors, `X-Request-Id`, audit logging (via
+  `management::StreamManager`, with open access by default, structured JSON
+  errors, `X-Request-Id`, audit logging (via
   `observability::AuditLog`, when injected), and pagination
   (`?limit=&offset=`) on list endpoints.
 
@@ -43,15 +48,13 @@ could still vendor a library if the endpoint surface grows.
 |---|---|---|
 | GET  | `/health/live`                              | No auth. Always 200 once the process is up. |
 | GET  | `/health/ready`                             | No auth. 503 if a `persistence::Store` is configured and unreachable. |
-| GET  | `/metrics`                                  | Auth required. Prometheus-text-ish `name value` lines from `observability::Metrics`. |
+| GET  | `/metrics`                                  | Open. Prometheus-text-ish `name value` lines from `observability::Metrics`. |
 | POST | `/v1/applications`                          | `{"name":"..."}` |
 | GET  | `/v1/applications`                          | Paginated. |
-| POST | `/v1/streams`                               | `{"application":"...","name":"...","recording_enabled":bool}`. Response includes `stream_key`/`publish_url`/`playback_url` — the *only* time the raw key appears. |
+| POST | `/v1/streams`                               | `{"application":"...","name":"...","recording_enabled":bool}`. Response includes `publish_name`/`publish_url`/`playback_url`. |
 | GET  | `/v1/streams?application=...`               | Paginated by `application` query param (required). |
 | GET  | `/v1/streams/{application}:{name}`          | Never includes the raw key. |
 | PATCH| `/v1/streams/{application}:{name}`          | `{"enabled":bool}` and/or `{"recording_enabled":bool}`. |
-| POST | `/v1/streams/{application}:{name}/rotate-publish-key` | Returns the new raw key (only time, along with creation). |
-| POST | `/v1/streams/{application}:{name}/playback-token`     | `{"ttl_seconds":N}` (default 3600) → `{"token":...,"expires_at":...}`. |
 | GET  | `/v1/streams/{application}:{name}/status`   | Requires a `StreamRegistry`/`LiveFanout` to be wired via `set_registry`/`set_fanout`; 503 otherwise (see Known limitations). |
 | GET  | `/v1/streams/{application}:{name}/viewers`  | Same payload as `status` (viewer_count is part of it). |
 | POST | `/v1/streams/{application}:{name}/disconnect-publisher` | Requires a `StreamRegistry`; 503 otherwise. |

@@ -76,6 +76,10 @@ int main(int argc, char** argv) {
             config.stream_key_prefix = parser.next_value(config.stream_key_prefix.c_str());
         } else if (parser.matches("--publish-key")) {
             config.publish_key = parser.next_value("");
+        } else if (parser.matches("--publish-name")) {
+            // Open-access production deployments publish by the same public
+            // name viewers use. Keep --publish-key as a compatibility alias.
+            config.publish_key = parser.next_value("");
         } else if (parser.matches("--playback-name")) {
             config.playback_name = parser.next_value("");
         } else if (parser.matches("--publishers")) {
@@ -112,9 +116,9 @@ int main(int argc, char** argv) {
 
     std::printf("rtmp_load_gen -> %s:%u app=%s key-prefix=%s\n", config.host.c_str(), config.port,
                 config.application.c_str(),
-                // Stream keys are publish secrets in this server's model, so
-                // even the operator-supplied prefix is printed redacted —
-                // the same rule the server's own logs follow.
+                // Synthetic multi-publisher mode can still use arbitrary
+                // generated identifiers; keep the prefix redacted so this
+                // diagnostic never exposes credentials in compatibility mode.
                 rtmp_server::observability::redact(config.stream_key_prefix).c_str());
     std::printf("publishers=%u viewers/publisher=%u duration=%llds ramp-up=%lldms\n", config.publishers,
                 config.viewers_per_publisher, static_cast<long long>(config.duration.count()),

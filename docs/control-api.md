@@ -1,5 +1,11 @@
 # Control API (Management API — Phase 8)
 
+> Deployment note: StreamForge now runs in open-access mode. The production
+> API does not expose publish-key rotation or playback-token endpoints, and
+> OBS publishes with the public stream name. The key/token primitives
+> documented below remain internal library history and are not required by
+> operators or viewers.
+
 ## Scope
 
 Phase 8 implements the **domain logic** behind the management API described

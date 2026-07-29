@@ -23,8 +23,9 @@ struct ScenarioConfig {
     // and its viewers use that same identifier so fan-out has a source.
     std::string stream_key_prefix = "loadtest-";
 
-    // Production single-stream mode: the publisher authenticates with the
-    // secret publish key while viewers request the public stream name.
+    // Production single-stream mode: the publisher supplies its RTMP publish
+    // argument while viewers request the public stream name. In the default
+    // open-access deployment these are the same public name.
     // When both are non-empty they are used verbatim and publishers must be
     // exactly 1. Empty values preserve the synthetic prefix+index mode used
     // by the test server and multi-publisher matrix.
