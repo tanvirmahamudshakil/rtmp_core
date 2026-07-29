@@ -36,6 +36,7 @@ struct EventLoopServices {
     protocol::commands::StreamKeyValidator key_validator;
     protocol::commands::StreamIdResolver stream_id_resolver;
     protocol::commands::PlaybackAuthorizer playback_authorizer;
+    protocol::commands::RecorderFactory recorder_factory;
     protocol::commands::ViewerLifecycleHandler viewer_attached_handler;
     protocol::commands::ViewerLifecycleHandler viewer_detached_handler;
     std::function<bool(std::string_view)> admit_connection;

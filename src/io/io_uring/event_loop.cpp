@@ -727,6 +727,7 @@ void IoUringEventLoop::start_rtmp_session(const std::shared_ptr<TcpConnection>& 
     deps.key_validator = services_.key_validator;
     deps.stream_id_resolver = services_.stream_id_resolver;
     deps.playback_authorizer = services_.playback_authorizer;
+    deps.recorder_factory = services_.recorder_factory;
     deps.viewer_attached_handler = services_.viewer_attached_handler;
     deps.viewer_detached_handler = services_.viewer_detached_handler;
     deps.client_ip = connection->client_ip();

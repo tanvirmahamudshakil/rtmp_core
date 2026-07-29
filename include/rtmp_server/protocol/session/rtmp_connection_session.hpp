@@ -56,6 +56,7 @@ public:
         commands::LiveFanout* live_fanout = nullptr;          // optional, not owned
         media::MediaIngest* media_ingest = nullptr;           // optional, not owned
         commands::RecorderSink* recorder = nullptr;           // optional, not owned
+        commands::RecorderFactory recorder_factory;           // optional; per-publish owned sink
         commands::StreamKeyValidator key_validator;           // optional; defaults to "always allow"
         commands::StreamIdResolver stream_id_resolver;         // optional; raw publish key -> public stream name
         commands::PlaybackAuthorizer playback_authorizer;      // optional; stream/token/IP playback gate

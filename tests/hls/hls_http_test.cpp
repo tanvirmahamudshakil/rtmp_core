@@ -74,8 +74,9 @@ TEST(HlsHttpTest, ServesSegmentsWithTheMpegTsContentType) {
     auto response = handler.handle(get("/hls/live/demo/segment-2.ts"));
     EXPECT_EQ(response.status, 200);
     EXPECT_EQ(response.content_type, "video/mp2t");
-    EXPECT_EQ(response.body.size(), 1024u);
-    EXPECT_EQ(static_cast<unsigned char>(response.body[0]), 0x47u);
+    EXPECT_EQ(response.payload_size(), 1024u);
+    ASSERT_FALSE(response.shared_body.empty());
+    EXPECT_EQ(static_cast<unsigned char>(response.shared_body.view()[0]), 0x47u);
 }
 
 TEST(HlsHttpTest, ServesTheMasterPlaylistWhenRenditionsAreDeclared) {
@@ -221,7 +222,7 @@ TEST(HlsHttpTest, ByteRangeRequestReturns206WithContentRange) {
     auto response = handler.handle(request);
 
     EXPECT_EQ(response.status, 206);
-    EXPECT_EQ(response.body.size(), 100u);
+    EXPECT_EQ(response.payload_size(), 100u);
     EXPECT_EQ(header_of(response, "Content-Range"), "bytes 100-199/1024");
 }
 
@@ -233,14 +234,14 @@ TEST(HlsHttpTest, OpenEndedAndSuffixRangesAreSupported) {
     open_ended.headers["range"] = "bytes=1000-";
     auto r1 = handler.handle(open_ended);
     EXPECT_EQ(r1.status, 206);
-    EXPECT_EQ(r1.body.size(), 24u);
+    EXPECT_EQ(r1.payload_size(), 24u);
     EXPECT_EQ(header_of(r1, "Content-Range"), "bytes 1000-1023/1024");
 
     auto suffix = get("/hls/live/demo/segment-0.ts");
     suffix.headers["range"] = "bytes=-50";
     auto r2 = handler.handle(suffix);
     EXPECT_EQ(r2.status, 206);
-    EXPECT_EQ(r2.body.size(), 50u);
+    EXPECT_EQ(r2.payload_size(), 50u);
     EXPECT_EQ(header_of(r2, "Content-Range"), "bytes 974-1023/1024");
 }
 
@@ -402,7 +403,7 @@ TEST(HlsHttpTest, ManyConcurrentViewersFetchPlaylistsAndSegmentsSafely) {
                 // 200 (still retained) or 404 (evicted) are both correct;
                 // anything else, or a wrong-sized body, is not.
                 if (segment.status == 200) {
-                    if (segment.body.size() != 1024) bad_responses++;
+                    if (segment.payload_size() != 1024) bad_responses++;
                 } else if (segment.status != 404) {
                     bad_responses++;
                 }

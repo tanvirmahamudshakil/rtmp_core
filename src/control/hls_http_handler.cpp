@@ -236,7 +236,6 @@ HttpResponse HlsHttpHandler::serve_segment(const HttpRequest& request, const Str
     }
 
     const auto view = segment->data.view();
-    const auto* bytes = reinterpret_cast<const char*>(view.data());
     const std::size_t size = view.size();
 
     const auto range_header = request.headers.find("range");
@@ -251,7 +250,9 @@ HttpResponse HlsHttpHandler::serve_segment(const HttpRequest& request, const Str
             HttpResponse response;
             response.status = 206;
             response.content_type = kContentTypeMpegTs;
-            response.body.assign(bytes + start, end - start + 1);
+            response.shared_body = segment->data;
+            response.shared_body_offset = start;
+            response.shared_body_length = end - start + 1;
             decorate(response, options_.segment_cache_control);
             response.headers["Content-Range"] =
                 "bytes " + std::to_string(start) + "-" + std::to_string(end) + "/" + std::to_string(size);
@@ -268,9 +269,8 @@ HttpResponse HlsHttpHandler::serve_segment(const HttpRequest& request, const Str
     HttpResponse response;
     response.status = 200;
     response.content_type = kContentTypeMpegTs;
-    // One copy into the response buffer; the stored segment bytes themselves
-    // are shared and never duplicated per viewer.
-    response.body.assign(bytes, size);
+    response.shared_body = segment->data;
+    response.shared_body_length = size;
     decorate(response, options_.segment_cache_control);
     return response;
 }
@@ -358,8 +358,11 @@ HttpResponse HlsHttpHandler::handle(const HttpRequest& request) {
     // is computed from body.size() by the server, so we record it explicitly
     // before clearing.
     if (request.method == "HEAD") {
-        response.headers["Content-Length"] = std::to_string(response.body.size());
+        response.headers["Content-Length"] = std::to_string(response.payload_size());
         response.body.clear();
+        response.shared_body = {};
+        response.shared_body_offset = 0;
+        response.shared_body_length = 0;
     }
     return response;
 }

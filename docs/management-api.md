@@ -51,9 +51,9 @@ could still vendor a library if the endpoint surface grows.
 | GET  | `/metrics`                                  | Open. Prometheus-text-ish `name value` lines from `observability::Metrics`. |
 | POST | `/v1/applications`                          | `{"name":"..."}` |
 | GET  | `/v1/applications`                          | Paginated. |
-| POST | `/v1/streams`                               | `{"application":"...","name":"...","recording_enabled":bool}`. Response includes one universal `rtmp_url` for input and output. |
+| POST | `/v1/streams`                               | `{"application":"...","name":"...","recording_enabled":bool}`. Response includes `rtmp_url` plus the scalable viewer `hls_path`. |
 | GET  | `/v1/streams?application=...`               | Paginated by `application` query param (required). |
-| GET  | `/v1/streams/{application}:{name}`          | Includes the universal `rtmp_url`; never includes a secret key. |
+| GET  | `/v1/streams/{application}:{name}`          | Includes `rtmp_url` and `hls_path`; never includes a secret key. |
 | PATCH| `/v1/streams/{application}:{name}`          | `{"enabled":bool}` and/or `{"recording_enabled":bool}`. |
 | DELETE| `/v1/streams/{application}:{name}`         | Permanently removes the stream and disconnects its active publisher/viewers. |
 | GET  | `/v1/streams/{application}:{name}/status`   | Requires a `StreamRegistry`/`LiveFanout` to be wired via `set_registry`/`set_fanout`; 503 otherwise (see Known limitations). |

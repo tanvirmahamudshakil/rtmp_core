@@ -44,6 +44,7 @@ type Page = "overview" | "streams" | "applications" | "capacity" | "system";
 type Notice = { type: "success" | "error"; message: string } | null;
 
 const EMPTY_SNAPSHOT: Snapshot = { applications: [], streams: [], metrics: {}, health: "offline" };
+const absoluteUrl = (path: string) => new URL(path, window.location.origin).toString();
 const pageTitles: Record<Page, { title: string; subtitle: string }> = {
   overview: { title: "Overview", subtitle: "Your live service at a glance" },
   streams: { title: "Streams", subtitle: "Create and monitor every stream" },
@@ -402,6 +403,7 @@ function StreamTable({
               <td>
                 <div className="row-actions">
                   <IconButton label="Copy universal RTMP URL" onClick={() => copyText(stream.rtmp_url)}><Copy size={16} /></IconButton>
+                  <IconButton label="Copy smooth HLS playback URL" onClick={() => copyText(absoluteUrl(stream.hls_path))}><ArrowDownToLine size={16} /></IconButton>
                   {!compactMode && <IconButton label={stream.enabled ? "Disable stream" : "Enable stream"} onClick={() => onAction(stream, "toggle")}><SlidersHorizontal size={16} /></IconButton>}
                   <IconButton label="More stream actions" onClick={() => onAction(stream, "more")}><MoreHorizontal size={17} /></IconButton>
                 </div>
@@ -790,9 +792,10 @@ function App() {
         />
       )}
       {setup && (
-        <Modal title={setup.title} description="Use this same RTMP link for both publisher input and viewer output. No token is required." onClose={() => setSetup(null)} wide>
+        <Modal title={setup.title} description="Publish through RTMP. For many viewers, use the segmented HLS playback link. Neither link requires a token." onClose={() => setSetup(null)} wide>
           <div className="setup-fields">
-            <CopyField label="Universal RTMP URL" value={setup.data.rtmp_url} />
+            <CopyField label="RTMP input / direct playback" value={setup.data.rtmp_url} />
+            <CopyField label="Smooth segmented playback (recommended)" value={absoluteUrl(setup.data.hls_path)} />
           </div>
           <div className="modal-actions"><button className="primary-button" onClick={() => setSetup(null)}>Done</button></div>
         </Modal>

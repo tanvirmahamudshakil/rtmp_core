@@ -62,6 +62,7 @@ RtmpConnectionSession::RtmpConnectionSession(std::uint64_t connection_id, Depend
                         deps.stream_id_registry) {
     if (deps.media_ingest != nullptr) command_session_.set_media_ingest(deps.media_ingest);
     if (deps.recorder != nullptr) command_session_.set_recorder(deps.recorder);
+    if (deps.recorder_factory) command_session_.set_recorder_factory(std::move(deps.recorder_factory));
     if (deps.live_fanout != nullptr) command_session_.set_live_fanout(deps.live_fanout);
     if (deps.stream_id_resolver) command_session_.set_stream_id_resolver(std::move(deps.stream_id_resolver));
     if (deps.playback_authorizer) command_session_.set_playback_authorizer(std::move(deps.playback_authorizer));

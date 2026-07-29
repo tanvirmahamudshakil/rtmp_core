@@ -90,6 +90,7 @@ TEST(ManagementApiTest, CreateStreamReturnsOneUniversalRtmpUrl) {
     EXPECT_EQ(create.body.find("publish_url"), std::string::npos);
     EXPECT_EQ(create.body.find("playback_url"), std::string::npos);
     EXPECT_NE(create.body.find(R"("rtmp_url":"rtmp://localhost:1935/live/alpha")"), std::string::npos);
+    EXPECT_NE(create.body.find(R"("hls_path":"/hls/live/alpha/index.m3u8")"), std::string::npos);
     EXPECT_EQ(create.body.find(R"("stream":)"), std::string::npos);
 
     auto get = api.handle(authed("GET", "/v1/streams/live:alpha"));

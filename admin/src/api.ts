@@ -9,6 +9,7 @@ export type Stream = {
   enabled: boolean;
   recording_enabled: boolean;
   rtmp_url: string;
+  hls_path: string;
   is_live?: boolean;
   viewer_count?: number;
 };
@@ -43,11 +44,11 @@ const demoApps: Application[] = [
 const demoRtmpUrl = (application: string, name: string) => `rtmp://stream.example.com:1935/${application}/${name}`;
 
 let demoStreams: Stream[] = [
-  { application: "live", name: "main-stage", enabled: true, recording_enabled: true, rtmp_url: demoRtmpUrl("live", "main-stage"), is_live: true, viewer_count: 3842 },
-  { application: "live", name: "sports-east", enabled: true, recording_enabled: false, rtmp_url: demoRtmpUrl("live", "sports-east"), is_live: true, viewer_count: 1947 },
-  { application: "events", name: "conference-a", enabled: true, recording_enabled: true, rtmp_url: demoRtmpUrl("events", "conference-a"), is_live: true, viewer_count: 826 },
-  { application: "events", name: "studio-feed", enabled: true, recording_enabled: false, rtmp_url: demoRtmpUrl("events", "studio-feed"), is_live: false, viewer_count: 0 },
-  { application: "backup", name: "disaster-recovery", enabled: false, recording_enabled: false, rtmp_url: demoRtmpUrl("backup", "disaster-recovery"), is_live: false, viewer_count: 0 }
+  { application: "live", name: "main-stage", enabled: true, recording_enabled: true, rtmp_url: demoRtmpUrl("live", "main-stage"), hls_path: "/hls/live/main-stage/index.m3u8", is_live: true, viewer_count: 3842 },
+  { application: "live", name: "sports-east", enabled: true, recording_enabled: false, rtmp_url: demoRtmpUrl("live", "sports-east"), hls_path: "/hls/live/sports-east/index.m3u8", is_live: true, viewer_count: 1947 },
+  { application: "events", name: "conference-a", enabled: true, recording_enabled: true, rtmp_url: demoRtmpUrl("events", "conference-a"), hls_path: "/hls/events/conference-a/index.m3u8", is_live: true, viewer_count: 826 },
+  { application: "events", name: "studio-feed", enabled: true, recording_enabled: false, rtmp_url: demoRtmpUrl("events", "studio-feed"), hls_path: "/hls/events/studio-feed/index.m3u8", is_live: false, viewer_count: 0 },
+  { application: "backup", name: "disaster-recovery", enabled: false, recording_enabled: false, rtmp_url: demoRtmpUrl("backup", "disaster-recovery"), hls_path: "/hls/backup/disaster-recovery/index.m3u8", is_live: false, viewer_count: 0 }
 ];
 
 const demoMetrics: Record<string, number> = {
@@ -170,7 +171,7 @@ export class ControlClient {
   async createStream(application: string, name: string, recording: boolean): Promise<StreamSetup> {
     if (this.demo) {
       const rtmpUrl = demoRtmpUrl(application, name);
-      const stream = { application, name, enabled: true, recording_enabled: recording, rtmp_url: rtmpUrl, is_live: false, viewer_count: 0 };
+      const stream = { application, name, enabled: true, recording_enabled: recording, rtmp_url: rtmpUrl, hls_path: `/hls/${application}/${name}/index.m3u8`, is_live: false, viewer_count: 0 };
       demoStreams = [...demoStreams, stream];
       return stream;
     }

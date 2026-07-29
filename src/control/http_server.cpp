@@ -152,18 +152,35 @@ void write_response(int fd, const HttpResponse& response) {
     // would produce a duplicate header, which is a request-smuggling hazard,
     // so the handler's value wins.
     if (!response.headers.contains("Content-Length")) {
-        out += "Content-Length: " + std::to_string(response.body.size()) + "\r\n";
+        out += "Content-Length: " + std::to_string(response.payload_size()) + "\r\n";
     }
     out += "Connection: close\r\n";
     for (const auto& [k, v] : response.headers) out += k + ": " + v + "\r\n";
     out += "\r\n";
-    out += response.body;
 
-    std::size_t sent = 0;
-    while (sent < out.size()) {
-        ssize_t n = ::send(fd, out.data() + sent, out.size() - sent, 0);
-        if (n <= 0) return;
-        sent += static_cast<std::size_t>(n);
+    auto send_all = [fd](const char* data, std::size_t size) {
+        std::size_t sent = 0;
+        while (sent < size) {
+            ssize_t n = ::send(fd, data + sent, size - sent, 0);
+            if (n < 0 && errno == EINTR) continue;
+            if (n <= 0) return false;
+            sent += static_cast<std::size_t>(n);
+        }
+        return true;
+    };
+
+    if (!send_all(out.data(), out.size())) return;
+    if (!response.shared_body.empty()) {
+        const auto view = response.shared_body.view();
+        if (response.shared_body_offset > view.size() ||
+            response.shared_body_length > view.size() - response.shared_body_offset) {
+            return;
+        }
+        const auto* bytes =
+            reinterpret_cast<const char*>(view.data() + response.shared_body_offset);
+        static_cast<void>(send_all(bytes, response.shared_body_length));
+    } else {
+        static_cast<void>(send_all(response.body.data(), response.body.size()));
     }
 }
 

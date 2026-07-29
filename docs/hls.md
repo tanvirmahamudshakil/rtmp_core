@@ -159,9 +159,12 @@ by `find_segment()` keeps the bytes alive.
 
 Served by `control::HlsHttpHandler` through the **existing Phase 5
 `control::HttpServer`** — chained in front of the management API handler, so
-one bounded HTTP server serves both. No second HTTP stack was introduced, and
-the Phase 5 posture (bounded accept queue, bounded header/body sizes, fixed
-worker pool) is preserved unchanged.
+one bounded HTTP server serves both. Production wires Caddy's asynchronous
+public HTTP/TLS transport to this loopback service. Segment responses retain
+the store's `SharedBuffer` and write it separately from the HTTP headers, so
+the C++ layer does not deep-copy a segment into a viewer-specific response.
+No second C++ HTTP stack was introduced, and the Phase 5 posture (bounded
+accept queue, bounded header/body sizes, fixed worker pool) is preserved.
 
 Routes (GET/HEAD only):
 
@@ -170,6 +173,13 @@ Routes (GET/HEAD only):
 /hls/{application}/{stream}/index.m3u8    media playlist
 /hls/{application}/{stream}/{name}.ts     one segment
 ```
+
+The Linux production entry point creates one publisher-owned `hls::StreamSink`
+through `RecorderFactory` after publish authorization. Its default production
+target is 2 seconds with six advertised plus six grace segments and a 128 MiB
+per-stream hard cap. Publisher disconnect finalizes the trailing segment and
+marks the playlist ended; reconnect replaces the bounded store with a fresh
+media sequence.
 
 ### Content types
 

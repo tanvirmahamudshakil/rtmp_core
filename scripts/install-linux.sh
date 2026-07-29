@@ -498,8 +498,11 @@ Bitrate mode: $(if [[ "${BITRATE_MODE}" == "auto" ]]; then printf 'OBS/transcode
 Pre-live viewer safety ceiling: ${MAX_VIEWERS}
 Generated: $(date -u +%Y-%m-%dT%H:%M:%SZ)
 
-The admin panel and RTMP playback are open and require no access token.
-Each stream has one full RTMP URL used for both publisher input and viewer output.
+The admin panel, RTMP playback, and HLS playback are open and require no access token.
+Each stream has one RTMP URL for publisher input/direct RTMP playback:
+  rtmp://${PUBLIC_HOST}:1935/<application>/<stream>
+For scalable segmented playback in VLC/web players, use:
+  $(if [[ -n "${DOMAIN}" ]]; then printf 'https://%s' "${DOMAIN}"; else printf 'http://%s' "${PRIMARY_IP}"; fi)/hls/<application>/<stream>/index.m3u8
 EOF
 chmod 0600 "${CREDENTIALS}"
 
@@ -652,6 +655,11 @@ ${CADDY_SITE} {
         reverse_proxy 127.0.0.1:8080
     }
 
+    @hls path /hls/*
+    handle @hls {
+        reverse_proxy 127.0.0.1:8080
+    }
+
     handle {
         root * /var/www/streamforge
         try_files {path} /index.html
@@ -709,6 +717,8 @@ if [[ -n "${DOMAIN}" ]]; then ADMIN_URL="https://${DOMAIN}"; fi
 printf '\n\033[1;32mStreamForge installation complete.\033[0m\n'
 printf '  Admin panel:      %s\n' "${ADMIN_URL}"
 printf '  RTMP origin:      rtmp://%s:1935\n' "${PUBLIC_HOST}"
+printf '  RTMP stream:      rtmp://%s:1935/<application>/<stream>\n' "${PUBLIC_HOST}"
+printf '  HLS playback:     %s/hls/<application>/<stream>/index.m3u8 (no token)\n' "${ADMIN_URL}"
 printf '  Install mode:     %s\n' "$(if [[ "${FRESH_INSTALL}" == "1" ]]; then printf 'full clean install'; else printf 'in-place install'; fi)"
 printf '  Network device:   %s\n' "${PRIMARY_INTERFACE}"
 printf '  Link bandwidth:   %s Mbps — %s\n' "${BANDWIDTH_MBIT}" "${BANDWIDTH_SOURCE}"

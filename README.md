@@ -1,9 +1,10 @@
 # StreamForge RTMP Server
 
-A self-hosted C++23 RTMP origin for Linux, built on `io_uring`, with a direct
-web control plane. It accepts OBS/encoder publishing by public stream name,
-fans H.264/AAC RTMP media to viewers without playback credentials, persists
-application and stream configuration in SQLite, and exports Prometheus metrics.
+A self-hosted C++23 RTMP/HLS origin for Linux, built on `io_uring`, with a
+direct web control plane. It accepts OBS/encoder publishing by public stream
+name, fans H.264/AAC RTMP media directly, repackages the same ingest into
+cacheable MPEG-TS HLS segments without transcoding, persists application and
+stream configuration in SQLite, and exports Prometheus metrics.
 
 This deployment is designed for direct origin delivery. It does not require
 or configure a CDN.
@@ -79,28 +80,37 @@ After installation:
 1. Open the admin panel directly; no sign-in is required.
 2. Create an application such as `live`.
 3. Create a stream such as `main-stage`.
-4. Copy the stream's universal RTMP URL:
+4. Publish to the stream's RTMP URL:
 
    ```text
    rtmp://stream.example.com:1935/live/main-stage
    ```
 
-5. Use that exact URL as both the publisher destination and viewer source.
-   Clients such as ffmpeg accept it directly. If an encoder UI forces separate
+5. Direct RTMP players may use that same URL. For many viewers, use the
+   segmented playback URL shown by the panel:
+
+   ```text
+   https://stream.example.com/hls/live/main-stage/index.m3u8
+   ```
+
+   HLS segments are generated in C++ from the RTMP H.264/AAC ingest without
+   re-encoding and require no token. If an encoder UI forces separate
    fields, split the same URL at the final slash (`Server:
    rtmp://stream.example.com:1935/live`, `Stream Key: main-stage`); this does
    not create a second server-side URL.
 
 ## Capacity reality
 
-Direct delivery is bounded by the lowest of usable NIC bandwidth, CPU/kernel
+Delivery is bounded by the lowest of usable NIC bandwidth, CPU/kernel
 send cost, memory/socket queues, and packets per second. A 10 Gbps port cannot
 serve 10,000 viewers at 2.5 Mbps each: even before overhead that would require
 25 Gbps. The admin panel includes a no-CDN capacity calculator, and the repo
 includes `rtmp_load_gen` for measurement on the actual VPS. The playback hot
 path reuses one immutable RTMP wire buffer across matching viewers and uses
-capability-gated Linux SEND_ZC for large writes; see
-`docs/high-density-rtmp.md`.
+capability-gated Linux SEND_ZC for large writes. HLS keeps a bounded live
+window in RAM, shares immutable segment buffers across requests, and emits
+long-lived cache headers suitable for a CDN; see `docs/high-density-rtmp.md`
+and `docs/hls.md`.
 
 Examples with the installer's default 90% utilization and 5% overhead:
 

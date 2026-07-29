@@ -11,6 +11,8 @@
 #include <unordered_map>
 #include <vector>
 
+#include "rtmp_server/core/buffer.hpp"
+
 namespace rtmp_server::control {
 
 // A parsed HTTP/1.1 request. Deliberately minimal: no chunked
@@ -31,7 +33,16 @@ struct HttpResponse {
     int status = 200;
     std::string content_type = "application/json";
     std::string body;
+    // Immutable media payload shared by every response for the same segment.
+    // Offset/length allow byte ranges without copying into a new string.
+    core::SharedBuffer shared_body;
+    std::size_t shared_body_offset = 0;
+    std::size_t shared_body_length = 0;
     std::unordered_map<std::string, std::string> headers;
+
+    [[nodiscard]] std::size_t payload_size() const noexcept {
+        return shared_body.empty() ? body.size() : shared_body_length;
+    }
 
     static HttpResponse json(int status, std::string body_json) {
         HttpResponse r;

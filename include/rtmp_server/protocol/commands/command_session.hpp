@@ -56,6 +56,8 @@ using PlaybackAuthorizer =
     std::function<bool(std::string_view app, std::string_view name, std::string_view query, std::string_view client_ip)>;
 using ViewerLifecycleHandler =
     std::function<void(std::string_view app, std::string_view name)>;
+using RecorderFactory =
+    std::function<std::shared_ptr<RecorderSink>(std::string_view app, std::string_view stream)>;
 
 // Parsed view of one decoded AMF0 command message (type 20). Exposed
 // mainly for tests; CommandSession::handle_message() does this parsing
@@ -134,6 +136,7 @@ public:
     // stream is torn down (deleteStream or connection close), including on an
     // abrupt disconnect. See docs/flv-recording.md.
     void set_recorder(RecorderSink* recorder) { recorder_ = recorder; }
+    void set_recorder_factory(RecorderFactory factory) { recorder_factory_ = std::move(factory); }
 
     // Injects the Live Fanout hub (Phase 7). Optional and non-owning, same
     // pattern as set_recorder. If never set: `play` still succeeds (status
@@ -217,6 +220,7 @@ private:
         NetStreamState state = NetStreamState::Idle;
         std::string stream_key; // set once publish()/play() names it
         StreamId stream_id;     // resolved at publish()/play() time via stream_id_registry_
+        std::shared_ptr<RecorderSink> recorder;
     };
 
     // Called by PlaybackRelay to actually emit an audio/video/metadata
@@ -257,6 +261,7 @@ private:
     PublishStopHandler publish_stop_handler_;
     media::MediaIngest* media_ingest_ = nullptr;
     RecorderSink* recorder_ = nullptr;
+    RecorderFactory recorder_factory_;
     LiveFanout* live_fanout_ = nullptr;
     StreamIdResolver stream_id_resolver_;
     PlaybackAuthorizer playback_authorizer_;

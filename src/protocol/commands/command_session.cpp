@@ -253,7 +253,7 @@ void CommandSession::handle_playback_evicted(std::uint32_t message_stream_id) {
 }
 
 void CommandSession::route_media_message(const RtmpMessage& message) {
-    if (media_ingest_ == nullptr && recorder_ == nullptr && live_fanout_ == nullptr) return;
+    if (media_ingest_ == nullptr && recorder_ == nullptr && !recorder_factory_ && live_fanout_ == nullptr) return;
 
     auto it = streams_.find(message.message_stream_id);
     if (it == streams_.end() || it->second.state != NetStreamState::Publishing || it->second.stream_key.empty()) {
@@ -265,6 +265,7 @@ void CommandSession::route_media_message(const RtmpMessage& message) {
     }
 
     const std::string& stream_key = it->second.stream_key;
+    RecorderSink* recorder = it->second.recorder ? it->second.recorder.get() : recorder_;
     // One SharedMediaFrame construction per message (one copy out of the
     // decoder's buffer, same cost as constructing RtmpMessage today) shared
     // by value (refcounted, no further copies) with LiveFanout — see
@@ -273,17 +274,17 @@ void CommandSession::route_media_message(const RtmpMessage& message) {
     switch (static_cast<MessageTypeId>(message.message_type_id)) {
         case MessageTypeId::Audio:
             if (media_ingest_ != nullptr) media_ingest_->on_audio_message(stream_key, message);
-            if (recorder_ != nullptr) recorder_->on_audio(message);
+            if (recorder != nullptr) recorder->on_audio(message);
             if (live_fanout_ != nullptr) live_fanout_->on_audio(it->second.stream_id, frame);
             break;
         case MessageTypeId::Video:
             if (media_ingest_ != nullptr) media_ingest_->on_video_message(stream_key, message);
-            if (recorder_ != nullptr) recorder_->on_video(message);
+            if (recorder != nullptr) recorder->on_video(message);
             if (live_fanout_ != nullptr) live_fanout_->on_video(it->second.stream_id, frame);
             break;
         case MessageTypeId::Amf0Data:
             if (media_ingest_ != nullptr) media_ingest_->on_metadata_message(stream_key, message);
-            if (recorder_ != nullptr) recorder_->on_metadata(message);
+            if (recorder != nullptr) recorder->on_metadata(message);
             if (live_fanout_ != nullptr) live_fanout_->on_metadata(it->second.stream_id, frame);
             break;
         default:
@@ -396,6 +397,7 @@ void CommandSession::handle_publish(const Amf0Command& command, std::uint32_t me
     slot.state = NetStreamState::Publishing;
     slot.stream_key = canonical_id;
     slot.stream_id = stream_id_registry_->resolve(app_name_, canonical_id);
+    if (recorder_factory_) slot.recorder = recorder_factory_(app_name_, canonical_id);
 
     send_status(message_stream_id, "status", "NetStream.Publish.Start",
                  "Publishing " + stream_key + ".");
@@ -460,7 +462,8 @@ void CommandSession::handle_delete_stream(const Amf0Command& command) {
 
     if (it->second.state == NetStreamState::Publishing && !it->second.stream_key.empty()) {
         registry_.unregister_publisher(it->second.stream_key, connection_id_);
-        if (recorder_ != nullptr) recorder_->finalize();
+        if (it->second.recorder) it->second.recorder->finalize();
+        else if (recorder_ != nullptr) recorder_->finalize();
         if (live_fanout_ != nullptr) live_fanout_->publisher_stopped(it->second.stream_id);
         if (publish_stop_handler_) publish_stop_handler_(it->second.stream_key, connection_id_);
     } else if (it->second.state == NetStreamState::Playing && !it->second.stream_key.empty()) {
@@ -478,7 +481,8 @@ void CommandSession::on_connection_closed() {
     for (auto& [stream_id, slot] : streams_) {
         if (slot.state == NetStreamState::Publishing && !slot.stream_key.empty()) {
             registry_.unregister_publisher(slot.stream_key, connection_id_);
-            if (recorder_ != nullptr) recorder_->finalize();
+            if (slot.recorder) slot.recorder->finalize();
+            else if (recorder_ != nullptr) recorder_->finalize();
             if (live_fanout_ != nullptr) live_fanout_->publisher_stopped(slot.stream_id);
             if (publish_stop_handler_) publish_stop_handler_(slot.stream_key, connection_id_);
         } else if (slot.state == NetStreamState::Playing && !slot.stream_key.empty()) {

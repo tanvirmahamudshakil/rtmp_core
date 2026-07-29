@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <chrono>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
@@ -8,10 +9,12 @@
 #include <vector>
 
 #include "rtmp_server/authentication/rtmp_authenticator.hpp"
+#include "rtmp_server/control/hls_http_handler.hpp"
 #include "rtmp_server/control/http_server.hpp"
 #include "rtmp_server/control/management_api.hpp"
 #include "rtmp_server/core/config.hpp"
 #include "rtmp_server/io/io_uring/worker_pool.hpp"
+#include "rtmp_server/hls/stream_sink.hpp"
 #include "rtmp_server/management/stream_manager.hpp"
 #include "rtmp_server/observability/audit_log.hpp"
 #include "rtmp_server/observability/logger.hpp"
@@ -133,6 +136,32 @@ int main(int argc, char** argv) {
     // The publish argument is already the canonical public fan-out name.
     services.stream_id_resolver = {};
     services.playback_authorizer = authenticator.playback_authorizer();
+
+    // Per-publisher C++ HLS pipeline: H.264/AAC is repackaged (never
+    // transcoded) into bounded, immutable MPEG-TS segments. Each HTTP viewer
+    // shares the same segment bytes instead of allocating its own media copy.
+    rtmp_server::control::HlsHttpOptions hls_options;
+    hls_options.require_playback_token = false;
+    rtmp_server::control::HlsHttpHandler hls_handler(std::move(hls_options));
+    services.recorder_factory =
+        [&hls_handler](std::string_view application,
+                       std::string_view stream) -> std::shared_ptr<rtmp_server::protocol::commands::RecorderSink> {
+            rtmp_server::hls::SegmentStoreConfig store_config;
+            store_config.live_window_segments = 6;
+            store_config.retention_grace_segments = 6;
+            store_config.max_total_bytes = 128u * 1024u * 1024u;
+            store_config.target_duration_seconds = 2;
+            auto store = std::make_shared<rtmp_server::hls::SegmentStore>(store_config);
+
+            rtmp_server::hls::SegmenterConfig segmenter_config;
+            segmenter_config.target_duration = std::chrono::seconds(2);
+            segmenter_config.max_segment_duration = std::chrono::seconds(8);
+            segmenter_config.max_segment_bytes = 16u * 1024u * 1024u;
+
+            hls_handler.register_stream(std::string(application), std::string(stream), store);
+            return std::make_shared<rtmp_server::hls::StreamSink>(std::move(store),
+                                                                  std::move(segmenter_config));
+        };
     services.viewer_attached_handler =
         [&authenticator](std::string_view application, std::string_view stream_name) {
             authenticator.on_viewer_attached(application, stream_name);
@@ -160,6 +189,10 @@ int main(int argc, char** argv) {
     management_api.set_audit_log(&audit_log);
     management_api.set_metrics(&metrics);
     management_api.set_stream_id_registry(&stream_id_registry);
+    management_api.set_stream_deleted_handler(
+        [&hls_handler](std::string_view application, std::string_view stream) {
+            hls_handler.unregister_stream(std::string(application), std::string(stream));
+        });
     management_api.set_live_state_provider([&stream_manager, &stream_registry, &stream_id_registry, &pool] {
         std::vector<rtmp_server::management::LiveState> states;
         const auto registrations = stream_registry.snapshot();
@@ -182,10 +215,16 @@ int main(int argc, char** argv) {
         return states;
     });
 
-    rtmp_server::control::HttpServer api_server(
-        {config.api_bind_address, config.api_port, 256, 4, 1024, 16 * 1024, 128 * 1024});
-    api_server.set_handler([&management_api](const rtmp_server::control::HttpRequest& request) {
+    hls_handler.set_next([&management_api](const rtmp_server::control::HttpRequest& request) {
         return management_api.handle(request);
+    });
+    // Caddy drains these loopback responses and performs the public
+    // asynchronous client I/O. A larger bounded worker/queue budget keeps
+    // bursty segment boundaries from head-of-line blocking management calls.
+    rtmp_server::control::HttpServer api_server(
+        {config.api_bind_address, config.api_port, 1024, 16, 8192, 16 * 1024, 128 * 1024});
+    api_server.set_handler([&hls_handler](const rtmp_server::control::HttpRequest& request) {
+        return hls_handler.handle(request);
     });
     if (!api_server.start()) {
         std::fprintf(stderr, "failed to bind management API on %s:%u\n", config.api_bind_address.c_str(),

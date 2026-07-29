@@ -52,6 +52,7 @@ struct ManagementApiOptions {
 class ManagementApi {
 public:
     using LiveStateProvider = std::function<std::vector<management::LiveState>()>;
+    using StreamDeletedHandler = std::function<void(std::string_view application, std::string_view name)>;
 
     ManagementApi(management::StreamManager& manager, ManagementApiOptions options);
 
@@ -62,6 +63,9 @@ public:
     void set_fanout(protocol::commands::LiveFanout* fanout) { fanout_ = fanout; }
     void set_stream_id_registry(protocol::commands::StreamIdRegistry* stream_ids) { stream_ids_ = stream_ids; }
     void set_live_state_provider(LiveStateProvider provider) { live_state_provider_ = std::move(provider); }
+    void set_stream_deleted_handler(StreamDeletedHandler handler) {
+        stream_deleted_handler_ = std::move(handler);
+    }
 
     // Suitable for HttpServer::set_handler directly.
     [[nodiscard]] HttpResponse handle(const HttpRequest& request);
@@ -97,6 +101,7 @@ private:
     protocol::commands::LiveFanout* fanout_ = nullptr;
     protocol::commands::StreamIdRegistry* stream_ids_ = nullptr;
     LiveStateProvider live_state_provider_;
+    StreamDeletedHandler stream_deleted_handler_;
 
     struct FailureWindow {
         std::size_t count = 0;

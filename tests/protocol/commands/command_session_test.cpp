@@ -374,6 +374,37 @@ TEST_F(CommandSessionTest, MediaIsRoutedToRecorderWhilePublishingAndFinalizedOnC
     EXPECT_EQ(recorder.finalized, 1);
 }
 
+TEST_F(CommandSessionTest, RecorderFactoryOwnsOneSinkForTheCanonicalPublishedStream) {
+    std::shared_ptr<RecorderSpy> recorder;
+    auto session = make_session();
+    session.set_recorder_factory([&](std::string_view application, std::string_view stream) {
+        EXPECT_EQ(application, "live");
+        EXPECT_EQ(stream, "good-key");
+        recorder = std::make_shared<RecorderSpy>();
+        return recorder;
+    });
+
+    session.handle_message(make_command(0, {Amf0Value::string("connect"), Amf0Value::number(1),
+                                             Amf0Value::object({{"app", Amf0Value::string("live")}})}));
+    session.handle_message(
+        make_command(0, {Amf0Value::string("createStream"), Amf0Value::number(2), Amf0Value::null()}));
+    const auto stream_id = session.last_created_stream_id();
+    session.handle_message(make_command(stream_id, {Amf0Value::string("publish"), Amf0Value::number(0),
+                                                      Amf0Value::null(), Amf0Value::string("good-key"),
+                                                      Amf0Value::string("live")}));
+
+    ASSERT_NE(recorder, nullptr);
+    RtmpMessage video;
+    video.message_stream_id = stream_id;
+    video.message_type_id = static_cast<std::uint8_t>(MessageTypeId::Video);
+    video.payload = {static_cast<std::byte>(0x17)};
+    session.handle_message(video);
+    EXPECT_EQ(recorder->video, 1);
+
+    session.on_connection_closed();
+    EXPECT_EQ(recorder->finalized, 1);
+}
+
 RtmpMessage make_media(std::uint32_t stream_id, MessageTypeId type, std::vector<std::byte> payload,
                        std::uint32_t timestamp = 0) {
     RtmpMessage m;
