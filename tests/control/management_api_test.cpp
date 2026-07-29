@@ -131,6 +131,19 @@ TEST(ManagementApiTest, PatchDisablesAStream) {
     EXPECT_NE(patch.body.find("\"enabled\":false"), std::string::npos);
 }
 
+TEST(ManagementApiTest, DeleteStreamRemovesItPermanently) {
+    StreamManager manager(manager_options());
+    ManagementApi api(manager, api_options());
+    ASSERT_EQ(api.handle(authed("POST", "/v1/applications", R"({"name":"live"})")).status, 201);
+    ASSERT_EQ(api.handle(authed("POST", "/v1/streams", R"({"application":"live","name":"alpha"})")).status, 201);
+
+    auto removed = api.handle(authed("DELETE", "/v1/streams/live%3Aalpha"));
+    EXPECT_EQ(removed.status, 200);
+    EXPECT_NE(removed.body.find(R"("deleted":true)"), std::string::npos);
+    EXPECT_EQ(api.handle(authed("GET", "/v1/streams/live:alpha")).status, 404);
+    EXPECT_EQ(api.handle(authed("DELETE", "/v1/streams/live:alpha")).status, 404);
+}
+
 TEST(ManagementApiTest, PublishKeyRotationRouteIsNotExposedInOpenMode) {
     StreamManager manager(manager_options());
     ManagementApi api(manager, api_options());

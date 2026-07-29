@@ -80,6 +80,7 @@ private:
     [[nodiscard]] HttpResponse handle_get_stream(std::string_view application, std::string_view name);
     [[nodiscard]] HttpResponse handle_patch_stream(std::string_view application, std::string_view name,
                                                      const HttpRequest& request);
+    [[nodiscard]] HttpResponse handle_delete_stream(std::string_view application, std::string_view name);
     [[nodiscard]] HttpResponse handle_status(std::string_view application, std::string_view name);
     [[nodiscard]] HttpResponse handle_viewers(std::string_view application, std::string_view name);
     [[nodiscard]] HttpResponse handle_disconnect_publisher(std::string_view application, std::string_view name);

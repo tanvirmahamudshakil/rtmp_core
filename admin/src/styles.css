@@ -184,7 +184,7 @@ button:focus-visible, input:focus-visible, select:focus-visible {
 }
 .content { width: 100%; max-width: 1500px; margin: 0 auto; padding: 30px 34px 52px; }
 
-.primary-button, .secondary-button, .subtle-button, .icon-button {
+.primary-button, .secondary-button, .danger-button, .subtle-button, .icon-button {
   border: 0;
   cursor: pointer;
   display: inline-flex;
@@ -216,6 +216,17 @@ button:focus-visible, input:focus-visible, select:focus-visible {
   font-weight: 700;
 }
 .secondary-button:hover { background: #f8fafc; border-color: #c4ccd7; }
+.danger-button {
+  min-height: 40px;
+  padding: 0 16px;
+  color: #fff;
+  background: var(--danger);
+  border-radius: 9px;
+  font-size: 12px;
+  font-weight: 750;
+  box-shadow: 0 5px 14px rgba(217, 45, 79, .16);
+}
+.danger-button:hover { background: #b42345; transform: translateY(-1px); }
 .subtle-button { padding: 4px 0; color: var(--muted); background: transparent; font-size: 12px; font-weight: 700; }
 .subtle-button:hover { color: var(--accent); }
 .icon-button {
@@ -666,6 +677,22 @@ tbody tr:hover { background: #fcfcfd; }
 .action-menu strong { color: #344054; font-size: 12px; }
 .action-menu small { margin-top: 4px; color: var(--muted); font-size: 9px; }
 .action-menu .danger-action > span { color: var(--danger); background: #fff1f3; }
+.action-menu .danger-action strong { color: var(--danger); }
+.delete-warning {
+  margin: 20px 24px 0;
+  padding: 14px;
+  display: flex;
+  align-items: flex-start;
+  gap: 11px;
+  color: var(--danger);
+  background: #fff5f6;
+  border: 1px solid #ffd6dd;
+  border-radius: 10px;
+}
+.delete-warning svg { flex: none; margin-top: 1px; }
+.delete-warning strong, .delete-warning span { display: block; }
+.delete-warning strong { font-size: 12px; }
+.delete-warning span { margin-top: 4px; color: #7a3142; font-size: 10px; line-height: 1.5; }
 
 .toast {
   position: fixed;

@@ -30,6 +30,7 @@ import {
   Signal,
   SlidersHorizontal,
   SquareActivity,
+  Trash2,
   Unplug,
   Users,
   Video,
@@ -642,6 +643,7 @@ function App() {
   const [createType, setCreateType] = useState<"stream" | "application" | null>(null);
   const [setup, setSetup] = useState<{ title: string; data: StreamSetup } | null>(null);
   const [actionStream, setActionStream] = useState<Stream | null>(null);
+  const [pendingDelete, setPendingDelete] = useState<Stream | null>(null);
   const [bandwidth, setBandwidthState] = useState(() => Number(localStorage.getItem("streamforge-bandwidth")) || 10000);
   const [history, setHistory] = useState<number[]>(demo ? [5200, 5400, 5310, 5710, 5890, 6030, 6210, 6150, 6420, 6615] : []);
 
@@ -803,6 +805,26 @@ function App() {
               setActionStream(null);
               perform(() => client.patchStream(stream, { recording_enabled: !stream.recording_enabled }), `Recording policy ${stream.recording_enabled ? "disabled" : "requested"}.`);
             }}><span><FileVideo size={18} /></span><div><strong>{actionStream.recording_enabled ? "Disable" : "Request"} recording policy</strong><small>Persist the desired policy; runtime recording must also be enabled on the server</small></div><ChevronRight size={17} /></button>
+            <button className="danger-action" onClick={() => {
+              setPendingDelete(actionStream);
+              setActionStream(null);
+            }}><span><Trash2 size={18} /></span><div><strong>Delete stream permanently</strong><small>Disconnect its publisher and viewers, then remove it from the server</small></div><ChevronRight size={17} /></button>
+          </div>
+        </Modal>
+      )}
+      {pendingDelete && (
+        <Modal title={`Delete ${pendingDelete.name}?`} description={`${pendingDelete.application} / ${pendingDelete.name}`} onClose={() => setPendingDelete(null)}>
+          <div className="delete-warning">
+            <Trash2 size={21} />
+            <div><strong>This cannot be undone.</strong><span>The RTMP link will stop working immediately and any connected publisher or viewers will be disconnected.</span></div>
+          </div>
+          <div className="modal-actions">
+            <button className="secondary-button" onClick={() => setPendingDelete(null)}>Cancel</button>
+            <button className="danger-button" onClick={() => {
+              const stream = pendingDelete;
+              setPendingDelete(null);
+              perform(() => client.deleteStream(stream), "Stream deleted.");
+            }}><Trash2 size={17} /> Delete stream</button>
           </div>
         </Modal>
       )}

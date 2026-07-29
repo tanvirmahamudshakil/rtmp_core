@@ -272,6 +272,7 @@ HttpResponse ManagementApi::route(const HttpRequest& request, const std::string&
             auto [application, name] = split_stream_id(parts[2]);
             if (request.method == "GET") return handle_get_stream(application, name);
             if (request.method == "PATCH") return handle_patch_stream(application, name, request);
+            if (request.method == "DELETE") return handle_delete_stream(application, name);
         }
         if (parts.size() == 4 && request.method == "POST") {
             auto [application, name] = split_stream_id(parts[2]);
@@ -431,6 +432,33 @@ HttpResponse ManagementApi::handle_patch_stream(std::string_view application, st
     auto stream = manager_.find_stream(application, name);
     if (!stream) return HttpResponse::json(404, error_body("not_found", "no such stream", ""));
     return HttpResponse::json(200, stream_json(*stream));
+}
+
+HttpResponse ManagementApi::handle_delete_stream(std::string_view application, std::string_view name) {
+    if (!manager_.find_stream(application, name)) {
+        return HttpResponse::json(404, error_body("not_found", "no such stream", ""));
+    }
+
+    // Stop new sessions first. A live stream is then disconnected before its
+    // persistent definition is removed; disconnecting an already-idle stream
+    // naturally returns NotFound and is intentionally harmless here.
+    auto disabled = manager_.set_enabled(application, name, false);
+    if (!disabled.ok()) {
+        return HttpResponse::json(http_status_for(disabled.error().code()),
+                                  error_body("request_failed", disabled.error().message(), ""));
+    }
+    if (registry_ != nullptr) {
+        static_cast<void>(manager_.disconnect_viewers(application, name, *registry_));
+        static_cast<void>(manager_.disconnect_publisher(application, name, *registry_));
+    }
+
+    auto result = manager_.delete_stream(application, name);
+    audit("delete_stream", application, name, result.ok());
+    if (!result.ok()) {
+        return HttpResponse::json(http_status_for(result.error().code()),
+                                  error_body("request_failed", result.error().message(), ""));
+    }
+    return HttpResponse::json(200, R"({"deleted":true})");
 }
 
 HttpResponse ManagementApi::handle_status(std::string_view application, std::string_view name) {

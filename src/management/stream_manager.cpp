@@ -382,7 +382,11 @@ std::optional<std::string> StreamManager::resolve_live_key_locked(
     const protocol::commands::StreamRegistry& registry) const {
     for (const auto& reg : registry.snapshot()) {
         if (reg.app != application) continue;
-        if (core::constant_time_equals(core::sha256_hex(reg.stream_key), record.key_hash)) {
+        // Open production mode registers the public stream name directly.
+        // Retain the legacy hash comparison for optional authenticated
+        // embedders.
+        if (reg.stream_key == record.meta.name ||
+            core::constant_time_equals(core::sha256_hex(reg.stream_key), record.key_hash)) {
             return reg.stream_key;
         }
     }
@@ -403,7 +407,10 @@ core::Result<void> StreamManager::disconnect_publisher(std::string_view applicat
 
     for (const auto& reg : registry.snapshot()) {
         if (reg.app != application) continue;
-        if (!core::constant_time_equals(core::sha256_hex(reg.stream_key), stream_it->second.key_hash)) continue;
+        if (reg.stream_key != stream_it->second.meta.name &&
+            !core::constant_time_equals(core::sha256_hex(reg.stream_key), stream_it->second.key_hash)) {
+            continue;
+        }
         if (publisher_disconnect_handler_) publisher_disconnect_handler_(reg.connection_id);
         audit_locked("disconnect_publisher", application, name, true);
         count_locked("disconnect_publisher");
@@ -427,7 +434,10 @@ core::Result<void> StreamManager::disconnect_viewers(std::string_view applicatio
 
     for (const auto& reg : registry.snapshot()) {
         if (reg.app != application) continue;
-        if (!core::constant_time_equals(core::sha256_hex(reg.stream_key), stream_it->second.key_hash)) continue;
+        if (reg.stream_key != stream_it->second.meta.name &&
+            !core::constant_time_equals(core::sha256_hex(reg.stream_key), stream_it->second.key_hash)) {
+            continue;
+        }
         if (viewer_disconnect_handler_) viewer_disconnect_handler_(reg.stream_key);
         audit_locked("disconnect_viewers", application, name, true);
         count_locked("disconnect_viewers");

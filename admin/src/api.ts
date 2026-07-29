@@ -193,6 +193,19 @@ export class ControlClient {
     });
   }
 
+  async deleteStream(stream: Stream): Promise<void> {
+    if (this.demo) {
+      demoStreams = demoStreams.filter(
+        (item) => item.application !== stream.application || item.name !== stream.name
+      );
+      return;
+    }
+    await this.request<{ deleted: boolean }>(
+      `/v1/streams/${encodeURIComponent(`${stream.application}:${stream.name}`)}`,
+      { method: "DELETE" }
+    );
+  }
+
   async disconnect(stream: Stream, target: "publisher" | "viewers"): Promise<void> {
     if (this.demo) {
       demoStreams = demoStreams.map((item) =>
