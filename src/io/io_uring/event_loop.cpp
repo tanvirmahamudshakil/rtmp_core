@@ -8,6 +8,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -52,14 +53,14 @@ IoUringEventLoop::IoUringEventLoop(IoUringContext context, core::ServerConfig co
         // comment: the subscription hook can run while state.mutex is held).
         live_fanout_.set_forward_hook([this](protocol::commands::StreamId stream_id,
                                               const protocol::commands::SharedMediaFrame& frame, bool is_video,
-                                              bool is_audio, bool is_sticky) {
-            router_->forward(worker_id_, stream_id, frame, is_video, is_audio, is_sticky);
+                                              bool is_audio, bool is_sticky, bool is_keyframe) {
+            router_->forward(worker_id_, stream_id, frame, is_video, is_audio, is_sticky, is_keyframe);
         });
         live_fanout_.set_subscription_hook([this](protocol::commands::StreamId stream_id, int delta) {
             router_->note_subscription(worker_id_, stream_id, delta);
         });
         live_fanout_.set_stream_end_hook(
-            [this](protocol::commands::StreamId stream_id) { router_->on_stream_end(stream_id); });
+            [this](protocol::commands::StreamId stream_id) { router_->on_stream_end(worker_id_, stream_id); });
     }
 }
 
@@ -117,7 +118,7 @@ core::Result<void> IoUringEventLoop::run() {
     submit_accept();
     if (router_ != nullptr) submit_router_poll();
 
-    io_uring_cqe* cqes[64];
+    std::vector<io_uring_cqe*> cqes(std::max<std::uint32_t>(1, config_.completion_batch_size));
     while (true) {
         if (stopping_.load() && !shutdown_initiated_) {
             begin_shutdown();
@@ -140,7 +141,8 @@ core::Result<void> IoUringEventLoop::run() {
                      {{"errno", std::to_string(-submitted)}});
         }
 
-        unsigned count = ::io_uring_peek_batch_cqe(&context_.ring(), cqes, 64);
+        unsigned count =
+            ::io_uring_peek_batch_cqe(&context_.ring(), cqes.data(), static_cast<unsigned>(cqes.size()));
         for (unsigned i = 0; i < count; ++i) {
             io_uring_cqe* cqe = cqes[i];
             auto operation_id = ::io_uring_cqe_get_data64(cqe);
@@ -239,7 +241,9 @@ void IoUringEventLoop::handle_wakeup_completion(const OperationContext& /*op*/, 
 }
 
 void IoUringEventLoop::drain_router_frames() {
-    for (auto& queued : router_->drain(worker_id_)) {
+    // Bound work per wake so a publisher burst cannot starve socket CQEs on
+    // this worker. drain() re-signals its eventfd if frames remain.
+    for (auto& queued : router_->drain(worker_id_, 1024)) {
         switch (queued.kind) {
             case CrossWorkerRouter::FrameKind::Video:
                 live_fanout_.on_video(queued.stream_id, queued.frame, /*is_replayed=*/true);
@@ -249,6 +253,9 @@ void IoUringEventLoop::drain_router_frames() {
                 break;
             case CrossWorkerRouter::FrameKind::Metadata:
                 live_fanout_.on_metadata(queued.stream_id, queued.frame, /*is_replayed=*/true);
+                break;
+            case CrossWorkerRouter::FrameKind::StreamEnd:
+                live_fanout_.publisher_stopped(queued.stream_id, /*is_replayed=*/true);
                 break;
         }
     }
@@ -501,6 +508,23 @@ void IoUringEventLoop::handle_accept_completion(const OperationContext& /*op*/, 
     ::setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
     int keepalive = 1;
     ::setsockopt(client_fd, SOL_SOCKET, SO_KEEPALIVE, &keepalive, sizeof(keepalive));
+    // Keep per-viewer kernel memory bounded and surface a slow receiver to
+    // the application queue early enough for keyframe-aware shedding.
+    int send_buffer = 256 * 1024;
+    ::setsockopt(client_fd, SOL_SOCKET, SO_SNDBUF, &send_buffer, sizeof(send_buffer));
+#ifdef TCP_NOTSENT_LOWAT
+    std::uint32_t not_sent_low_watermark = 128 * 1024;
+    ::setsockopt(client_fd, IPPROTO_TCP, TCP_NOTSENT_LOWAT, &not_sent_low_watermark,
+                 sizeof(not_sent_low_watermark));
+#endif
+#ifdef TCP_KEEPIDLE
+    int keep_idle_seconds = 30;
+    int keep_interval_seconds = 10;
+    int keep_probe_count = 3;
+    ::setsockopt(client_fd, IPPROTO_TCP, TCP_KEEPIDLE, &keep_idle_seconds, sizeof(keep_idle_seconds));
+    ::setsockopt(client_fd, IPPROTO_TCP, TCP_KEEPINTVL, &keep_interval_seconds, sizeof(keep_interval_seconds));
+    ::setsockopt(client_fd, IPPROTO_TCP, TCP_KEEPCNT, &keep_probe_count, sizeof(keep_probe_count));
+#endif
 
     constexpr std::uint64_t kWorkerIdShift = 56;
     constexpr std::uint64_t kLocalIdMask = (std::uint64_t{1} << kWorkerIdShift) - 1;
@@ -508,8 +532,17 @@ void IoUringEventLoop::handle_accept_completion(const OperationContext& /*op*/, 
     const auto connection_id = ((static_cast<std::uint64_t>(worker_id_) + 1) << kWorkerIdShift) |
                                local_connection_id;
     auto generation = next_generation_++;
-    auto connection = std::make_shared<TcpConnection>(*this, core::FileDescriptor(client_fd),
-                                                        connection_id, generation, client_ip);
+    // The playback policy starts shedding frames at subscriber_queue_max_*.
+    // The transport gets one additional full RTMP-message worth of byte
+    // headroom (and a small command/control packet allowance) so framing
+    // overhead cannot trip the hard safety cap during a normal recovery.
+    const std::size_t max_write_queue_bytes =
+        static_cast<std::size_t>(config_.subscriber_queue_max_bytes) + config_.maximum_rtmp_message_size;
+    const std::size_t max_write_queue_packets =
+        static_cast<std::size_t>(config_.subscriber_queue_max_packets) + 64;
+    auto connection = std::make_shared<TcpConnection>(*this, core::FileDescriptor(client_fd), connection_id,
+                                                       generation, client_ip, max_write_queue_bytes,
+                                                       max_write_queue_packets);
     connections_.add(connection);
     if (metrics_ != nullptr) {
         if (!services_.admit_connection) metrics_->add(observability::MetricId::ActiveConnections, +1);
@@ -659,9 +692,10 @@ void IoUringEventLoop::start_rtmp_session(const std::shared_ptr<TcpConnection>& 
     // Playback backpressure (CommandSession::set_pending_bytes_provider)
     // reads this connection's actual queued-but-unsent byte count so a slow
     // viewer's queue growth is visible to the drop decision.
-    session->set_pending_bytes_provider([weak_connection]() -> std::size_t {
+    session->set_pending_queue_provider([weak_connection]() -> protocol::commands::QueueBacklog {
         auto conn = weak_connection.lock();
-        return conn ? conn->pending_write_bytes() : 0;
+        return conn ? protocol::commands::QueueBacklog{conn->pending_write_bytes(), conn->pending_write_packets()}
+                    : protocol::commands::QueueBacklog{};
     });
 
     protocol::session::RtmpConnectionSession* raw_session = session.get();
@@ -770,6 +804,14 @@ void IoUringEventLoop::handle_send_completion(const OperationContext& op, int re
                                          static_cast<std::uint64_t>(result));
         const std::uint64_t delta = connection->partial_send_count() - partials_before;
         if (delta > 0) metrics_->increment(observability::MetricId::PartialSendCount, delta);
+    }
+
+    if (!success) {
+        // A zero-length or failed send cannot make forward progress.
+        // Resubmitting the same buffer would otherwise spin the completion
+        // loop indefinitely and burn a worker core.
+        close_connection(connection);
+        return;
     }
 
     if (connection->is_open() && connection->has_pending_write()) {

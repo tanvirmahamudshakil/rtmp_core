@@ -19,12 +19,10 @@ namespace rtmp_server::protocol::commands {
 // Abstract hook a viewer's CommandSession implements so LiveFanout can push
 // media at it without depending on how the viewer actually delivers bytes.
 //
-// on_audio/on_video/on_metadata return false to mean "not delivered", but
-// LiveFanout itself no longer counts these returns for eviction — the
-// staged slow-viewer policy (ViewerQueue) decides eviction *before*
-// calling the sink at all (docs/v2_promot.md PHASE 3 "Implement slow-viewer
-// policy"). A false return here only means the transport-level write
-// itself failed; callers should still not throw or block.
+// on_audio/on_video/on_metadata return false to mean transport backpressure
+// prevented delivery. LiveFanout folds repeated false results into the
+// slow-viewer eviction lifecycle after callbacks return; a backed-up socket
+// therefore cannot remain subscribed forever while consuming fan-out CPU.
 //
 // Contract, unchanged from the prior revision: on_publisher_stopped() and
 // on_slow_client_evicted() are called *after* LiveFanout has already
@@ -111,7 +109,7 @@ public:
     // always holds the current init state for any future subscriber.
     using ForwardHook =
         std::function<void(StreamId stream_id, const SharedMediaFrame& frame, bool is_video, bool is_audio,
-                           bool is_sticky)>;
+                           bool is_sticky, bool is_keyframe)>;
     void set_forward_hook(ForwardHook hook) { forward_hook_ = std::move(hook); }
 
     // SubscriptionHook is invoked with delta=+1 from subscribe() and
@@ -149,7 +147,11 @@ public:
     // sequence headers, metadata) for the id. A subsequent publish under a
     // freshly-resolved StreamId (see StreamIdRegistry::forget) starts with
     // a clean cache — "stream end cleanup".
-    void publisher_stopped(StreamId stream_id);
+    // is_replayed is set only when a CrossWorkerRouter StreamEnd control
+    // reaches this worker. Replayed stops perform all local cleanup and
+    // viewer notification but do not invoke stream_end_hook_ again, avoiding
+    // an inter-worker rebroadcast loop.
+    void publisher_stopped(StreamId stream_id, bool is_replayed = false);
 
     [[nodiscard]] std::size_t subscriber_count(StreamId stream_id) const;
 
@@ -183,6 +185,7 @@ private:
     struct Subscriber {
         PlaybackSink* sink;
         ViewerQueue queue;
+        std::size_t consecutive_transport_drops = 0;
     };
 
     struct StreamState {
@@ -199,18 +202,22 @@ private:
     // One pending, already-decided callback to run outside any lock.
     struct PendingDelivery {
         enum class Kind : std::uint8_t { Audio, Video, Metadata, Evict };
+        std::uint64_t subscriber_id;
         PlaybackSink* sink;
         Kind kind;
         std::optional<SharedMediaFrame> resend_video_seq_header; // set only for DeliverResumed
         std::optional<SharedMediaFrame> resend_audio_seq_header; // set only for DeliverResumed
-        SharedMediaFrame frame; // unused for Evict
+        // Non-owning pointer to the one immutable frame shared by this whole
+        // dispatch. run_deliveries() is synchronous, so the caller's frame
+        // outlives every callback. This avoids one shared_ptr refcount RMW per
+        // viewer on the hottest fan-out path.
+        const SharedMediaFrame* frame; // null for Evict
     };
 
     // Looks up (or creates) the StreamState node for `id`. The returned
-    // reference is stable for the lifetime of the node (stored via
-    // unique_ptr in streams_), so callers may release streams_mutex_ before
-    // locking state.mutex.
-    StreamState& state_for(StreamId id);
+    // shared ownership keeps the node alive after streams_mutex_ is released,
+    // including across a concurrent publisher_stopped().
+    std::shared_ptr<StreamState> state_for(StreamId id);
 
     // Shared implementation for on_audio/on_video/on_metadata: takes the
     // already-locked StreamState, decides per-subscriber delivery via each
@@ -224,10 +231,11 @@ private:
     std::vector<PendingDelivery> dispatch_locked(StreamState& state, const SharedMediaFrame& frame, bool is_video,
                                                   bool is_audio, bool is_keyframe, StreamId stream_id);
 
-    void run_deliveries(std::vector<PendingDelivery> deliveries);
+    void run_deliveries(StreamId stream_id, const std::shared_ptr<StreamState>& state,
+                        std::vector<PendingDelivery> deliveries);
 
     mutable std::mutex streams_mutex_; // guards only insert/erase of StreamState nodes in streams_
-    std::unordered_map<std::uint64_t, std::unique_ptr<StreamState>> streams_; // key = StreamId::raw()
+    std::unordered_map<std::uint64_t, std::shared_ptr<StreamState>> streams_; // key = StreamId::raw()
     GopLimits gop_limits_;
     QueueLimits queue_limits_;
     std::size_t max_frames_waiting_for_keyframe_;

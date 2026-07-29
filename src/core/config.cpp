@@ -164,6 +164,11 @@ Result<void> ServerConfig::validate() const {
         return Error(ErrorCode::InvalidConfiguration, ErrorCategory::Configuration,
                       "ring_queue_depth must be positive");
     }
+    if (completion_batch_size == 0 || completion_batch_size > ring_queue_depth ||
+        submission_batch_size == 0 || submission_batch_size > ring_queue_depth) {
+        return Error(ErrorCode::InvalidConfiguration, ErrorCategory::Configuration,
+                      "completion/submission batch sizes must be positive and no larger than ring_queue_depth");
+    }
     if (max_worker_ring_count == 0) {
         return Error(ErrorCode::InvalidConfiguration, ErrorCategory::Configuration,
                       "max_worker_ring_count must be positive");

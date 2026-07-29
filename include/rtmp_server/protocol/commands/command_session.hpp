@@ -159,8 +159,16 @@ public:
     // drops. Used only to decide whether to drop a playback frame for a slow
     // viewer (docs/rtmp_promot.md Phase 7 "viewer backpressure"); publishing
     // and command traffic are unaffected.
+    using PendingQueueProvider = std::function<QueueBacklog()>;
+    void set_pending_queue_provider(PendingQueueProvider provider) { pending_queue_provider_ = std::move(provider); }
+
+    // Compatibility for embedders that can only expose a byte count.
     using PendingBytesProvider = std::function<std::size_t()>;
-    void set_pending_bytes_provider(PendingBytesProvider provider) { pending_bytes_provider_ = std::move(provider); }
+    void set_pending_bytes_provider(PendingBytesProvider provider) {
+        pending_queue_provider_ = [provider = std::move(provider)] {
+            return QueueBacklog{provider ? provider() : 0, 0};
+        };
+    }
 
     // Byte/packet budget for this connection's playback backlog, folded
     // into pending_bytes_provider_()'s real transport backlog via a
@@ -205,7 +213,8 @@ private:
     // backpressure byte-budget check. Returns false (message dropped) if the
     // budget is exceeded or there is no outgoing_handler_.
     bool deliver_playback_message(std::uint32_t message_stream_id, const SharedMediaFrame& frame, ViewerQueue& queue,
-                                   bool is_video);
+                                   bool is_video, const SharedMediaFrame* video_sequence_header,
+                                   const SharedMediaFrame* audio_sequence_header);
     // PlaybackRelay callbacks: the subscription in live_fanout_ is already
     // gone by the time these run (see PlaybackSink contract).
     void handle_playback_publisher_stopped(std::uint32_t message_stream_id);
@@ -242,7 +251,7 @@ private:
     ViewerLifecycleHandler viewer_attached_handler_;
     ViewerLifecycleHandler viewer_detached_handler_;
     std::string client_ip_;
-    PendingBytesProvider pending_bytes_provider_;
+    PendingQueueProvider pending_queue_provider_;
     QueueLimits playback_queue_limits_;
 
     bool connected_ = false;

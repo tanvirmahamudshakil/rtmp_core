@@ -37,7 +37,9 @@ enum class ConnectionState : std::uint8_t {
 class TcpConnection : public IAsyncTransport, public std::enable_shared_from_this<TcpConnection> {
 public:
     TcpConnection(io::io_uring::IoUringEventLoop& loop, core::FileDescriptor fd,
-                  std::uint64_t connection_id, std::uint64_t generation, std::string client_ip = {});
+                  std::uint64_t connection_id, std::uint64_t generation, std::string client_ip = {},
+                  std::size_t max_write_queue_bytes = 16 * 1024 * 1024,
+                  std::size_t max_write_queue_packets = 2048);
 
     void set_receive_handler(ReceiveHandler handler) override { receive_handler_ = std::move(handler); }
     void set_close_handler(CloseHandler handler) override { close_handler_ = std::move(handler); }
@@ -65,19 +67,18 @@ public:
         return !write_queue_.empty();
     }
 
-    // Total bytes currently queued but not yet confirmed sent — used by the
-    // RTMP session layer (CommandSession::set_pending_bytes_provider) to
-    // decide whether a slow playback viewer's next frame should be dropped
-    // rather than grown into an unbounded backlog (Phase 1 wiring; the
-    // queue itself becoming byte/packet bounded is a Phase 2/3 concern).
+    // Total bytes currently queued but not yet confirmed sent. Both accessors
+    // are O(1): this is sampled for every media frame of every viewer, so
+    // walking the deque here turns one slow socket into a CPU amplification
+    // problem under high fan-out.
     [[nodiscard]] std::size_t pending_write_bytes() const noexcept {
         std::lock_guard<std::mutex> lock(write_mutex_);
-        std::size_t total = 0;
-        for (const auto& buffer : write_queue_) total += buffer.size();
-        // Bytes of the front buffer already on the wire are no longer
-        // "pending", and counting them would overstate backpressure to the
-        // slow-viewer policy.
-        return total - std::min(total, front_offset_);
+        return queued_bytes_;
+    }
+
+    [[nodiscard]] std::size_t pending_write_packets() const noexcept {
+        std::lock_guard<std::mutex> lock(write_mutex_);
+        return write_queue_.size();
     }
 
     // Pops the next queued buffer for submission, or an empty SharedBuffer
@@ -134,6 +135,9 @@ private:
     mutable std::mutex write_mutex_;
     std::deque<core::SharedBuffer> write_queue_;
     std::size_t front_offset_ = 0; // bytes of write_queue_.front() already sent
+    std::size_t queued_bytes_ = 0; // unsent bytes across the entire deque
+    std::size_t max_write_queue_bytes_;
+    std::size_t max_write_queue_packets_;
     bool send_in_flight_ = false;
     std::atomic<std::uint64_t> partial_send_count_{0};
 

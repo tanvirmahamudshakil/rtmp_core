@@ -113,24 +113,92 @@ TEST(CrossWorkerRouterTest, StreamEndClearsSubscriptionBookkeeping) {
     CrossWorkerRouter router(2);
     StreamId stream = StreamId::next();
     router.note_subscription(1, stream, +1);
-    router.on_stream_end(stream);
+    router.on_stream_end(/*source_worker=*/0, stream);
 
     router.forward(0, stream, make_frame(), true, false);
-    EXPECT_TRUE(router.drain(1).empty());
+    auto drained = router.drain(1);
+    ASSERT_EQ(drained.size(), 1u);
+    EXPECT_EQ(drained.front().kind, CrossWorkerRouter::FrameKind::StreamEnd);
 }
 
-TEST(CrossWorkerRouterTest, DropsFramesWhenDestinationQueueIsFull) {
+TEST(CrossWorkerRouterTest, StreamEndIsBroadcastOnceAndPrioritized) {
+    CrossWorkerRouter router(3);
+    StreamId active = StreamId::next();
+    StreamId ended = StreamId::next();
+    router.note_subscription(1, active, +1);
+    router.forward(0, active, make_frame(1), true, false);
+
+    router.on_stream_end(/*source_worker=*/0, ended);
+    router.on_stream_end(/*source_worker=*/0, ended); // coalesced
+
+    EXPECT_TRUE(router.drain(0).empty());
+    auto worker_1 = router.drain(1);
+    ASSERT_EQ(worker_1.size(), 2u);
+    EXPECT_EQ(worker_1[0].kind, CrossWorkerRouter::FrameKind::StreamEnd);
+    EXPECT_EQ(worker_1[0].stream_id, ended);
+    EXPECT_EQ(worker_1[1].frame.timestamp, 1u);
+
+    auto worker_2 = router.drain(2);
+    ASSERT_EQ(worker_2.size(), 1u);
+    EXPECT_EQ(worker_2[0].kind, CrossWorkerRouter::FrameKind::StreamEnd);
+}
+
+TEST(CrossWorkerRouterTest, StickyStateIsCoalescedToTheLatestFrame) {
+    CrossWorkerRouter router(2);
+    StreamId stream = StreamId::next();
+
+    router.forward(0, stream, make_frame(1), true, false, true);
+    router.forward(0, stream, make_frame(2), true, false, true);
+
+    auto drained = router.drain(1);
+    ASSERT_EQ(drained.size(), 1u);
+    EXPECT_EQ(drained[0].frame.timestamp, 2u);
+    EXPECT_TRUE(drained[0].is_sticky);
+}
+
+TEST(CrossWorkerRouterTest, QueueOverflowDropsPartialGopAndResumesAtNextKeyframe) {
     CrossWorkerRouter router(2, /*max_queue_frames_per_worker=*/2);
     StreamId stream = StreamId::next();
     router.note_subscription(1, stream, +1);
 
-    router.forward(0, stream, make_frame(1), true, false);
+    router.forward(0, stream, make_frame(1), true, false, false, true);
     router.forward(0, stream, make_frame(2), true, false);
-    router.forward(0, stream, make_frame(3), true, false); // over capacity: dropped
+    router.forward(0, stream, make_frame(3), true, false); // overflow: whole partial GOP is shed
+    router.forward(0, stream, make_frame(4), false, true); // gated until a keyframe
+    EXPECT_TRUE(router.drain(1).empty());
 
+    router.forward(0, stream, make_frame(5), true, false, false, true);
+    router.forward(0, stream, make_frame(6), false, true);
     auto drained = router.drain(1);
     EXPECT_EQ(drained.size(), 2u);
-    EXPECT_EQ(router.dropped_frame_count(), 1u);
+    EXPECT_EQ(drained[0].frame.timestamp, 5u);
+    EXPECT_EQ(drained[1].frame.timestamp, 6u);
+    EXPECT_GE(router.dropped_frame_count(), 4u);
+}
+
+TEST(CrossWorkerRouterTest, ByteLimitBoundsFewHugeFrames) {
+    CrossWorkerRouter router(2, /*max_queue_frames_per_worker=*/100,
+                             /*max_queue_bytes_per_worker=*/3);
+    StreamId stream = StreamId::next();
+    router.note_subscription(1, stream, +1);
+
+    router.forward(0, stream, make_frame(1), true, false, false, true); // 2 bytes
+    router.forward(0, stream, make_frame(2), true, false); // would total 4; partial GOP shed
+
+    EXPECT_TRUE(router.drain(1).empty());
+    EXPECT_GT(router.dropped_frame_count(), 0u);
+}
+
+TEST(CrossWorkerRouterTest, BoundedDrainResignalsWhenFramesRemain) {
+    CrossWorkerRouter router(2);
+    StreamId stream = StreamId::next();
+    router.note_subscription(1, stream, +1);
+    router.forward(0, stream, make_frame(1), true, false);
+    router.forward(0, stream, make_frame(2), true, false);
+
+    EXPECT_EQ(router.drain(1, 1).size(), 1u);
+    EXPECT_TRUE(fd_is_readable(router.wake_fd(1)));
+    EXPECT_EQ(router.drain(1, 1).size(), 1u);
 }
 
 TEST(CrossWorkerRouterTest, DrainIsFifoAndClearsQueue) {

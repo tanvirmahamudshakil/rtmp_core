@@ -90,22 +90,40 @@ public:
     [[nodiscard]] SubscriberId subscriber_id() const noexcept { return subscriber_id_; }
 
     bool on_audio(const SharedMediaFrame& frame) override {
-        return owner_.deliver_playback_message(message_stream_id_, frame, queue_, /*is_video=*/false);
+        auto info = media::classify_audio_tag(frame.payload.view());
+        if (info && info->codec == media::AudioCodec::Aac &&
+            info->aac_packet_type == media::AacPacketType::SequenceHeader) {
+            audio_sequence_header_ = frame;
+        }
+        return deliver(frame, /*is_video=*/false);
     }
     bool on_video(const SharedMediaFrame& frame) override {
-        return owner_.deliver_playback_message(message_stream_id_, frame, queue_, /*is_video=*/true);
+        auto info = media::classify_video_tag(frame.payload.view());
+        if (info && info->codec == media::VideoCodec::Avc &&
+            info->avc_packet_type == media::AvcPacketType::SequenceHeader) {
+            video_sequence_header_ = frame;
+        }
+        return deliver(frame, /*is_video=*/true);
     }
     bool on_metadata(const SharedMediaFrame& frame) override {
-        return owner_.deliver_playback_message(message_stream_id_, frame, queue_, /*is_video=*/false);
+        return deliver(frame, /*is_video=*/false);
     }
     void on_publisher_stopped() override { owner_.handle_playback_publisher_stopped(message_stream_id_); }
     void on_slow_client_evicted() override { owner_.handle_playback_evicted(message_stream_id_); }
 
 private:
+    bool deliver(const SharedMediaFrame& frame, bool is_video) {
+        return owner_.deliver_playback_message(message_stream_id_, frame, queue_, is_video,
+                                               video_sequence_header_ ? &*video_sequence_header_ : nullptr,
+                                               audio_sequence_header_ ? &*audio_sequence_header_ : nullptr);
+    }
+
     CommandSession& owner_;
     std::uint32_t message_stream_id_;
     ViewerQueue queue_;
     SubscriberId subscriber_id_;
+    std::optional<SharedMediaFrame> video_sequence_header_;
+    std::optional<SharedMediaFrame> audio_sequence_header_;
 };
 
 CommandSession::~CommandSession() = default;
@@ -150,17 +168,22 @@ void CommandSession::handle_message(const RtmpMessage& message) {
 }
 
 bool CommandSession::deliver_playback_message(std::uint32_t message_stream_id, const SharedMediaFrame& frame,
-                                               ViewerQueue& queue, bool is_video) {
+                                               ViewerQueue& queue, bool is_video,
+                                               const SharedMediaFrame* video_sequence_header,
+                                               const SharedMediaFrame* audio_sequence_header) {
     if (!outgoing_handler_) return false;
 
     bool is_keyframe = false;
     if (is_video) {
         auto info = media::classify_video_tag(frame.payload.view());
-        is_keyframe = info && (info->frame_type == media::VideoFrameType::KeyFrame ||
-                                info->frame_type == media::VideoFrameType::GeneratedKeyFrame);
+        const bool key_type =
+            info && (info->frame_type == media::VideoFrameType::KeyFrame ||
+                     info->frame_type == media::VideoFrameType::GeneratedKeyFrame);
+        is_keyframe =
+            key_type && (info->codec != media::VideoCodec::Avc || info->avc_packet_type == media::AvcPacketType::Nalu);
     }
 
-    std::size_t pending = pending_bytes_provider_ ? pending_bytes_provider_() : 0;
+    QueueBacklog pending = pending_queue_provider_ ? pending_queue_provider_() : QueueBacklog{};
     auto decision = queue.offer(pending, frame.payload.size(), is_video, is_keyframe);
     // Evict is treated as a drop here rather than a hard disconnect: the
     // authoritative slow-viewer eviction lifecycle lives in LiveFanout
@@ -172,19 +195,32 @@ bool CommandSession::deliver_playback_message(std::uint32_t message_stream_id, c
     // gracefully instead of an unbounded flat-byte cliff.
     if (decision == ViewerQueue::Decision::DropAndWait || decision == ViewerQueue::Decision::Evict) return false;
 
-    RtmpMessage out = frame.to_message(kCommandChunkStreamId, message_stream_id);
-    switch (static_cast<MessageTypeId>(frame.message_type_id)) {
-        case MessageTypeId::Audio:
-            out.chunk_stream_id = kAudioChunkStreamId;
-            break;
-        case MessageTypeId::Video:
-            out.chunk_stream_id = kVideoChunkStreamId;
-            break;
-        default:
-            out.chunk_stream_id = kDataChunkStreamId;
-            break;
+    const auto emit = [&](const SharedMediaFrame& outgoing_frame) {
+        RtmpMessage out = outgoing_frame.to_message(kCommandChunkStreamId, message_stream_id);
+        switch (static_cast<MessageTypeId>(outgoing_frame.message_type_id)) {
+            case MessageTypeId::Audio:
+                out.chunk_stream_id = kAudioChunkStreamId;
+                break;
+            case MessageTypeId::Video:
+                out.chunk_stream_id = kVideoChunkStreamId;
+                break;
+            default:
+                out.chunk_stream_id = kDataChunkStreamId;
+                break;
+        }
+        outgoing_handler_(std::move(out));
+    };
+
+    if (decision == ViewerQueue::Decision::DeliverResumed) {
+        // Re-prime the decoder before the recovery keyframe. This is
+        // required after dropping an arbitrary number of frames while the
+        // socket drained; otherwise a reconnect-free recovery can show a
+        // frozen/green picture until the publisher happens to repeat SPS,
+        // PPS and AudioSpecificConfig.
+        if (video_sequence_header != nullptr) emit(*video_sequence_header);
+        if (audio_sequence_header != nullptr) emit(*audio_sequence_header);
     }
-    outgoing_handler_(std::move(out));
+    emit(frame);
     queue.note_flushed(frame.payload.size());
     return true;
 }

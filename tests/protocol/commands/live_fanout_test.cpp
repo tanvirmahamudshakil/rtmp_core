@@ -100,10 +100,7 @@ private:
     std::vector<Event> events_;
 };
 
-// Always reports delivery failure — irrelevant to LiveFanout's own eviction
-// decision now (that lives entirely in ViewerQueue, decided before the sink
-// is ever called), but kept to prove a failing sink doesn't itself crash
-// anything.
+// Simple successful sink used for callback counts.
 class CountingSink : public PlaybackSink {
 public:
     int audio = 0, video = 0, metadata = 0, publisher_stopped = 0, evicted = 0;
@@ -120,6 +117,26 @@ public:
         return true;
     }
     void on_publisher_stopped() override { ++publisher_stopped; }
+    void on_slow_client_evicted() override { ++evicted; }
+};
+
+class BackpressuredSink : public PlaybackSink {
+public:
+    int attempts = 0;
+    int evicted = 0;
+    bool on_audio(const SharedMediaFrame&) override {
+        ++attempts;
+        return false;
+    }
+    bool on_video(const SharedMediaFrame&) override {
+        ++attempts;
+        return false;
+    }
+    bool on_metadata(const SharedMediaFrame&) override {
+        ++attempts;
+        return false;
+    }
+    void on_publisher_stopped() override {}
     void on_slow_client_evicted() override { ++evicted; }
 };
 
@@ -279,6 +296,51 @@ TEST_F(LiveFanoutTest, SlowViewerRecoversAfterNextKeyframe) {
     EXPECT_EQ(fanout.subscriber_count(stream), 1u); // never evicted
 }
 
+TEST(ViewerQueueTest, RecoveryUsesByteAndPacketLowWatermarks) {
+    ViewerQueue queue(QueueLimits{/*max_bytes=*/100, /*max_packets=*/10},
+                      /*max_frames_waiting_for_keyframe=*/10);
+
+    EXPECT_EQ(queue.offer(QueueBacklog{/*bytes=*/101, /*packets=*/1}, 10, true, false),
+              ViewerQueue::Decision::DropAndWait);
+    EXPECT_EQ(queue.offer(QueueBacklog{/*bytes=*/90, /*packets=*/1}, 10, true, true),
+              ViewerQueue::Decision::DropAndWait);
+    EXPECT_EQ(queue.offer(QueueBacklog{/*bytes=*/50, /*packets=*/6}, 10, true, true),
+              ViewerQueue::Decision::DropAndWait);
+    EXPECT_EQ(queue.offer(QueueBacklog{/*bytes=*/50, /*packets=*/5}, 10, true, true),
+              ViewerQueue::Decision::DeliverResumed);
+}
+
+TEST(ViewerQueueTest, BackedUpKeyframesEventuallyEvictInsteadOfGrowingSawtooth) {
+    ViewerQueue queue(QueueLimits{/*max_bytes=*/100, /*max_packets=*/10},
+                      /*max_frames_waiting_for_keyframe=*/2);
+
+    EXPECT_EQ(queue.offer(QueueBacklog{/*bytes=*/101, /*packets=*/0}, 10, true, false),
+              ViewerQueue::Decision::DropAndWait);
+    EXPECT_EQ(queue.offer(QueueBacklog{/*bytes=*/101, /*packets=*/0}, 10, true, true),
+              ViewerQueue::Decision::DropAndWait);
+    EXPECT_EQ(queue.offer(QueueBacklog{/*bytes=*/101, /*packets=*/0}, 10, true, true),
+              ViewerQueue::Decision::DropAndWait);
+    EXPECT_EQ(queue.offer(QueueBacklog{/*bytes=*/101, /*packets=*/0}, 10, true, true),
+              ViewerQueue::Decision::Evict);
+}
+
+TEST_F(LiveFanoutTest, RepeatedTransportBackpressureEvictsOnlyTheSlowSubscriber) {
+    LiveFanout fanout(GopLimits{}, QueueLimits{/*max_bytes=*/0, /*max_packets=*/0},
+                       /*max_frames_waiting_for_keyframe=*/2);
+    BackpressuredSink slow;
+    CountingSink healthy;
+    fanout.subscribe(stream, SubscriberId::next(), &slow);
+    fanout.subscribe(stream, SubscriberId::next(), &healthy);
+
+    fanout.on_video(stream, frame_of(make_video(avc_keyframe())));
+    fanout.on_video(stream, frame_of(make_video(avc_interframe())));
+    fanout.on_video(stream, frame_of(make_video(avc_interframe())));
+
+    EXPECT_EQ(slow.evicted, 1);
+    EXPECT_EQ(fanout.subscriber_count(stream), 1u);
+    EXPECT_EQ(healthy.video, 3);
+}
+
 TEST_F(LiveFanoutTest, SlowViewerIsEvictedIfItNeverRecovers) {
     LiveFanout fanout(GopLimits{}, QueueLimits{/*max_bytes=*/1, /*max_packets=*/1000},
                        /*max_frames_waiting_for_keyframe=*/3);
@@ -370,6 +432,21 @@ TEST_F(LiveFanoutTest, StreamEndCleanupNotifiesSubscribersAndDropsState) {
     EXPECT_EQ(v1.publisher_stopped, 1);
     EXPECT_EQ(v2.publisher_stopped, 1);
     EXPECT_EQ(fanout.subscriber_count(stream), 0u);
+}
+
+TEST_F(LiveFanoutTest, ReplayedStreamEndCleansLocallyWithoutRebroadcastLoop) {
+    LiveFanout fanout;
+    CountingSink viewer;
+    int stream_end_broadcasts = 0;
+    fanout.set_stream_end_hook([&](StreamId) { ++stream_end_broadcasts; });
+    fanout.subscribe(stream, SubscriberId::next(), &viewer);
+    fanout.on_video(stream, frame_of(make_video(avc_keyframe())));
+
+    fanout.publisher_stopped(stream, /*is_replayed=*/true);
+
+    EXPECT_EQ(viewer.publisher_stopped, 1);
+    EXPECT_EQ(fanout.subscriber_count(stream), 0u);
+    EXPECT_EQ(stream_end_broadcasts, 0);
 }
 
 // A sink whose callback, if ever invoked while LiveFanout holds its

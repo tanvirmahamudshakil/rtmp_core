@@ -108,6 +108,10 @@ void RtmpConnectionSession::set_pending_bytes_provider(std::function<std::size_t
     command_session_.set_pending_bytes_provider(std::move(provider));
 }
 
+void RtmpConnectionSession::set_pending_queue_provider(std::function<commands::QueueBacklog()> provider) {
+    command_session_.set_pending_queue_provider(std::move(provider));
+}
+
 void RtmpConnectionSession::set_max_queued_playback_bytes(std::size_t bytes) {
     // Preserved for API compatibility: maps onto the new staged ViewerQueue
     // policy's byte cap, leaving its packet cap at the default (see

@@ -7,6 +7,7 @@
 #include <memory>
 #include <mutex>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "rtmp_server/core/file_descriptor.hpp"
@@ -44,19 +45,22 @@ class CrossWorkerRouter {
 public:
     using WorkerId = std::uint32_t;
 
-    enum class FrameKind : std::uint8_t { Video, Audio, Metadata };
+    enum class FrameKind : std::uint8_t { Video, Audio, Metadata, StreamEnd };
 
     struct QueuedFrame {
         StreamId stream_id;
         SharedMediaFrame frame;
         FrameKind kind;
+        bool is_sticky = false;
+        bool is_keyframe = false;
     };
 
     // `worker_count` must match the number of workers the caller will ever
     // pass as a `worker`/`source_worker` argument (workers are identified by
     // a dense [0, worker_count) index). `max_queue_frames_per_worker` bounds
     // each worker's inbound queue independently of any other worker's.
-    explicit CrossWorkerRouter(std::size_t worker_count, std::size_t max_queue_frames_per_worker = 4096);
+    explicit CrossWorkerRouter(std::size_t worker_count, std::size_t max_queue_frames_per_worker = 4096,
+                               std::size_t max_queue_bytes_per_worker = 32 * 1024 * 1024);
 
     CrossWorkerRouter(const CrossWorkerRouter&) = delete;
     CrossWorkerRouter& operator=(const CrossWorkerRouter&) = delete;
@@ -78,18 +82,21 @@ public:
     // worker than the publisher receives media it cannot decode because the
     // sequence header was sent before that worker had any subscriber.
     void forward(WorkerId source_worker, StreamId stream_id, const SharedMediaFrame& frame, bool is_video,
-                 bool is_audio, bool is_sticky = false);
+                 bool is_audio, bool is_sticky = false, bool is_keyframe = false);
 
-    // Bound to LiveFanout::set_stream_end_hook() on each worker's local
-    // LiveFanout; drops all per-worker subscriber-count bookkeeping for a
-    // stream whose cache was just torn down, so a later republish under a
-    // freshly-minted StreamId (see StreamIdRegistry::forget) starts clean.
+    // Bound to LiveFanout::set_stream_end_hook(). Purges queued media and
+    // sends a lightweight StreamEnd control to every other worker so their
+    // local viewers are notified and their GOP/header cache is discarded.
+    // The one-argument overload broadcasts to every worker and is retained
+    // for embedders/tests that do not track a source worker.
+    void on_stream_end(WorkerId source_worker, StreamId stream_id);
     void on_stream_end(StreamId stream_id);
 
     // Drains every frame currently queued for `worker` (FIFO). Must only be
     // called from that worker's own thread — typically once per completion-
     // loop iteration, after the worker's inbound wake eventfd fires.
-    [[nodiscard]] std::vector<QueuedFrame> drain(WorkerId worker);
+    [[nodiscard]] std::vector<QueuedFrame> drain(
+        WorkerId worker, std::size_t max_frames = static_cast<std::size_t>(-1));
 
     // Readable/pollable fd that becomes ready (via a byte written by
     // forward()) whenever a frame is pushed for `worker`. Owned by the
@@ -107,6 +114,9 @@ private:
     struct PerWorkerQueue {
         std::mutex mutex;
         std::deque<QueuedFrame> frames;
+        std::unordered_set<std::uint64_t> waiting_for_keyframe;
+        std::unordered_set<std::uint64_t> queued_stream_ends;
+        std::size_t queued_bytes = 0;
         core::FileDescriptor wake_fd;
     };
 
@@ -114,10 +124,12 @@ private:
     // per-worker counters inside an entry are plain std::atomic and read/
     // written without holding this mutex once the entry exists.
     std::mutex counts_mutex_;
-    std::unordered_map<std::uint64_t, std::vector<std::atomic<std::uint32_t>>> counts_; // key = StreamId::raw()
+    using SubscriberCounters = std::vector<std::atomic<std::uint32_t>>;
+    std::unordered_map<std::uint64_t, std::shared_ptr<SubscriberCounters>> counts_; // key = StreamId::raw()
 
     std::size_t worker_count_;
     std::size_t max_queue_frames_per_worker_;
+    std::size_t max_queue_bytes_per_worker_;
     std::vector<std::unique_ptr<PerWorkerQueue>> queues_;
     std::atomic<std::uint64_t> dropped_frames_{0};
 };

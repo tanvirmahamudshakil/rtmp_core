@@ -97,6 +97,24 @@ TEST(ServerConfigValidate, BaselineConfigIsValid) {
     EXPECT_TRUE(valid_config().validate().ok());
 }
 
+TEST(ServerConfigValidate, RejectsInvalidIoUringBatchSizes) {
+    auto cfg = valid_config();
+    cfg.completion_batch_size = 0;
+    EXPECT_FALSE(cfg.validate().ok());
+
+    cfg = valid_config();
+    cfg.completion_batch_size = cfg.ring_queue_depth + 1;
+    EXPECT_FALSE(cfg.validate().ok());
+
+    cfg = valid_config();
+    cfg.submission_batch_size = 0;
+    EXPECT_FALSE(cfg.validate().ok());
+
+    cfg = valid_config();
+    cfg.submission_batch_size = cfg.ring_queue_depth + 1;
+    EXPECT_FALSE(cfg.validate().ok());
+}
+
 TEST(ServerConfigValidate, RejectsSecretsShorterThanTheMinimum) {
     auto cfg = valid_config();
     cfg.token_signing_secret = std::string(kMinSecretLength - 1, 'a');

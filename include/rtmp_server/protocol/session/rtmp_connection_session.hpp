@@ -87,6 +87,7 @@ public:
     // used by CommandSession for playback backpressure (see
     // command_session.hpp set_pending_bytes_provider). Optional.
     void set_pending_bytes_provider(std::function<std::size_t()> provider);
+    void set_pending_queue_provider(std::function<commands::QueueBacklog()> provider);
     void set_max_queued_playback_bytes(std::size_t bytes);
 
     // Feeds a fragment of bytes read off the wire after the RTMP handshake
