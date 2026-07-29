@@ -32,3 +32,9 @@ target_link_libraries(rtmp_server_io_uring
 )
 
 target_compile_features(rtmp_server_io_uring PUBLIC cxx_std_23)
+
+if(RTMP_LIBURING_HAS_SEND_ZC)
+    target_compile_definitions(rtmp_server_io_uring PRIVATE RTMP_HAS_SEND_ZC=1)
+else()
+    message(STATUS "liburing SEND_ZC API unavailable; using ordinary async send")
+endif()

@@ -15,6 +15,8 @@
 //   --port P                    server port              (default 1935)
 //   --app A                     RTMP application         (default live)
 //   --key-prefix S              stream key prefix        (default loadtest-)
+//   --publish-key S             exact secret key, single-publisher production mode
+//   --playback-name S           exact public name paired with --publish-key
 //   --publishers N              publisher count          (default 1)
 //   --viewers N                 viewers per publisher    (default 100)
 //   --duration S                run length in seconds    (default 30)
@@ -29,9 +31,8 @@
 //   --publisher-reconnect S     reconnect every S seconds, 0=never (default 0)
 //   --tick MS                   poll/media granularity   (default 20)
 //
-// Exit status is 0 if the run completed with no corrupt payloads and at
-// least one viewer reached playback, 1 otherwise — so it is usable directly
-// as a CI/acceptance gate rather than needing a human to read the output.
+// Exit status is 0 only when every requested publisher and viewer reaches
+// streaming with zero corrupt payloads and zero client failures.
 
 #include <cstdio>
 #include <cstdlib>
@@ -73,6 +74,10 @@ int main(int argc, char** argv) {
             config.application = parser.next_value(config.application.c_str());
         } else if (parser.matches("--key-prefix")) {
             config.stream_key_prefix = parser.next_value(config.stream_key_prefix.c_str());
+        } else if (parser.matches("--publish-key")) {
+            config.publish_key = parser.next_value("");
+        } else if (parser.matches("--playback-name")) {
+            config.playback_name = parser.next_value("");
         } else if (parser.matches("--publishers")) {
             config.publishers = static_cast<std::uint32_t>(std::atoi(parser.next_value("1")));
         } else if (parser.matches("--viewers")) {
@@ -122,10 +127,17 @@ int main(int argc, char** argv) {
     const auto report = rtmp_server::loadgen::run_scenario(config);
     std::fputs(report.to_text().c_str(), stdout);
 
-    const bool healthy = report.payloads_corrupt == 0 && report.viewers_streaming > 0;
+    const bool healthy =
+        report.payloads_corrupt == 0 && report.clients_failed == 0 &&
+        report.publishers_streaming == report.publishers_requested &&
+        report.viewers_streaming == report.viewers_requested;
     if (!healthy) {
-        std::fprintf(stderr, "FAIL: corrupt_payloads=%llu viewers_streaming=%u\n",
-                     static_cast<unsigned long long>(report.payloads_corrupt), report.viewers_streaming);
+        std::fprintf(stderr,
+                     "FAIL: corrupt=%llu failed=%u publishers=%u/%u viewers=%u/%u\n",
+                     static_cast<unsigned long long>(report.payloads_corrupt),
+                     report.clients_failed, report.publishers_streaming,
+                     report.publishers_requested, report.viewers_streaming,
+                     report.viewers_requested);
     }
     return healthy ? EXIT_SUCCESS : EXIT_FAILURE;
 }

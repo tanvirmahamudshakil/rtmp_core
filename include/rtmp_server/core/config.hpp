@@ -59,7 +59,9 @@ struct ServerConfig {
     bool enable_multishot_recv = true;
     bool enable_registered_buffers = true;
     bool enable_provided_buffer_ring = true;
-    bool enable_send_zero_copy = false;
+    // Capability-gated and automatically falls back to ordinary io_uring
+    // send if the running kernel/NIC rejects SEND_ZC.
+    bool enable_send_zero_copy = true;
     bool enable_sqpoll = false;
     std::uint32_t sqpoll_idle_ms = 1000;
 

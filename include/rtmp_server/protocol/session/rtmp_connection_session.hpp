@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "rtmp_server/core/error.hpp"
+#include "rtmp_server/core/buffer.hpp"
 #include "rtmp_server/observability/metrics.hpp"
 #include "rtmp_server/protocol/chunk/chunk_decoder.hpp"
 #include "rtmp_server/protocol/chunk/chunk_encoder.hpp"
@@ -46,6 +47,7 @@ namespace rtmp_server::protocol::session {
 class RtmpConnectionSession {
 public:
     using OutgoingBytesHandler = std::function<void(std::vector<std::byte>)>;
+    using SharedOutgoingBytesHandler = std::function<void(core::SharedBuffer)>;
     using CloseHandler = std::function<void()>; // fatal protocol error -> caller should close the socket
 
     struct Dependencies {
@@ -70,6 +72,12 @@ public:
     RtmpConnectionSession& operator=(const RtmpConnectionSession&) = delete;
 
     void set_outgoing_handler(OutgoingBytesHandler handler) { outgoing_handler_ = std::move(handler); }
+    // Preferred transport path: immutable encoded buffers can be referenced
+    // by thousands of TcpConnection queues without duplicating their bytes.
+    // The vector handler remains for portable embedders/tests.
+    void set_shared_outgoing_handler(SharedOutgoingBytesHandler handler) {
+        shared_outgoing_handler_ = std::move(handler);
+    }
     void set_close_handler(CloseHandler handler) { close_handler_ = std::move(handler); }
 
     // Must be called once, after set_outgoing_handler(), before any bytes
@@ -115,6 +123,10 @@ private:
     void handle_decoded_message(chunk::RtmpMessage message);
     void handle_decode_error(core::Error error);
     void send_encoded(const chunk::RtmpMessage& message);
+    void send_encoded_media(const commands::SharedMediaFrame& frame,
+                            std::uint32_t chunk_stream_id,
+                            std::uint32_t message_stream_id);
+    void emit_encoded(std::vector<std::byte> bytes);
     void flush_pending_acknowledgement();
     void handle_user_control(const chunk::RtmpMessage& message);
     void fail(std::string_view reason);
@@ -125,6 +137,7 @@ private:
     std::uint32_t output_chunk_size_;
     commands::CommandSession command_session_;
     OutgoingBytesHandler outgoing_handler_;
+    SharedOutgoingBytesHandler shared_outgoing_handler_;
     CloseHandler close_handler_;
     std::vector<std::byte> out_scratch_;
     bool failed_ = false;

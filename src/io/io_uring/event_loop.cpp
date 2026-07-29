@@ -9,6 +9,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -47,6 +48,10 @@ IoUringEventLoop::IoUringEventLoop(IoUringContext context, core::ServerConfig co
       enable_reuseport_(enable_reuseport),
       services_(std::move(services)) {
     set_metrics(services_.metrics);
+#if defined(RTMP_HAS_SEND_ZC)
+    zero_copy_send_enabled_ =
+        config_.enable_send_zero_copy && context_.capabilities().send_zero_copy;
+#endif
     if (router_ != nullptr) {
         // Lightweight, non-reentrant hooks only — never call back into
         // LiveFanout from inside them (see live_fanout.hpp's dispatch_locked
@@ -125,7 +130,12 @@ core::Result<void> IoUringEventLoop::run() {
         }
 
         if (shutdown_initiated_) {
-            if (operations_.pending_count() == 0) {
+            std::size_t zero_copy_buffers_pending = 0;
+            {
+                std::lock_guard lock(zero_copy_buffers_mutex_);
+                zero_copy_buffers_pending = zero_copy_buffers_.size();
+            }
+            if (operations_.pending_count() == 0 && zero_copy_buffers_pending == 0) {
                 break;
             }
             if (std::chrono::steady_clock::now() >= shutdown_deadline_) {
@@ -318,12 +328,32 @@ void IoUringEventLoop::submit_send(std::shared_ptr<TcpConnection> connection) {
         return;
     }
     view = view.subspan(offset);
+    bool use_zero_copy = false;
+#if defined(RTMP_HAS_SEND_ZC)
+    use_zero_copy =
+        zero_copy_send_enabled_ && view.size() >= kZeroCopySendMinimumBytes;
+    if (use_zero_copy) {
+        ::io_uring_prep_send_zc(sqe, connection->fd(), view.data(), view.size(), 0,
+                                IORING_SEND_ZC_REPORT_USAGE);
+    } else {
+        ::io_uring_prep_send(sqe, connection->fd(), view.data(), view.size(), 0);
+    }
+#else
     ::io_uring_prep_send(sqe, connection->fd(), view.data(), view.size(), 0);
+#endif
 
     OperationContext ctx{OperationType::Send, 0, connection->connection_id(),
                           connection->generation(), connection, TimeoutPurpose::None};
+    ctx.zero_copy = use_zero_copy;
     auto id = operations_.create(std::move(ctx));
     ::io_uring_sqe_set_data64(sqe, id);
+    if (use_zero_copy) {
+        // TcpConnection may pop its queue entry after the ordinary send CQE.
+        // Keep an independent reference until IORING_CQE_F_NOTIF says the
+        // kernel no longer references the source memory.
+        std::lock_guard lock(zero_copy_buffers_mutex_);
+        zero_copy_buffers_.emplace(id, std::move(buffer));
+    }
 }
 
 void IoUringEventLoop::arm_idle_timeout(const std::shared_ptr<TcpConnection>& connection) {
@@ -418,7 +448,16 @@ void IoUringEventLoop::close_connection(const std::shared_ptr<TcpConnection>& co
 }
 
 void IoUringEventLoop::process_completion(std::uint64_t operation_id, int result, std::uint32_t flags) {
-    (void)flags;
+#if defined(RTMP_HAS_SEND_ZC)
+    if ((flags & IORING_CQE_F_NOTIF) != 0) {
+        // The ordinary SEND_ZC completion already advanced the connection
+        // queue. This second CQE exists solely to release source memory.
+        std::lock_guard lock(zero_copy_buffers_mutex_);
+        zero_copy_buffers_.erase(operation_id);
+        return;
+    }
+#endif
+
     auto maybe_ctx = operations_.take(operation_id);
     if (!maybe_ctx) {
         // Stale completion for an operation we already forgot about
@@ -426,6 +465,15 @@ void IoUringEventLoop::process_completion(std::uint64_t operation_id, int result
         return;
     }
     OperationContext ctx = std::move(*maybe_ctx);
+
+    // If no notification will follow, the kernel is already done with the
+    // source buffer at this completion.
+#if defined(RTMP_HAS_SEND_ZC)
+    if (ctx.zero_copy && (flags & IORING_CQE_F_MORE) == 0) {
+        std::lock_guard lock(zero_copy_buffers_mutex_);
+        zero_copy_buffers_.erase(operation_id);
+    }
+#endif
 
     if (ctx.type == OperationType::Accept) {
         pending_accept_operation_id_ = 0;
@@ -441,6 +489,25 @@ void IoUringEventLoop::process_completion(std::uint64_t operation_id, int result
             handle_receive_completion(ctx, result);
             break;
         case OperationType::Send:
+            if (ctx.zero_copy &&
+                (result == -EOPNOTSUPP || result == -EINVAL ||
+                 result == -ENOSYS || result == -ENOMEM)) {
+                // Opcode probing can succeed while a particular NIC/socket
+                // cannot honor zero-copy. Disable it once per worker and
+                // retry the untouched queue entry through ordinary send.
+                zero_copy_send_enabled_ = false;
+                if (!zero_copy_fallback_logged_) {
+                    zero_copy_fallback_logged_ = true;
+                    RTMP_LOG(LogLevel::Warn, "event_loop",
+                             "send_zero_copy_disabled_after_runtime_rejection",
+                             {{"errno", std::to_string(-result)}});
+                }
+                if (auto connection = ctx.connection.lock();
+                    connection && connection->is_open()) {
+                    submit_send(std::move(connection));
+                }
+                break;
+            }
             handle_send_completion(ctx, result);
             break;
         case OperationType::Timeout:
@@ -677,9 +744,9 @@ void IoUringEventLoop::start_rtmp_session(const std::shared_ptr<TcpConnection>& 
     // playback media) reach the socket through TcpConnection::async_write,
     // which itself queues and honours partial-send semantics (Phase 1 task
     // 7 / Phase 2 concern for partial-send correctness itself).
-    session->set_outgoing_handler([weak_connection](std::vector<std::byte> bytes) {
+    session->set_shared_outgoing_handler([weak_connection](core::SharedBuffer bytes) {
         if (auto conn = weak_connection.lock()) {
-            conn->async_write(core::SharedBuffer::adopt(std::move(bytes)));
+            conn->async_write(std::move(bytes));
         }
     });
 

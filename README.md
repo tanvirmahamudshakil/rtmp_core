@@ -99,7 +99,10 @@ Direct delivery is bounded by the lowest of usable NIC bandwidth, CPU/kernel
 send cost, memory/socket queues, and packets per second. A 10 Gbps port cannot
 serve 10,000 viewers at 2.5 Mbps each: even before overhead that would require
 25 Gbps. The admin panel includes a no-CDN capacity calculator, and the repo
-includes `rtmp_load_gen` for measurement on the actual VPS.
+includes `rtmp_load_gen` for measurement on the actual VPS. The playback hot
+path reuses one immutable RTMP wire buffer across matching viewers and uses
+capability-gated Linux SEND_ZC for large writes; see
+`docs/high-density-rtmp.md`.
 
 Examples with the installer's default 90% utilization and 5% overhead:
 

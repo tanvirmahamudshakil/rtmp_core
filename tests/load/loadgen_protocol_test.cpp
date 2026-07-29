@@ -60,6 +60,22 @@ namespace {
 
 using protocol::chunk::MessageTypeId;
 using protocol::chunk::RtmpMessage;
+
+TEST(LoadGenScenarioConfig, ProductionIdentityRequiresKeyNamePairAndOnePublisher) {
+    ScenarioConfig missing_name;
+    missing_name.publish_key = "secret-key";
+    auto first = run_scenario(missing_name);
+    EXPECT_GT(first.clients_failed, 0u);
+    ASSERT_FALSE(first.failure_reasons.empty());
+
+    ScenarioConfig multiple_publishers;
+    multiple_publishers.publish_key = "secret-key";
+    multiple_publishers.playback_name = "public-name";
+    multiple_publishers.publishers = 2;
+    auto second = run_scenario(multiple_publishers);
+    EXPECT_GT(second.clients_failed, 0u);
+    ASSERT_FALSE(second.failure_reasons.empty());
+}
 using protocol::handshake::HandshakeSession;
 
 // A peer that vanishes mid-write must not kill the process with SIGPIPE.

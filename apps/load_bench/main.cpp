@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -12,6 +13,7 @@
 #include "rtmp_server/protocol/commands/stream_registry.hpp"
 
 // load_bench [--streams N] [--viewers-per-stream M] [--frames F]
+//            [--payload-bytes B]
 //
 // In-process synthetic load test for the RTMP protocol/fan-out layer
 // (docs/rtmp_promot.md Phase 9 "load testing"). There is no real socket
@@ -52,6 +54,7 @@ struct Options {
     int streams = 4;
     int viewers_per_stream = 50;
     int frames = 1000;
+    int payload_bytes = 16 * 1024;
 };
 
 Options parse_options(int argc, char** argv) {
@@ -64,6 +67,7 @@ Options parse_options(int argc, char** argv) {
         if (std::strcmp(argv[i], "--streams") == 0) opts.streams = next_int(opts.streams);
         else if (std::strcmp(argv[i], "--viewers-per-stream") == 0) opts.viewers_per_stream = next_int(opts.viewers_per_stream);
         else if (std::strcmp(argv[i], "--frames") == 0) opts.frames = next_int(opts.frames);
+        else if (std::strcmp(argv[i], "--payload-bytes") == 0) opts.payload_bytes = next_int(opts.payload_bytes);
     }
     return opts;
 }
@@ -72,8 +76,8 @@ Options parse_options(int argc, char** argv) {
 
 int main(int argc, char** argv) {
     Options opts = parse_options(argc, argv);
-    std::printf("load_bench: streams=%d viewers_per_stream=%d frames=%d\n", opts.streams, opts.viewers_per_stream,
-                opts.frames);
+    std::printf("load_bench: streams=%d viewers_per_stream=%d frames=%d payload_bytes=%d\n",
+                opts.streams, opts.viewers_per_stream, opts.frames, opts.payload_bytes);
 
     StreamRegistry registry;
     LiveFanout fanout;
@@ -83,6 +87,7 @@ int main(int argc, char** argv) {
     std::vector<std::unique_ptr<CommandSession>> viewers;
     std::vector<std::uint32_t> publisher_stream_ids;
     std::uint64_t delivered_messages = 0;
+    std::uint64_t delivered_wire_bytes = 0;
     std::uint64_t next_connection_id = 1;
 
     for (int s = 0; s < opts.streams; ++s) {
@@ -104,6 +109,14 @@ int main(int argc, char** argv) {
         for (int v = 0; v < opts.viewers_per_stream; ++v) {
             auto viewer = std::make_unique<CommandSession>(next_connection_id++, registry, always_ok);
             viewer->set_outgoing_handler([&delivered_messages](RtmpMessage) { ++delivered_messages; });
+            viewer->set_media_outgoing_handler(
+                [&delivered_messages, &delivered_wire_bytes](
+                    const rtmp_server::protocol::commands::SharedMediaFrame& frame,
+                    std::uint32_t chunk_stream_id, std::uint32_t message_stream_id) {
+                    auto wire = frame.wire_bytes(4096, chunk_stream_id, message_stream_id);
+                    delivered_wire_bytes += wire.size();
+                    ++delivered_messages;
+                });
             viewer->set_live_fanout(&fanout);
             viewer->handle_message(make_command(
                 0, {Amf0Value::string("connect"), Amf0Value::number(1), Amf0Value::object({{"app", Amf0Value::string("live")}})}));
@@ -123,7 +136,10 @@ int main(int argc, char** argv) {
         RtmpMessage video;
         video.message_type_id = static_cast<std::uint8_t>(MessageTypeId::Video);
         video.timestamp = static_cast<std::uint32_t>(f * 33);
-        video.payload = {static_cast<std::byte>(keyframe ? 0x17 : 0x27), static_cast<std::byte>(0x01)};
+        video.payload.assign(static_cast<std::size_t>(std::max(opts.payload_bytes, 2)),
+                             static_cast<std::byte>(f & 0xFF));
+        video.payload[0] = static_cast<std::byte>(keyframe ? 0x17 : 0x27);
+        video.payload[1] = std::byte{0x01};
         for (std::size_t s = 0; s < publishers.size(); ++s) {
             video.message_stream_id = publisher_stream_ids[s];
             publishers[s]->handle_message(video);
@@ -136,5 +152,7 @@ int main(int argc, char** argv) {
 
     std::printf("delivered %llu viewer messages in %.3fs (%.0f messages/sec)\n",
                 static_cast<unsigned long long>(delivered_messages), seconds, fps);
+    std::printf("logical viewer egress %.2f GiB; media wire buffers encoded once and shared\n",
+                static_cast<double>(delivered_wire_bytes) / (1024.0 * 1024.0 * 1024.0));
     return EXIT_SUCCESS;
 }

@@ -171,6 +171,12 @@ private:
     // frame (is_replayed=true — never re-forwarded, see live_fanout.hpp).
     void drain_router_frames();
 
+    // Declared before context_ deliberately: members are destroyed in
+    // reverse order, so the ring is torn down before these references are
+    // released. SEND_ZC permits the kernel to retain source memory until a
+    // notification CQE, including while shutdown is in progress.
+    std::mutex zero_copy_buffers_mutex_;
+    std::unordered_map<std::uint64_t, core::SharedBuffer> zero_copy_buffers_;
     IoUringContext context_;
     core::ServerConfig config_;
     core::FileDescriptor listener_;
@@ -213,6 +219,8 @@ private:
     CrossWorkerRouter* router_;
     int router_wake_fd_ = -1;
     bool enable_reuseport_;
+    bool zero_copy_send_enabled_ = false;
+    bool zero_copy_fallback_logged_ = false;
     EventLoopServices services_;
     std::uint64_t pending_router_poll_operation_id_ = 0;
     std::mutex rtmp_sessions_mutex_;
@@ -237,6 +245,10 @@ private:
     // "Apply a configurable shutdown deadline". Revisit as a config field if
     // production experience shows it needs tuning.
     static constexpr std::chrono::milliseconds kShutdownDeadline{10000};
+    // Zero-copy setup/completion overhead is counterproductive for tiny
+    // command/audio packets. Large video frames are where avoiding the
+    // kernel copy pays for itself.
+    static constexpr std::size_t kZeroCopySendMinimumBytes = 16 * 1024;
 };
 
 } // namespace rtmp_server::io::io_uring

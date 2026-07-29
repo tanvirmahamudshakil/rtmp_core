@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <span>
 #include <unordered_map>
 #include <vector>
 
@@ -32,6 +33,19 @@ public:
     // chunk_size()-sized pieces (fmt3-prefixed continuations), and emitting
     // the extended timestamp field wherever the timestamp/delta requires it.
     void encode_message(const RtmpMessage& message, std::vector<std::byte>& out);
+
+    // Encodes one complete message with an explicit fmt0 header, without
+    // consulting or mutating per-connection header-compression state.
+    //
+    // Live fan-out uses this deliberately-stateless representation so the
+    // exact same immutable wire buffer can be shared by every viewer whose
+    // chunk size / chunk-stream ID / message-stream ID match. fmt0 is always
+    // legal RTMP; the few extra header bytes are far cheaper than copying
+    // and re-encoding a multi-kilobyte video frame thousands of times.
+    static void encode_message_fmt0(std::uint32_t chunk_size, std::uint32_t chunk_stream_id,
+                                    std::uint32_t message_stream_id, std::uint8_t message_type_id,
+                                    std::uint32_t timestamp, std::span<const std::byte> payload,
+                                    std::vector<std::byte>& out);
 
     // Convenience helpers for the five protocol-control messages, always
     // sent on chunk stream ID 2 / message stream ID 0 per spec. Each both

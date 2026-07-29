@@ -134,6 +134,35 @@ void ChunkEncoder::encode_message(const RtmpMessage& message, std::vector<std::b
     } while (offset < total);
 }
 
+void ChunkEncoder::encode_message_fmt0(std::uint32_t chunk_size, std::uint32_t chunk_stream_id,
+                                       std::uint32_t message_stream_id, std::uint8_t message_type_id,
+                                       std::uint32_t timestamp, std::span<const std::byte> payload,
+                                       std::vector<std::byte>& out) {
+    assert(chunk_size > 0);
+    const bool extended = timestamp >= kExtendedTimestampMarker;
+
+    write_basic_header(out, 0, chunk_stream_id);
+    append_u24_be(out, extended ? kExtendedTimestampMarker : timestamp);
+    append_u24_be(out, static_cast<std::uint32_t>(payload.size()));
+    out.push_back(static_cast<std::byte>(message_type_id));
+    append_u32_le(out, message_stream_id);
+    if (extended) append_u32_be(out, timestamp);
+
+    std::size_t offset = 0;
+    bool first_piece = true;
+    do {
+        const std::size_t piece = std::min<std::size_t>(chunk_size, payload.size() - offset);
+        if (!first_piece) {
+            write_basic_header(out, 3, chunk_stream_id);
+            if (extended) append_u32_be(out, timestamp);
+        }
+        out.insert(out.end(), payload.begin() + static_cast<std::ptrdiff_t>(offset),
+                   payload.begin() + static_cast<std::ptrdiff_t>(offset + piece));
+        offset += piece;
+        first_piece = false;
+    } while (offset < payload.size());
+}
+
 void ChunkEncoder::encode_set_chunk_size(std::uint32_t new_chunk_size, std::vector<std::byte>& out) {
     RtmpMessage message;
     message.chunk_stream_id = kProtocolControlChunkStreamId;

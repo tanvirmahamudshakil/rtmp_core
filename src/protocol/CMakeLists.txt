@@ -9,6 +9,7 @@ add_library(rtmp_server_protocol STATIC
     chunk/chunk_encoder.cpp
     amf0/amf0_encoder.cpp
     amf0/amf0_decoder.cpp
+    commands/shared_media_frame.cpp
     commands/command_session.cpp
     commands/live_fanout.cpp
     media/media_ingest.cpp

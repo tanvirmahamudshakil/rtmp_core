@@ -227,5 +227,35 @@ TEST(ChunkEncoderTest, RoundTripThroughDecoderPreservesArbitraryMessageSequence)
     }
 }
 
+TEST(ChunkEncoderTest, StatelessFmt0EncodingRoundTripsAndDoesNotNeedPriorHeaderState) {
+    constexpr std::uint32_t kChunkSize = 64;
+    const auto original =
+        make_message(5, 7, static_cast<std::uint8_t>(MessageTypeId::Video),
+                     0x01020304, payload_of(257, std::byte{0x5A}));
+
+    std::vector<std::byte> out;
+    // Tell a fresh peer about the non-default chunk size first, exactly as
+    // RtmpConnectionSession::start() does.
+    ChunkEncoder setup;
+    setup.encode_set_chunk_size(kChunkSize, out);
+    ChunkEncoder::encode_message_fmt0(
+        kChunkSize, original.chunk_stream_id, original.message_stream_id,
+        original.message_type_id, original.timestamp, original.payload, out);
+
+    ChunkDecoder decoder(1 << 20);
+    std::vector<RtmpMessage> received;
+    decoder.set_message_handler([&](RtmpMessage message) {
+        received.push_back(std::move(message));
+    });
+    decoder.on_bytes_received(out);
+
+    ASSERT_EQ(received.size(), 1u);
+    EXPECT_EQ(received[0].chunk_stream_id, original.chunk_stream_id);
+    EXPECT_EQ(received[0].message_stream_id, original.message_stream_id);
+    EXPECT_EQ(received[0].message_type_id, original.message_type_id);
+    EXPECT_EQ(received[0].timestamp, original.timestamp);
+    EXPECT_EQ(received[0].payload, original.payload);
+}
+
 } // namespace
 } // namespace rtmp_server::protocol::chunk

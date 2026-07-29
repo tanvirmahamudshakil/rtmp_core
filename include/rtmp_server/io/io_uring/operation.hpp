@@ -46,6 +46,10 @@ struct OperationContext {
     std::uint64_t generation;
     std::weak_ptr<network::TcpConnection> connection;
     TimeoutPurpose timeout_purpose = TimeoutPurpose::None;
+    // SEND_ZC has a normal completion plus a later notification completion.
+    // This bit lets the event loop distinguish a retryable zero-copy
+    // capability failure from an ordinary socket send failure.
+    bool zero_copy = false;
 };
 
 } // namespace rtmp_server::io::io_uring

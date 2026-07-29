@@ -79,6 +79,11 @@ RtmpConnectionSession::RtmpConnectionSession(std::uint64_t connection_id, Depend
     // the single point that turns RtmpMessage values into wire bytes
     // (Phase 1 task 7: "Connect ChunkEncoder to real socket output").
     command_session_.set_outgoing_handler([this](RtmpMessage message) { send_encoded(message); });
+    command_session_.set_media_outgoing_handler(
+        [this](const commands::SharedMediaFrame& frame, std::uint32_t chunk_stream_id,
+               std::uint32_t message_stream_id) {
+            send_encoded_media(frame, chunk_stream_id, message_stream_id);
+        });
 
     decoder_.set_message_handler([this](RtmpMessage message) { handle_decoded_message(std::move(message)); });
     decoder_.set_error_handler([this](core::Error error) { handle_decode_error(error); });
@@ -100,7 +105,7 @@ void RtmpConnectionSession::start() {
         // just told the peer, correctly, for every message that follows.
         out_scratch_.clear();
         encoder_.encode_message(set_chunk_size, out_scratch_);
-        if (outgoing_handler_ && !out_scratch_.empty()) outgoing_handler_(std::move(out_scratch_));
+        if (!out_scratch_.empty()) emit_encoded(std::move(out_scratch_));
     }
 }
 
@@ -129,7 +134,28 @@ void RtmpConnectionSession::send_encoded(const RtmpMessage& message) {
     if (failed_ || closed_) return;
     out_scratch_.clear();
     encoder_.encode_message(message, out_scratch_);
-    if (outgoing_handler_ && !out_scratch_.empty()) outgoing_handler_(std::move(out_scratch_));
+    if (!out_scratch_.empty()) emit_encoded(std::move(out_scratch_));
+}
+
+void RtmpConnectionSession::send_encoded_media(const commands::SharedMediaFrame& frame,
+                                               std::uint32_t chunk_stream_id,
+                                               std::uint32_t message_stream_id) {
+    if (failed_ || closed_) return;
+    auto bytes = frame.wire_bytes(output_chunk_size_, chunk_stream_id, message_stream_id);
+    if (shared_outgoing_handler_) {
+        shared_outgoing_handler_(std::move(bytes));
+    } else if (outgoing_handler_) {
+        auto view = bytes.view();
+        outgoing_handler_(std::vector<std::byte>(view.begin(), view.end()));
+    }
+}
+
+void RtmpConnectionSession::emit_encoded(std::vector<std::byte> bytes) {
+    if (shared_outgoing_handler_) {
+        shared_outgoing_handler_(core::SharedBuffer::adopt(std::move(bytes)));
+    } else if (outgoing_handler_) {
+        outgoing_handler_(std::move(bytes));
+    }
 }
 
 void RtmpConnectionSession::flush_pending_acknowledgement() {

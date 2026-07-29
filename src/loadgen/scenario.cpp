@@ -68,6 +68,14 @@ ScenarioReport run_scenario(const ScenarioConfig& config) {
     ScenarioReport report;
     report.publishers_requested = config.publishers;
     report.viewers_requested = config.publishers * config.viewers_per_publisher;
+    if ((!config.publish_key.empty() || !config.playback_name.empty()) &&
+        (config.publish_key.empty() || config.playback_name.empty() ||
+         config.publishers != 1)) {
+        report.clients_failed = config.publishers + report.viewers_requested;
+        report.failure_reasons.push_back(
+            "publish_key and playback_name must both be set and require publishers=1");
+        return report;
+    }
 
     const auto run_started = Clock::now();
     const auto deadline = run_started + config.duration;
@@ -96,7 +104,11 @@ ScenarioReport run_scenario(const ScenarioConfig& config) {
         static_cast<std::uint32_t>(static_cast<double>(report.viewers_requested) * config.abrupt_disconnect_fraction);
 
     for (std::uint32_t p = 0; p < config.publishers; ++p) {
-        const std::string key = config.stream_key_prefix + std::to_string(p);
+        const std::string key = config.publish_key.empty()
+                                    ? config.stream_key_prefix + std::to_string(p)
+                                    : config.publish_key;
+        const std::string viewer_name =
+            config.playback_name.empty() ? key : config.playback_name;
 
         // Publisher first: viewers ramp in behind it so there is a stream to
         // subscribe to, matching how a real audience arrives.
@@ -122,7 +134,7 @@ ScenarioReport run_scenario(const ScenarioConfig& config) {
             cc.host = config.host;
             cc.port = config.port;
             cc.application = config.application;
-            cc.stream_key = key;
+            cc.stream_key = viewer_name;
             cc.role = RtmpClient::Role::Viewer;
             if (slow_viewers_assigned < slow_target) {
                 cc.read_budget_per_tick = config.slow_viewer_read_budget;

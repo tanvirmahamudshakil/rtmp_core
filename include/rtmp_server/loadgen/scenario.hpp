@@ -19,9 +19,17 @@ struct ScenarioConfig {
     std::uint16_t port = 1935;
     std::string application = "live";
 
-    // Stream keys are generated as `stream_key_prefix + index`. Publisher i
-    // and its viewers share the same key so fan-out actually has a source.
+    // Synthetic test mode generates `stream_key_prefix + index`; publisher i
+    // and its viewers use that same identifier so fan-out has a source.
     std::string stream_key_prefix = "loadtest-";
+
+    // Production single-stream mode: the publisher authenticates with the
+    // secret publish key while viewers request the public stream name.
+    // When both are non-empty they are used verbatim and publishers must be
+    // exactly 1. Empty values preserve the synthetic prefix+index mode used
+    // by the test server and multi-publisher matrix.
+    std::string publish_key;
+    std::string playback_name;
 
     std::uint32_t publishers = 1;
     std::uint32_t viewers_per_publisher = 100;

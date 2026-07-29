@@ -507,6 +507,30 @@ TEST_F(LiveFanoutTest, SharedPayloadIsReferencedNotCopiedAcrossCacheAndViewers) 
     (void)original_data;
 }
 
+TEST_F(LiveFanoutTest, WireEncodingIsComputedOnceAndSharedAcrossThousandsOfViewers) {
+    SharedMediaFrame frame = frame_of(
+        make_video(std::vector<std::byte>(64 * 1024, std::byte{0x5A}), 1234));
+
+    auto first = frame.wire_bytes(/*chunk_size=*/4096, /*csid=*/5,
+                                  /*message_stream_id=*/1);
+    ASSERT_FALSE(first.empty());
+    const void* shared_address = first.view().data();
+
+    // Models the hot fan-out operation without allocating 5,000 sockets:
+    // every viewer asks the copied frame for the same wire shape and must
+    // receive a reference to one immutable allocation.
+    for (int viewer = 0; viewer < 5000; ++viewer) {
+        SharedMediaFrame copied = frame;
+        auto encoded = copied.wire_bytes(4096, 5, 1);
+        EXPECT_EQ(encoded.view().data(), shared_address);
+        EXPECT_EQ(encoded.size(), first.size());
+    }
+
+    // A different RTMP message stream needs a distinct header/cache entry.
+    auto other_stream = frame.wire_bytes(4096, 5, 2);
+    EXPECT_NE(other_stream.view().data(), shared_address);
+}
+
 TEST_F(LiveFanoutTest, PermanentlySlowViewerDoesNotGrowMemoryUnboundedly) {
     // A viewer that never sends another keyframe-recoverable state: once
     // evicted, it must stay evicted (subscriber_count stays 0) no matter

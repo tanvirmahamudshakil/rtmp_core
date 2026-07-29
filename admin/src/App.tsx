@@ -49,12 +49,12 @@ type Page = "overview" | "streams" | "applications" | "capacity" | "system";
 type Notice = { type: "success" | "error"; message: string } | null;
 
 const EMPTY_SNAPSHOT: Snapshot = { applications: [], streams: [], metrics: {}, health: "offline" };
-const pageTitles: Record<Page, { title: string; eyebrow: string }> = {
-  overview: { title: "Command overview", eyebrow: "LIVE OPERATIONS" },
-  streams: { title: "Streams", eyebrow: "CONTENT CONTROL" },
-  applications: { title: "Applications", eyebrow: "NAMESPACES" },
-  capacity: { title: "Capacity planner", eyebrow: "NO-CDN DELIVERY" },
-  system: { title: "System health", eyebrow: "SERVER TELEMETRY" }
+const pageTitles: Record<Page, { title: string; subtitle: string }> = {
+  overview: { title: "Overview", subtitle: "Your live service at a glance" },
+  streams: { title: "Streams", subtitle: "Create, monitor and secure every stream" },
+  applications: { title: "Applications", subtitle: "Organize streams into simple namespaces" },
+  capacity: { title: "Capacity", subtitle: "Plan direct delivery without a CDN" },
+  system: { title: "System", subtitle: "Server health and resource usage" }
 };
 
 const metric = (snapshot: Snapshot, name: string) => snapshot.metrics[name] ?? 0;
@@ -233,17 +233,16 @@ function Login({
           </div>
         </div>
         <div className="login-statement">
-          <span className="eyebrow">SELF-HOSTED · NO CDN</span>
-          <h1>Own the stream.<br />Command the edge.</h1>
+          <span className="eyebrow">STREAMFORGE CONTROL</span>
+          <h1>Live streaming,<br />simply managed.</h1>
           <p>
-            One operational surface for RTMP publishing, playback security,
-            server throughput and every live session.
+            Publish securely, watch audience growth and keep your origin healthy
+            from one focused dashboard.
           </p>
         </div>
         <div className="login-points">
-          <span><Zap size={16} /> io_uring multi-core transport</span>
-          <span><ShieldCheck size={16} /> Hashed keys & signed playback</span>
-          <span><Network size={16} /> Direct bandwidth visibility</span>
+          <span><ShieldCheck size={16} /> Secure by default</span>
+          <span><Network size={16} /> Clear bandwidth visibility</span>
         </div>
       </section>
       <section className="login-panel">
@@ -255,9 +254,9 @@ function Login({
           }}
         >
           <div className="login-card-icon"><LockKeyhole size={22} /></div>
-          <span className="eyebrow">OPERATOR ACCESS</span>
-          <h2>Sign in to your server</h2>
-          <p>Use the admin token created by the Linux setup script.</p>
+          <span className="eyebrow">WELCOME BACK</span>
+          <h2>Sign in to StreamForge</h2>
+          <p>Enter the admin token created during server setup.</p>
           <label htmlFor="admin-token">Admin bearer token</label>
           <div className="password-field">
             <KeyRound size={18} />
@@ -278,9 +277,9 @@ function Login({
           {demo && <div className="demo-note"><SquareActivity size={16} /> Preview mode is using safe demo data.</div>}
           <button className="primary-button login-button" disabled={!token.trim() || loading}>
             {loading ? <RefreshCw className="spin" size={17} /> : <ArrowUpRight size={17} />}
-            {loading ? "Verifying server…" : "Open control plane"}
+            {loading ? "Checking access…" : "Continue to dashboard"}
           </button>
-          <small>Token is kept in this browser tab only and is never included in the frontend build.</small>
+          <small>Your token stays in this browser tab and is never bundled with the app.</small>
         </form>
       </section>
     </main>
@@ -334,11 +333,11 @@ function Sidebar({
         <div className="sidebar-spacer" />
         <div className="edge-card">
           <div className="edge-icon"><CloudOff size={18} /></div>
-          <div><strong>Direct delivery</strong><span>No CDN attached</span></div>
-          <StatusPill live label="Origin" />
+          <div><strong>Direct origin</strong><span>Serving viewers without a CDN</span></div>
+          <StatusPill live label="Ready" />
         </div>
         <button className="logout-button" onClick={onLogout}>
-          <LogOut size={17} /> End secure session
+          <LogOut size={17} /> Sign out
         </button>
         <div className="sidebar-version">StreamForge v1.0 · C++23</div>
       </aside>
@@ -414,13 +413,13 @@ function Overview({
   return (
     <>
       <section className="metric-grid">
-        <MetricCard icon={<Users size={20} />} label="Connected viewers" value={compact(viewers)}
-          helper={`${compact(metric(snapshot, "active_connections"))} total sockets`} tone="amber" history={history} />
-        <MetricCard icon={<RadioTower size={20} />} label="Live publishers" value={compact(publishers)}
-          helper={`${snapshot.streams.length} configured streams`} tone="teal" />
-        <MetricCard icon={<ArrowUpRight size={20} />} label="Origin egress" value={bitrate(egress)}
-          helper={`${utilization.toFixed(1)}% of declared uplink`} tone="blue" />
-        <MetricCard icon={<Cpu size={20} />} label="Worker load"
+        <MetricCard icon={<Users size={20} />} label="Viewers now" value={compact(viewers)}
+          helper={`${compact(metric(snapshot, "active_connections"))} active connections`} tone="amber" history={history} />
+        <MetricCard icon={<RadioTower size={20} />} label="Live streams" value={compact(publishers)}
+          helper={`${snapshot.streams.length} streams configured`} tone="teal" />
+        <MetricCard icon={<ArrowUpRight size={20} />} label="Bandwidth out" value={bitrate(egress)}
+          helper={`${utilization.toFixed(1)}% of available uplink`} tone="blue" />
+        <MetricCard icon={<Cpu size={20} />} label="Server load"
           value={`${(metric(snapshot, "worker_cpu_usage") / 1000).toFixed(1)} cores`}
           helper={`${bytes(metric(snapshot, "process_memory_bytes"))} resident memory`} tone="purple" />
       </section>
@@ -428,7 +427,7 @@ function Overview({
       <section className="overview-grid">
         <article className="panel traffic-panel">
           <div className="panel-heading">
-            <div><span className="eyebrow">ORIGIN THROUGHPUT</span><h2>Network headroom</h2></div>
+            <div><span className="eyebrow">BANDWIDTH</span><h2>Network headroom</h2></div>
             <button className="subtle-button" onClick={() => onNavigate("capacity")}>
               Open planner <ChevronRight size={16} />
             </button>
@@ -466,7 +465,7 @@ function Overview({
 
         <article className="panel health-panel">
           <div className="panel-heading">
-            <div><span className="eyebrow">FAST SIGNALS</span><h2>Server health</h2></div>
+            <div><span className="eyebrow">HEALTH</span><h2>Everything important</h2></div>
             <StatusPill live={snapshot.health === "online"} label={snapshot.health === "online" ? "Operational" : "Degraded"} />
           </div>
           <div className="health-list">
@@ -480,7 +479,7 @@ function Overview({
 
       <section className="panel">
         <div className="panel-heading">
-          <div><span className="eyebrow">ACTIVE DELIVERY</span><h2>Top live streams</h2></div>
+          <div><span className="eyebrow">LIVE NOW</span><h2>Top streams</h2></div>
           <button className="subtle-button" onClick={() => onNavigate("streams")}>View all streams <ChevronRight size={16} /></button>
         </div>
         <StreamTable streams={(liveStreams.length ? liveStreams : snapshot.streams).slice(0, 5)} onAction={onStreamAction} compactMode />
@@ -576,7 +575,7 @@ function ApplicationsPage({
   return (
     <>
       <div className="section-intro">
-        <div><h2>Publishing namespaces</h2><p>Separate streams by product, event, customer or operational environment.</p></div>
+        <div><h2>Organize your streams</h2><p>Use applications to group streams by event, product or customer.</p></div>
         <button className="primary-button" onClick={openCreate}><Plus size={17} /> New application</button>
       </div>
       <section className="application-grid">
@@ -710,7 +709,7 @@ function SystemPage({ snapshot }: { snapshot: Snapshot }) {
   const items = [
     ["RTMP transport", "io_uring / SO_REUSEPORT", "Operational", <Zap size={19} />],
     ["Control database", "SQLite WAL · local disk", "Ready", <Database size={19} />],
-    ["Management API", "Loopback · open access", "Open", <ShieldCheck size={19} />],
+    ["Management API", "Bearer token protected", "Protected", <ShieldCheck size={19} />],
     ["Media delivery", "Direct origin · no CDN", "Active", <Network size={19} />]
   ];
   return (
@@ -751,14 +750,11 @@ function SystemPage({ snapshot }: { snapshot: Snapshot }) {
 
 function App() {
   const demo = new URLSearchParams(window.location.search).get("demo") === "1";
-  // Open control plane: the server serves the management API without a bearer
-  // token, so the panel boots straight into the dashboard instead of asking
-  // for a login. The Bearer value below is a harmless placeholder the API
-  // ignores; the Login screen is retained only as a fallback if a future
-  // deployment turns authentication back on server-side (a 401 clears it).
-  const [token, setToken] = useState(() => (demo ? "demo-session" : sessionStorage.getItem("streamforge-token") ?? "open"));
-  const [client, setClient] = useState<ControlClient | null>(() => new ControlClient(token, demo));
-  const [authenticated, setAuthenticated] = useState(true);
+  const initialToken = demo ? "demo-session" : sessionStorage.getItem("streamforge-token") ?? "";
+  const [client, setClient] = useState<ControlClient | null>(() =>
+    initialToken ? new ControlClient(initialToken, demo) : null
+  );
+  const [authenticated, setAuthenticated] = useState(Boolean(initialToken));
   const [loginLoading, setLoginLoading] = useState(false);
   const [loginError, setLoginError] = useState("");
   const [snapshot, setSnapshot] = useState<Snapshot>(EMPTY_SNAPSHOT);
@@ -837,7 +833,6 @@ function App() {
     try {
       await nextClient.validate();
       if (!demo) sessionStorage.setItem("streamforge-token", nextToken);
-      setToken(nextToken);
       setClient(nextClient);
       setAuthenticated(true);
     } catch (error) {
@@ -849,7 +844,6 @@ function App() {
 
   const logout = () => {
     sessionStorage.removeItem("streamforge-token");
-    setToken("");
     setClient(null);
     setAuthenticated(false);
     setSnapshot(EMPTY_SNAPSHOT);
@@ -906,7 +900,7 @@ function App() {
       <main className="main-shell">
         <header className="topbar">
           <button className="menu-button" aria-label="Open navigation" onClick={() => setMobileNav(true)}><Menu size={21} /></button>
-          <div className="page-title"><span className="eyebrow">{title.eyebrow}</span><h1>{title.title}</h1></div>
+          <div className="page-title"><h1>{title.title}</h1><p>{title.subtitle}</p></div>
           <div className="topbar-actions">
             {demo && <span className="demo-badge"><SquareActivity size={14} /> Demo data</span>}
             <div className="node-status"><span className="pulse" /><div><strong>Origin node</strong><small>{snapshot.health === "online" ? "Online" : "Connecting…"}</small></div></div>

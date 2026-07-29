@@ -171,7 +171,7 @@ bool CommandSession::deliver_playback_message(std::uint32_t message_stream_id, c
                                                ViewerQueue& queue, bool is_video,
                                                const SharedMediaFrame* video_sequence_header,
                                                const SharedMediaFrame* audio_sequence_header) {
-    if (!outgoing_handler_) return false;
+    if (!outgoing_handler_ && !media_outgoing_handler_) return false;
 
     bool is_keyframe = false;
     if (is_video) {
@@ -196,19 +196,22 @@ bool CommandSession::deliver_playback_message(std::uint32_t message_stream_id, c
     if (decision == ViewerQueue::Decision::DropAndWait || decision == ViewerQueue::Decision::Evict) return false;
 
     const auto emit = [&](const SharedMediaFrame& outgoing_frame) {
-        RtmpMessage out = outgoing_frame.to_message(kCommandChunkStreamId, message_stream_id);
+        std::uint32_t chunk_stream_id = kDataChunkStreamId;
         switch (static_cast<MessageTypeId>(outgoing_frame.message_type_id)) {
             case MessageTypeId::Audio:
-                out.chunk_stream_id = kAudioChunkStreamId;
+                chunk_stream_id = kAudioChunkStreamId;
                 break;
             case MessageTypeId::Video:
-                out.chunk_stream_id = kVideoChunkStreamId;
+                chunk_stream_id = kVideoChunkStreamId;
                 break;
             default:
-                out.chunk_stream_id = kDataChunkStreamId;
                 break;
         }
-        outgoing_handler_(std::move(out));
+        if (media_outgoing_handler_) {
+            media_outgoing_handler_(outgoing_frame, chunk_stream_id, message_stream_id);
+        } else {
+            outgoing_handler_(outgoing_frame.to_message(chunk_stream_id, message_stream_id));
+        }
     };
 
     if (decision == ViewerQueue::Decision::DeliverResumed) {

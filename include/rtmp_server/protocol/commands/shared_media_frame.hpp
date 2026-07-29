@@ -1,6 +1,9 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
+#include <mutex>
+#include <vector>
 
 #include "rtmp_server/core/buffer.hpp"
 #include "rtmp_server/protocol/chunk/chunk_types.hpp"
@@ -20,6 +23,16 @@ struct SharedMediaFrame {
     std::uint8_t message_type_id = 0; // chunk::MessageTypeId
     std::uint32_t timestamp = 0;
 
+    // Returns a stateless fmt0 RTMP wire representation. Copies of this
+    // SharedMediaFrame share the cache, including copies placed in a GOP
+    // cache or forwarded to another io_uring worker. The small bounded key
+    // set covers the normal one-message-stream case without allowing an
+    // unusual client that creates many RTMP message streams to grow a
+    // retained frame without limit.
+    [[nodiscard]] core::SharedBuffer wire_bytes(std::uint32_t chunk_size,
+                                                std::uint32_t chunk_stream_id,
+                                                std::uint32_t message_stream_id) const;
+
     static SharedMediaFrame from_message(const chunk::RtmpMessage& message) {
         SharedMediaFrame frame;
         frame.payload = core::SharedBuffer::copy_from(message.payload);
@@ -38,6 +51,22 @@ struct SharedMediaFrame {
         message.payload.assign(view.begin(), view.end());
         return message;
     }
+
+private:
+    struct WireEncoding {
+        std::uint32_t chunk_size = 0;
+        std::uint32_t chunk_stream_id = 0;
+        std::uint32_t message_stream_id = 0;
+        core::SharedBuffer bytes;
+    };
+    struct WireCache {
+        std::mutex mutex;
+        std::vector<WireEncoding> entries;
+    };
+
+    // shared_ptr preserves cache identity when a frame is copied into the
+    // GOP cache, subscriber delivery list, or a cross-worker queue.
+    mutable std::shared_ptr<WireCache> wire_cache_ = std::make_shared<WireCache>();
 };
 
 } // namespace rtmp_server::protocol::commands

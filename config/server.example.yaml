@@ -20,7 +20,7 @@ enable_multishot_accept: true
 enable_multishot_recv: true
 enable_registered_buffers: true
 enable_provided_buffer_ring: true
-enable_send_zero_copy: false
+enable_send_zero_copy: true
 enable_sqpoll: false
 sqpoll_idle_ms: 1000
 

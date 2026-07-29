@@ -34,7 +34,9 @@ IoUringCapabilities detect_capabilities(::io_uring& ring) {
         caps.multishot_recv = io_uring_opcode_supported(probe, IORING_OP_RECV) != 0;
         caps.async_cancel = io_uring_opcode_supported(probe, IORING_OP_ASYNC_CANCEL) != 0;
         caps.linked_timeout = io_uring_opcode_supported(probe, IORING_OP_LINK_TIMEOUT) != 0;
+#if defined(RTMP_HAS_SEND_ZC)
         caps.send_zero_copy = io_uring_opcode_supported(probe, IORING_OP_SEND_ZC) != 0;
+#endif
         io_uring_free_probe(probe);
     }
 

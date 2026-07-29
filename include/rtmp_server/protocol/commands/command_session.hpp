@@ -85,6 +85,9 @@ struct Amf0Command {
 class CommandSession {
 public:
     using OutgoingHandler = std::function<void(chunk::RtmpMessage)>;
+    using MediaOutgoingHandler =
+        std::function<void(const SharedMediaFrame&, std::uint32_t chunk_stream_id,
+                           std::uint32_t message_stream_id)>;
 
     // Invoked once a `publish` for a previously-unpublished, validator-approved
     // stream key succeeds and the stream has been added to the registry.
@@ -106,6 +109,14 @@ public:
     CommandSession& operator=(const CommandSession&) = delete;
 
     void set_outgoing_handler(OutgoingHandler handler) { outgoing_handler_ = std::move(handler); }
+    // Optional high-density path for playback media. When installed, media
+    // stays as a SharedMediaFrame until the connection session requests its
+    // cached wire representation; command/control messages continue through
+    // OutgoingHandler. Embedders that do not install it retain the original
+    // RtmpMessage path.
+    void set_media_outgoing_handler(MediaOutgoingHandler handler) {
+        media_outgoing_handler_ = std::move(handler);
+    }
     void set_publish_start_handler(PublishStartHandler handler) { publish_start_handler_ = std::move(handler); }
     void set_publish_stop_handler(PublishStopHandler handler) { publish_stop_handler_ = std::move(handler); }
 
@@ -241,6 +252,7 @@ private:
     StreamKeyValidator key_validator_;
     StreamIdRegistry* stream_id_registry_ = nullptr; // never null after construction; see .cpp fallback
     OutgoingHandler outgoing_handler_;
+    MediaOutgoingHandler media_outgoing_handler_;
     PublishStartHandler publish_start_handler_;
     PublishStopHandler publish_stop_handler_;
     media::MediaIngest* media_ingest_ = nullptr;
