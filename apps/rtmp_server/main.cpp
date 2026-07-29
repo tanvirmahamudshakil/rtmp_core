@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <memory>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -13,6 +14,7 @@
 #include "rtmp_server/control/http_server.hpp"
 #include "rtmp_server/control/management_api.hpp"
 #include "rtmp_server/core/config.hpp"
+#include "rtmp_server/core/error.hpp"
 #include "rtmp_server/io/io_uring/worker_pool.hpp"
 #include "rtmp_server/hls/stream_sink.hpp"
 #include "rtmp_server/management/stream_manager.hpp"
@@ -22,6 +24,7 @@
 #include "rtmp_server/persistence/sqlite_store.hpp"
 #include "rtmp_server/protocol/commands/stream_ids.hpp"
 #include "rtmp_server/protocol/commands/stream_registry.hpp"
+#include "rtmp_server/transcoding/supervisor.hpp"
 
 namespace {
 
@@ -46,6 +49,47 @@ void install_signal_handlers() {
     // already reset the connection (docs/rtmp_promot.md "io_uring Error
     // Classification").
     ::signal(SIGPIPE, SIG_IGN);
+}
+
+std::string json_escape(std::string_view value) {
+    std::string result;
+    result.reserve(value.size() + 8);
+    for (const char c : value) {
+        switch (c) {
+            case '"': result += "\\\""; break;
+            case '\\': result += "\\\\"; break;
+            case '\n': result += "\\n"; break;
+            case '\r': result += "\\r"; break;
+            case '\t': result += "\\t"; break;
+            default: result.push_back(c); break;
+        }
+    }
+    return result;
+}
+
+std::string assignment_json(const rtmp_server::persistence::TranscodingAssignmentRow& row) {
+    auto parsed = rtmp_server::transcoding::PresetCatalogue::parse(row.rules);
+    std::ostringstream json;
+    json << R"({"application":")" << json_escape(row.application)
+         << R"(","source_stream":")" << json_escape(row.source_stream)
+         << R"(","template_name":")" << json_escape(row.template_name)
+         << R"(","master_hls_path":"/hls/)" << json_escape(row.application) << "/"
+         << json_escape(row.source_stream) << R"(/master.m3u8","outputs":[)";
+    bool first = true;
+    if (parsed) {
+        for (const auto& preset : parsed.value().match(row.application, row.source_stream)) {
+            if (!first) json << ",";
+            first = false;
+            json << R"({"name":")" << json_escape(preset.name)
+                 << R"(","stream":")" << json_escape(preset.outgoing_stream_name)
+                 << R"(","video_codec":")" << rtmp_server::transcoding::to_string(preset.video_codec)
+                 << R"(","video_bitrate":)" << preset.video_bitrate
+                 << R"(,"width":)" << preset.width.value_or(0)
+                 << R"(,"height":)" << preset.height.value_or(0) << "}";
+        }
+    }
+    json << "]}";
+    return json.str();
 }
 
 } // namespace
@@ -162,6 +206,87 @@ int main(int argc, char** argv) {
             return std::make_shared<rtmp_server::hls::StreamSink>(std::move(store),
                                                                   std::move(segmenter_config));
         };
+
+    std::unique_ptr<rtmp_server::transcoding::TranscoderSupervisor> transcoder;
+    if (config.transcoding_enabled) {
+        auto catalogue_result =
+            rtmp_server::transcoding::PresetCatalogue::load(config.transcoding_preset_file);
+        if (!catalogue_result) {
+            std::fprintf(stderr, "failed to load transcoding presets '%s': %s\n",
+                         config.transcoding_preset_file.c_str(),
+                         catalogue_result.error().message().c_str());
+            return EXIT_FAILURE;
+        }
+        auto assignments_result = store->load_transcoding_assignments();
+        if (!assignments_result) {
+            std::fprintf(stderr, "failed to load transcoding assignments: %s\n",
+                         assignments_result.error().message().c_str());
+            return EXIT_FAILURE;
+        }
+        for (const auto& assignment : assignments_result.value()) {
+            auto parsed = rtmp_server::transcoding::PresetCatalogue::parse(assignment.rules);
+            if (!parsed || parsed.value().rules().size() != 1) {
+                std::fprintf(stderr, "invalid persisted transcoding assignment for %s/%s\n",
+                             assignment.application.c_str(), assignment.source_stream.c_str());
+                return EXIT_FAILURE;
+            }
+            auto rule = parsed.value().rules().front();
+            if (rule.application != assignment.application ||
+                rule.source_stream != assignment.source_stream) {
+                std::fprintf(stderr, "persisted transcoding assignment identity mismatch for %s/%s\n",
+                             assignment.application.c_str(), assignment.source_stream.c_str());
+                return EXIT_FAILURE;
+            }
+            catalogue_result.value().upsert_rule(std::move(rule));
+        }
+        rtmp_server::transcoding::SupervisorOptions options;
+        options.enabled = true;
+        options.rtmp_port = config.rtmp_port;
+        options.ffmpeg_path = config.transcoding_ffmpeg_path;
+        options.max_active_jobs = config.transcoding_max_active_jobs;
+        options.max_outputs_per_job = config.transcoding_max_outputs_per_job;
+        options.max_restart_attempts = config.transcoding_max_restart_attempts;
+        transcoder = std::make_unique<rtmp_server::transcoding::TranscoderSupervisor>(
+            std::move(options), std::move(catalogue_result).value());
+        transcoder->set_prepare_output(
+            [&stream_manager](std::string_view application, std::string_view output_stream) {
+                if (stream_manager.find_stream(application, output_stream)) return true;
+                return stream_manager.create_stream(application, std::string(output_stream), false).ok();
+            });
+        transcoder->set_renditions_ready(
+            [&hls_handler](std::string_view application, std::string_view source_stream,
+                           const std::vector<rtmp_server::transcoding::Preset>& presets) {
+                std::vector<rtmp_server::hls::Rendition> renditions;
+                renditions.reserve(presets.size());
+                for (const auto& preset : presets) {
+                    rtmp_server::hls::Rendition rendition;
+                    rendition.uri = "../" + preset.outgoing_stream_name + "/index.m3u8";
+                    rendition.bandwidth = preset.video_bitrate + preset.audio_bitrate;
+                    rendition.average_bandwidth = rendition.bandwidth;
+                    rendition.codecs = "avc1.64001f,mp4a.40.2";
+                    rendition.width = preset.width.value_or(0);
+                    rendition.height = preset.height.value_or(0);
+                    rendition.name = preset.name;
+                    renditions.push_back(std::move(rendition));
+                }
+                hls_handler.set_renditions(std::string(application), std::string(source_stream),
+                                           std::move(renditions));
+            });
+        auto start_result = transcoder->start();
+        if (!start_result) {
+            std::fprintf(stderr, "failed to start transcoder supervisor: %s\n",
+                         start_result.error().message().c_str());
+            return EXIT_FAILURE;
+        }
+        services.publish_start_handler =
+            [&transcoder](const rtmp_server::protocol::commands::StreamRegistration& registration) {
+                transcoder->on_publish_started(registration);
+            };
+        services.publish_stop_handler =
+            [&transcoder](std::string_view, std::uint64_t connection_id) {
+                transcoder->on_publish_stopped(connection_id);
+            };
+    }
     services.viewer_attached_handler =
         [&authenticator](std::string_view application, std::string_view stream_name) {
             authenticator.on_viewer_attached(application, stream_name);
@@ -193,6 +318,127 @@ int main(int argc, char** argv) {
         [&hls_handler](std::string_view application, std::string_view stream) {
             hls_handler.unregister_stream(std::string(application), std::string(stream));
         });
+    if (transcoder) {
+        const auto backend_capabilities = transcoder->capabilities();
+        management_api.set_transcoding_status_provider(
+            [&transcoder, backend_capabilities] {
+                std::ostringstream json;
+                json << R"({"enabled":true,"capabilities":[)";
+                for (std::size_t i = 0; i < backend_capabilities.size(); ++i) {
+                    if (i > 0) json << ",";
+                    const auto& capability = backend_capabilities[i];
+                    json << R"({"backend":")"
+                         << rtmp_server::transcoding::to_string(capability.kind)
+                         << R"(","available":)" << (capability.available ? "true" : "false")
+                         << R"(,"detail":")" << capability.detail << "\"}";
+                }
+                json << R"(],"jobs":[)";
+                const auto jobs = transcoder->snapshot();
+                for (std::size_t i = 0; i < jobs.size(); ++i) {
+                    if (i > 0) json << ",";
+                    const auto& job = jobs[i];
+                    json << R"({"application":")" << job.application
+                         << R"(","source_stream":")" << job.source_stream
+                         << R"(","pid":)" << job.process_id
+                         << R"(,"running":)" << (job.running ? "true" : "false")
+                         << R"(,"restart_attempts":)" << job.restart_attempts
+                         << R"(,"outputs":[)";
+                    for (std::size_t output = 0; output < job.output_streams.size(); ++output) {
+                        if (output > 0) json << ",";
+                        json << "\"" << job.output_streams[output] << "\"";
+                    }
+                    json << "]}";
+                }
+                json << "]}";
+                return json.str();
+            });
+        management_api.set_transcoding_assignment_handlers(
+            [&store](std::string_view application) -> rtmp_server::core::Result<std::string> {
+                auto rows = store->load_transcoding_assignments();
+                if (!rows) return rows.error();
+                std::ostringstream json;
+                json << R"({"items":[)";
+                bool first = true;
+                for (const auto& row : rows.value()) {
+                    if (row.application != application) continue;
+                    if (!first) json << ",";
+                    first = false;
+                    json << assignment_json(row);
+                }
+                json << "]}";
+                return json.str();
+            },
+            [&store, &stream_manager, &stream_registry, &transcoder, &config](
+                std::string_view application, std::string_view source_stream,
+                std::string_view template_name,
+                std::string_view rules) -> rtmp_server::core::Result<std::string> {
+                if (!stream_manager.find_stream(application, source_stream)) {
+                    return rtmp_server::core::Error(
+                        rtmp_server::core::ErrorCode::NotFound,
+                        rtmp_server::core::ErrorCategory::Configuration,
+                        "source stream not found");
+                }
+                auto parsed = rtmp_server::transcoding::PresetCatalogue::parse(rules);
+                if (!parsed || parsed.value().rules().size() != 1) {
+                    return parsed ? rtmp_server::core::Error(
+                                        rtmp_server::core::ErrorCode::InvalidConfiguration,
+                                        rtmp_server::core::ErrorCategory::Configuration,
+                                        "assignment must contain exactly one source rule")
+                                  : parsed.error();
+                }
+                auto rule = parsed.value().rules().front();
+                if (rule.application != application || rule.source_stream != source_stream ||
+                    rule.presets.empty() ||
+                    rule.presets.size() > config.transcoding_max_outputs_per_job) {
+                    return rtmp_server::core::Error(
+                        rtmp_server::core::ErrorCode::InvalidConfiguration,
+                        rtmp_server::core::ErrorCategory::Configuration,
+                        "assignment identity is invalid, empty or exceeds the output limit");
+                }
+                for (const auto& preset : rule.presets) {
+                    const bool supported_video =
+                        preset.video_codec == rtmp_server::transcoding::VideoCodec::H264 ||
+                        preset.video_codec == rtmp_server::transcoding::VideoCodec::Passthrough ||
+                        preset.video_codec == rtmp_server::transcoding::VideoCodec::Disabled;
+                    const bool supported_audio =
+                        preset.audio_codec == rtmp_server::transcoding::AudioCodec::Aac ||
+                        preset.audio_codec == rtmp_server::transcoding::AudioCodec::Passthrough ||
+                        preset.audio_codec == rtmp_server::transcoding::AudioCodec::Disabled;
+                    const bool licensed_backend =
+                        preset.backend == rtmp_server::transcoding::BackendKind::Beamr ||
+                        preset.backend == rtmp_server::transcoding::BackendKind::MainConcept;
+                    if (!supported_video || !supported_audio || licensed_backend) {
+                        return rtmp_server::core::Error(
+                            rtmp_server::core::ErrorCode::InvalidConfiguration,
+                            rtmp_server::core::ErrorCategory::Configuration,
+                            "current RTMP/HLS output supports H.264/AAC with Default, NVENC or QuickSync");
+                    }
+                }
+
+                rtmp_server::persistence::TranscodingAssignmentRow row;
+                row.application = std::string(application);
+                row.source_stream = std::string(source_stream);
+                row.template_name = std::string(template_name);
+                row.rules = std::string(rules);
+                auto stored = store->upsert_transcoding_assignment(row);
+                if (!stored) return stored.error();
+
+                transcoder->apply_rule(std::move(rule));
+                const auto registrations = stream_registry.snapshot();
+                const auto live = std::ranges::find_if(registrations, [&](const auto& registration) {
+                    return registration.app == application && registration.stream_key == source_stream;
+                });
+                if (live != registrations.end()) transcoder->on_publish_started(*live);
+                return assignment_json(row);
+            },
+            [&store, &transcoder](std::string_view application,
+                                  std::string_view source_stream) -> rtmp_server::core::Result<void> {
+                auto removed = store->delete_transcoding_assignment(application, source_stream);
+                if (!removed) return removed.error();
+                transcoder->remove_rule(std::string(application), std::string(source_stream));
+                return {};
+            });
+    }
     management_api.set_live_state_provider([&stream_manager, &stream_registry, &stream_id_registry, &pool] {
         std::vector<rtmp_server::management::LiveState> states;
         const auto registrations = stream_registry.snapshot();
@@ -241,6 +487,7 @@ int main(int argc, char** argv) {
 
     auto run_result = pool.run();
     g_pool = nullptr;
+    if (transcoder) transcoder->stop();
     api_server.stop();
 
     if (!run_result) {

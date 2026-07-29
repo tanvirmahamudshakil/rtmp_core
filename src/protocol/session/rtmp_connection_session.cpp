@@ -72,6 +72,12 @@ RtmpConnectionSession::RtmpConnectionSession(std::uint64_t connection_id, Depend
     if (deps.viewer_detached_handler) {
         command_session_.set_viewer_detached_handler(std::move(deps.viewer_detached_handler));
     }
+    if (deps.publish_start_handler) {
+        command_session_.set_publish_start_handler(std::move(deps.publish_start_handler));
+    }
+    if (deps.publish_stop_handler) {
+        command_session_.set_publish_stop_handler(std::move(deps.publish_stop_handler));
+    }
     if (!deps.client_ip.empty()) command_session_.set_client_ip(std::move(deps.client_ip));
     command_session_.set_playback_queue_limits(deps.playback_queue_limits);
 

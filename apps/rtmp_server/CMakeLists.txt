@@ -8,6 +8,7 @@ target_link_libraries(rtmp_server PRIVATE
     rtmp_server_authentication
     rtmp_server_persistence
     rtmp_server_control
+    rtmp_server_transcoding
     rtmp_server_warnings
     rtmp_server_sanitizers
 )

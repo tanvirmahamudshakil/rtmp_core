@@ -37,8 +37,8 @@ import {
   X,
   Zap
 } from "lucide-react";
-import { FormEvent, ReactNode, useCallback, useEffect, useState } from "react";
-import { Application, ControlClient, Snapshot, Stream } from "./api";
+import { Dispatch, FormEvent, ReactNode, SetStateAction, useCallback, useEffect, useState } from "react";
+import { Application, ControlClient, Snapshot, Stream, TranscodingAssignment, TranscodingOutput } from "./api";
 
 type Page = "home" | "applications" | "transcode" | "server";
 type ApplicationTab = "playback" | "transcoding";
@@ -114,6 +114,67 @@ const loadTranscodingTemplates = (): TranscodingTemplate[] => {
   } catch {
     return [];
   }
+};
+
+const safeRuleName = (value: string, fallback: string) => {
+  const safe = value.trim().replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "");
+  return (safe || fallback).slice(0, 96);
+};
+const backendRuleValue: Record<EncodingImplementation, string> = {
+  Default: "default",
+  NVENC: "nvenc",
+  QuickSync: "quicksync",
+  Beamr: "beamr"
+};
+const videoRuleValue: Record<VideoCodec, string> = {
+  "H.263": "h263",
+  "H.264": "h264",
+  "H.265": "h265",
+  VP8: "vp8",
+  VP9: "vp9",
+  Passthrough: "passthrough",
+  Disabled: "disabled"
+};
+const audioRuleValue: Record<AudioCodec, string> = {
+  AAC: "aac",
+  Vorbis: "vorbis",
+  Opus: "opus",
+  Passthrough: "passthrough",
+  Disabled: "disabled"
+};
+const buildTemplateRules = (stream: Stream, template: TranscodingTemplate) => {
+  const outputs: TranscodingOutput[] = [];
+  const lines = template.presets.map((preset, index) => {
+    const outputSuffix = safeRuleName(preset.outgoingStreamName, `output-${index + 1}`);
+    const outputStream = safeRuleName(`${stream.name}_${outputSuffix}`, `${stream.name}_output-${index + 1}`);
+    outputs.push({
+      name: preset.name,
+      stream: outputStream,
+      video_codec: videoRuleValue[preset.videoCodec],
+      video_bitrate: preset.videoBitrate,
+      width: preset.frameWidth ?? 0,
+      height: preset.frameHeight ?? 0
+    });
+    const description = preset.description.replace(/[|\r\n]+/g, " ").slice(0, 180);
+    return [
+      `${stream.application}/${stream.name}`,
+      safeRuleName(preset.name, `preset-${index + 1}`),
+      outputStream,
+      backendRuleValue[preset.implementation],
+      videoRuleValue[preset.videoCodec],
+      preset.videoBitrate || 2500000,
+      preset.profile,
+      preset.keyFrameMode === "source" ? "source" : preset.keyFrameInterval ?? 60,
+      preset.frameWidth ?? "",
+      preset.frameHeight ?? "",
+      preset.fitMode,
+      audioRuleValue[preset.audioCodec],
+      preset.audioBitrate || 128000,
+      preset.gpuMode === "specific" ? preset.gpuId ?? 0 : "first",
+      description
+    ].join("|");
+  });
+  return { rules: lines.join("\n"), outputs };
 };
 
 const metric = (snapshot: Snapshot, name: string) => snapshot.metrics[name] ?? 0;
@@ -510,22 +571,106 @@ function ApplicationsPage({
 function ApplicationDetailPage({
   application,
   streams,
+  templates,
+  client,
   activeTab,
   setActiveTab,
-  onBack
+  onBack,
+  onNotify
 }: {
   application: Application;
   streams: Stream[];
+  templates: TranscodingTemplate[];
+  client: ControlClient;
   activeTab: ApplicationTab;
   setActiveTab: (tab: ApplicationTab) => void;
   onBack: () => void;
+  onNotify: (type: "success" | "error", message: string) => void;
 }) {
   const applicationStreams = streams.filter((stream) => stream.application === application.name);
   const [copiedUrl, setCopiedUrl] = useState<string | null>(null);
+  const [assignments, setAssignments] = useState<TranscodingAssignment[]>([]);
+  const [selectedTemplates, setSelectedTemplates] = useState<Record<string, string>>({});
+  const [assignmentBusy, setAssignmentBusy] = useState<string | null>(null);
+  const [assignmentsLoading, setAssignmentsLoading] = useState(false);
+  const renditionStreamNames = new Set(assignments.flatMap((assignment) => assignment.outputs.map((output) => output.stream)));
+  const sourceStreams = applicationStreams.filter((stream) => !renditionStreamNames.has(stream.name));
+
+  const loadAssignments = useCallback(async () => {
+    setAssignmentsLoading(true);
+    try {
+      const items = await client.listTranscodingAssignments(application.name);
+      setAssignments(items);
+      setSelectedTemplates((current) => {
+        const next = { ...current };
+        for (const item of items) {
+          const template = templates.find((candidate) => candidate.name === item.template_name);
+          if (template) next[item.source_stream] = template.id;
+        }
+        return next;
+      });
+    } catch (error) {
+      onNotify("error", error instanceof Error ? error.message : "Could not load transcoding assignments.");
+    } finally {
+      setAssignmentsLoading(false);
+    }
+  }, [application.name, client, onNotify, templates]);
+
+  useEffect(() => {
+    if (activeTab === "transcoding") loadAssignments();
+  }, [activeTab, loadAssignments]);
+
   const copyUrl = async (url: string) => {
     await copyText(url);
     setCopiedUrl(url);
     window.setTimeout(() => setCopiedUrl((current) => current === url ? null : current), 1500);
+  };
+  const applyTemplate = async (stream: Stream) => {
+    const template = templates.find((item) => item.id === selectedTemplates[stream.name]);
+    if (!template) {
+      onNotify("error", "Select a transcoding template first.");
+      return;
+    }
+    if (!template.presets.length) {
+      onNotify("error", "This template has no encoding presets.");
+      return;
+    }
+    const unsupported = template.presets.find((preset) =>
+      !["H.264", "Passthrough", "Disabled"].includes(preset.videoCodec) ||
+      !["AAC", "Passthrough", "Disabled"].includes(preset.audioCodec) ||
+      ["Beamr"].includes(preset.implementation)
+    );
+    if (unsupported) {
+      onNotify("error", `${unsupported.name} is not supported by the current RTMP/HLS output pipeline.`);
+      return;
+    }
+    setAssignmentBusy(stream.name);
+    try {
+      const { rules, outputs } = buildTemplateRules(stream, template);
+      const assignment = await client.assignTranscodingTemplate(stream, template.name, rules, outputs);
+      setAssignments((current) => [
+        ...current.filter((item) => item.source_stream !== stream.name),
+        assignment
+      ]);
+      onNotify("success", `${template.name} applied. ${template.presets.length} resolutions now share one adaptive link.`);
+    } catch (error) {
+      onNotify("error", error instanceof Error ? error.message : "Could not apply the transcoding template.");
+    } finally {
+      setAssignmentBusy(null);
+    }
+  };
+  const removeTemplate = async (stream: Stream) => {
+    setAssignmentBusy(stream.name);
+    try {
+      await client.removeTranscodingAssignment(stream);
+      setAssignments((current) => current.filter((item) => item.source_stream !== stream.name));
+      setSelectedTemplates((current) => ({ ...current, [stream.name]: "" }));
+      onNotify("success", `Transcoding removed from ${stream.name}.`);
+    } catch (error) {
+      onNotify("error", error instanceof Error ? error.message : "Could not remove transcoding.");
+    } finally {
+      setAssignmentBusy(null);
+    }
   };
 
   const renderTab = () => {
@@ -570,12 +715,67 @@ function ApplicationDetailPage({
       );
     }
     return (
-      <section className="application-feature-placeholder">
-        <span className="feature-icon"><Workflow size={24} /></span>
-        <span className="placeholder-badge">TRANSCODING</span>
-        <h2>Transcoding workspace</h2>
-        <p>This tab is ready for the transcoding profiles and controls you will provide later.</p>
-        <small>{application.name} / transcoding</small>
+      <section className="assignment-workspace">
+        <div className="playback-heading">
+          <div><span className="eyebrow">ADAPTIVE BITRATE</span><h2>Assign transcoding templates</h2><p>Choose one template per source. Every preset becomes a resolution inside one master M3U8 link.</p></div>
+          <span className="panel-count">{assignments.length} assigned</span>
+        </div>
+        {assignmentsLoading && <div className="assignment-loading"><RefreshCw className="spin" size={17} /> Loading assignments…</div>}
+        <div className="assignment-grid">
+          {sourceStreams.map((stream) => {
+            const assignment = assignments.find((item) => item.source_stream === stream.name);
+            const masterUrl = assignment ? absoluteUrl(assignment.master_hls_path) : "";
+            return (
+              <article className={`assignment-card ${assignment ? "assigned" : ""}`} key={`${stream.application}:${stream.name}`}>
+                <div className="assignment-card-head">
+                  <span className="stream-avatar"><Workflow size={17} /></span>
+                  <div><strong>{stream.name}</strong><small>{assignment ? assignment.template_name : "No template assigned"}</small></div>
+                  <StatusPill live={stream.is_live} />
+                </div>
+                <label className="assignment-select">Transcoding template
+                  <select
+                    value={selectedTemplates[stream.name] ?? ""}
+                    onChange={(event) => setSelectedTemplates((current) => ({ ...current, [stream.name]: event.target.value }))}
+                  >
+                    <option value="">Select a template</option>
+                    {templates.map((template) => (
+                      <option key={template.id} value={template.id}>{template.name} · {template.presets.length} resolutions</option>
+                    ))}
+                  </select>
+                </label>
+                {assignment ? (
+                  <>
+                    <div className="rendition-list">
+                      {assignment.outputs.map((output) => (
+                        <span key={output.stream}>
+                          <b>{output.width && output.height ? `${output.width}×${output.height}` : output.name}</b>
+                          <small>{bitrate(output.video_bitrate)} · {output.video_codec.toUpperCase()}</small>
+                        </span>
+                      ))}
+                    </div>
+                    <div className="master-url-row">
+                      <span>MASTER M3U8</span><code title={masterUrl}>{masterUrl}</code>
+                      <IconButton label="Copy adaptive master URL" onClick={() => copyUrl(masterUrl)}>
+                        {copiedUrl === masterUrl ? <Check size={16} /> : <Copy size={16} />}
+                      </IconButton>
+                    </div>
+                  </>
+                ) : (
+                  <div className="assignment-empty"><Layers3 size={19} /><span>Select a template to create the adaptive resolution ladder.</span></div>
+                )}
+                <div className="assignment-actions">
+                  {assignment && <button className="secondary-button danger-text" disabled={assignmentBusy === stream.name} onClick={() => removeTemplate(stream)}><Trash2 size={15} /> Remove</button>}
+                  <button className="primary-button" disabled={!selectedTemplates[stream.name] || assignmentBusy === stream.name} onClick={() => applyTemplate(stream)}>
+                    {assignmentBusy === stream.name ? <RefreshCw className="spin" size={16} /> : <Plus size={16} />}
+                    {assignment ? "Update template" : "Add template"}
+                  </button>
+                </div>
+              </article>
+            );
+          })}
+          {!sourceStreams.length && <div className="empty-state full"><Radio size={28} /><strong>No source streams</strong><span>Create a stream before assigning a transcoding template.</span></div>}
+        </div>
+        {!templates.length && <div className="assignment-guidance"><Workflow size={18} /><span>Create a template from the sidebar Transcode page, add its resolution presets, then return here.</span></div>}
       </section>
     );
   };
@@ -926,16 +1126,17 @@ function NewPresetModal({ onClose, onAdd }: { onClose: () => void; onAdd: (prese
   );
 }
 
-function TranscodePage() {
-  const [templates, setTemplates] = useState<TranscodingTemplate[]>(loadTranscodingTemplates);
+function TranscodePage({
+  templates,
+  setTemplates
+}: {
+  templates: TranscodingTemplate[];
+  setTemplates: Dispatch<SetStateAction<TranscodingTemplate[]>>;
+}) {
   const [selectedTemplateId, setSelectedTemplateId] = useState<string | null>(null);
   const [showTemplateModal, setShowTemplateModal] = useState(false);
   const [showPresetModal, setShowPresetModal] = useState(false);
   const selectedTemplate = templates.find((template) => template.id === selectedTemplateId) ?? null;
-
-  useEffect(() => {
-    localStorage.setItem(transcodingStorageKey, JSON.stringify(templates));
-  }, [templates]);
 
   const addTemplate = (name: string) => {
     const template: TranscodingTemplate = { id: newLocalId(), name, presets: [] };
@@ -1014,7 +1215,7 @@ function TranscodePage() {
         )}
       </section>
       {showTemplateModal && <NewTemplateModal onClose={() => setShowTemplateModal(false)} onAdd={addTemplate} />}
-      <div className="storage-note"><Database size={16} /><span>Template drafts are saved in this browser until the transcoding server API is connected.</span></div>
+      <div className="storage-note"><Database size={16} /><span>Template drafts stay in this browser. Assigning one from an Application stores its active rendition rules on the server.</span></div>
     </div>
   );
 }
@@ -1032,8 +1233,13 @@ function App() {
   const [createType, setCreateType] = useState<"application" | null>(null);
   const [actionStream, setActionStream] = useState<Stream | null>(null);
   const [pendingDelete, setPendingDelete] = useState<Stream | null>(null);
+  const [templates, setTemplates] = useState<TranscodingTemplate[]>(loadTranscodingTemplates);
   const [bandwidth, setBandwidthState] = useState(() => Number(localStorage.getItem("streamforge-bandwidth")) || 10000);
   const [history, setHistory] = useState<number[]>(demo ? [5200, 5400, 5310, 5710, 5890, 6030, 6210, 6150, 6420, 6615] : []);
+
+  useEffect(() => {
+    localStorage.setItem(transcodingStorageKey, JSON.stringify(templates));
+  }, [templates]);
 
   const setBandwidth = (value: number) => {
     setBandwidthState(value);
@@ -1087,7 +1293,7 @@ function App() {
     };
   }, []);
 
-  const notify = (type: "success" | "error", message: string) => setNotice({ type, message });
+  const notify = useCallback((type: "success" | "error", message: string) => setNotice({ type, message }), []);
   const perform = async (work: () => Promise<unknown>, message: string) => {
     try {
       await work();
@@ -1149,8 +1355,11 @@ function App() {
               ? <ApplicationDetailPage
                   application={selectedApplication}
                   streams={snapshot.streams}
+                  templates={templates}
+                  client={client}
                   activeTab={applicationTab}
                   setActiveTab={setApplicationTab}
+                  onNotify={notify}
                   onBack={() => {
                     setSelectedApplication(null);
                     setApplicationTab("playback");
@@ -1166,7 +1375,7 @@ function App() {
                   }}
                 />
           )}
-          {page === "transcode" && <TranscodePage />}
+          {page === "transcode" && <TranscodePage templates={templates} setTemplates={setTemplates} />}
           {page === "server" && (
             <div className="workspace-stack">
               <SystemPage snapshot={snapshot} />

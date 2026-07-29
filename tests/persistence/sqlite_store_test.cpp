@@ -101,6 +101,31 @@ TEST(SqliteStoreTest, DeleteStreamRemovesOnlyThatRow) {
     EXPECT_EQ(streams[0].name, "b");
 }
 
+TEST(SqliteStoreTest, TranscodingAssignmentRoundTripsUpdatesAndDeletes) {
+    auto store = open_memory_store();
+    TranscodingAssignmentRow row{
+        "football",
+        "live2",
+        "Sports ladder",
+        "football/live2|720p|live2_720p|default|h264|2500000|high|60|1280|720|"
+        "letterbox|aac|128000|first",
+    };
+    ASSERT_TRUE(store->upsert_transcoding_assignment(row).ok());
+    auto assignments = store->load_transcoding_assignments().value();
+    ASSERT_EQ(assignments.size(), 1U);
+    EXPECT_EQ(assignments.front().template_name, "Sports ladder");
+    EXPECT_EQ(assignments.front().rules, row.rules);
+
+    row.template_name = "Updated ladder";
+    ASSERT_TRUE(store->upsert_transcoding_assignment(row).ok());
+    assignments = store->load_transcoding_assignments().value();
+    ASSERT_EQ(assignments.size(), 1U);
+    EXPECT_EQ(assignments.front().template_name, "Updated ladder");
+
+    ASSERT_TRUE(store->delete_transcoding_assignment("football", "live2").ok());
+    EXPECT_TRUE(store->load_transcoding_assignments().value().empty());
+}
+
 TEST(SqliteStoreTest, DataSurvivesAcrossACloseAndReopenOfTheSameFile) {
     // Uses a real temp file (not :memory:) to prove data is actually
     // persisted to disk, not just held in the sqlite3 connection's cache.

@@ -227,6 +227,17 @@ Result<void> ServerConfig::validate() const {
         return Error(ErrorCode::MissingConfiguration, ErrorCategory::Configuration,
                       "database_connection must be set");
     }
+    if (transcoding_enabled &&
+        (transcoding_preset_file.empty() || transcoding_ffmpeg_path.empty())) {
+        return Error(ErrorCode::MissingConfiguration, ErrorCategory::Configuration,
+                      "transcoding_preset_file and transcoding_ffmpeg_path are required when transcoding is enabled");
+    }
+    if (transcoding_max_active_jobs == 0 || transcoding_max_active_jobs > 1024 ||
+        transcoding_max_outputs_per_job == 0 || transcoding_max_outputs_per_job > 32 ||
+        transcoding_max_restart_attempts > 100) {
+        return Error(ErrorCode::InvalidConfiguration, ErrorCategory::Configuration,
+                      "transcoding job, output or restart limits are outside the supported range");
+    }
 
     if (auto r = validate_secret(token_signing_secret, "token_signing_secret"); !r) return r;
     if (auto r = validate_secret(api_authentication_secret, "api_authentication_secret"); !r) return r;
@@ -336,6 +347,12 @@ Result<ServerConfig> load_config(const std::string& path) {
 
     str("database_type", cfg.database_type);
     str("database_connection", cfg.database_connection);
+    boolean("transcoding_enabled", cfg.transcoding_enabled);
+    str("transcoding_preset_file", cfg.transcoding_preset_file);
+    str("transcoding_ffmpeg_path", cfg.transcoding_ffmpeg_path);
+    u32("transcoding_max_active_jobs", cfg.transcoding_max_active_jobs);
+    u32("transcoding_max_outputs_per_job", cfg.transcoding_max_outputs_per_job);
+    u32("transcoding_max_restart_attempts", cfg.transcoding_max_restart_attempts);
     str("token_signing_secret", cfg.token_signing_secret);
     str("api_authentication_secret", cfg.api_authentication_secret);
     str("log_level", cfg.log_level);

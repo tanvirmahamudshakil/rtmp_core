@@ -39,6 +39,8 @@ struct EventLoopServices {
     protocol::commands::RecorderFactory recorder_factory;
     protocol::commands::ViewerLifecycleHandler viewer_attached_handler;
     protocol::commands::ViewerLifecycleHandler viewer_detached_handler;
+    protocol::commands::CommandSession::PublishStartHandler publish_start_handler;
+    protocol::commands::CommandSession::PublishStopHandler publish_stop_handler;
     std::function<bool(std::string_view)> admit_connection;
     std::function<void(std::string_view)> release_connection;
 };

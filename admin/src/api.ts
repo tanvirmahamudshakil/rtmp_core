@@ -16,6 +16,23 @@ export type Stream = {
 
 export type StreamSetup = Stream;
 
+export type TranscodingOutput = {
+  name: string;
+  stream: string;
+  video_codec: string;
+  video_bitrate: number;
+  width: number;
+  height: number;
+};
+
+export type TranscodingAssignment = {
+  application: string;
+  source_stream: string;
+  template_name: string;
+  master_hls_path: string;
+  outputs: TranscodingOutput[];
+};
+
 export type Snapshot = {
   applications: Application[];
   streams: Stream[];
@@ -50,6 +67,7 @@ let demoStreams: Stream[] = [
   { application: "events", name: "studio-feed", enabled: true, recording_enabled: false, rtmp_url: demoRtmpUrl("events", "studio-feed"), hls_path: "/hls/events/studio-feed/index.m3u8", is_live: false, viewer_count: 0 },
   { application: "backup", name: "disaster-recovery", enabled: false, recording_enabled: false, rtmp_url: demoRtmpUrl("backup", "disaster-recovery"), hls_path: "/hls/backup/disaster-recovery/index.m3u8", is_live: false, viewer_count: 0 }
 ];
+let demoAssignments: TranscodingAssignment[] = [];
 
 const demoMetrics: Record<string, number> = {
   active_connections: 6624,
@@ -219,6 +237,74 @@ export class ControlClient {
     await this.request(
       `/v1/streams/${encodeURIComponent(`${stream.application}:${stream.name}`)}/disconnect-${target}`,
       { method: "POST" }
+    );
+  }
+
+  async listTranscodingAssignments(application: string): Promise<TranscodingAssignment[]> {
+    if (this.demo) {
+      return demoAssignments.filter((item) => item.application === application).map((item) => ({ ...item, outputs: [...item.outputs] }));
+    }
+    const response = await this.request<{ items: TranscodingAssignment[] }>(
+      `/v1/transcoding/assignments?application=${encodeURIComponent(application)}`
+    );
+    return response.items;
+  }
+
+  async assignTranscodingTemplate(
+    stream: Stream,
+    templateName: string,
+    rules: string,
+    outputs: TranscodingOutput[]
+  ): Promise<TranscodingAssignment> {
+    if (this.demo) {
+      const assignment: TranscodingAssignment = {
+        application: stream.application,
+        source_stream: stream.name,
+        template_name: templateName,
+        master_hls_path: `/hls/${stream.application}/${stream.name}/master.m3u8`,
+        outputs
+      };
+      demoAssignments = [
+        ...demoAssignments.filter((item) => item.application !== stream.application || item.source_stream !== stream.name),
+        assignment
+      ];
+      return assignment;
+    }
+    const response = await fetch(
+      `${this.baseUrl}/v1/transcoding/assignments/${encodeURIComponent(`${stream.application}:${stream.name}`)}`,
+      {
+        method: "PUT",
+        headers: {
+          Accept: "application/json",
+          "Content-Type": "text/plain; charset=utf-8",
+          "X-Template-Name": templateName
+        },
+        body: rules
+      }
+    );
+    if (!response.ok) {
+      let message = `Request failed (${response.status})`;
+      try {
+        const body = (await response.json()) as { message?: string };
+        if (body.message) message = body.message;
+      } catch {
+        // Keep status-based fallback.
+      }
+      throw new ApiError(message, response.status, response.headers.get("X-Request-Id") ?? undefined);
+    }
+    return response.json() as Promise<TranscodingAssignment>;
+  }
+
+  async removeTranscodingAssignment(stream: Stream): Promise<void> {
+    if (this.demo) {
+      demoAssignments = demoAssignments.filter(
+        (item) => item.application !== stream.application || item.source_stream !== stream.name
+      );
+      return;
+    }
+    await this.request<{ deleted: boolean }>(
+      `/v1/transcoding/assignments/${encodeURIComponent(`${stream.application}:${stream.name}`)}`,
+      { method: "DELETE" }
     );
   }
 }

@@ -32,6 +32,11 @@
 #                                artefact before reinstalling. Set 0 only for
 #                                the legacy in-place upgrade behaviour.
 #   RTMP_FORCE_ROTATE_SECRETS    1 rotates secrets during an in-place install.
+#   RTMP_ENABLE_TRANSCODING      1 (default) installs/enables the independent
+#                                worker supervisor. An empty preset file starts
+#                                no jobs and consumes no encoder resources.
+#   RTMP_TRANSCODING_RULES       Optional newline-delimited preset rules used
+#                                to seed /etc/rtmp-server/transcoding.conf.
 #
 set -Eeuo pipefail
 IFS=$'\n\t'
@@ -80,6 +85,8 @@ ENABLE_FAIR_QUEUE="${RTMP_ENABLE_FAIR_QUEUE:-1}"
 CONFIGURE_FIREWALL="${RTMP_CONFIGURE_FIREWALL:-1}"
 FORCE_ROTATE="${RTMP_FORCE_ROTATE_SECRETS:-0}"
 FRESH_INSTALL="${RTMP_FRESH_INSTALL:-1}"
+ENABLE_TRANSCODING="${RTMP_ENABLE_TRANSCODING:-1}"
+TRANSCODING_RULES="${RTMP_TRANSCODING_RULES:-}"
 
 if [[ "${BANDWIDTH_MBIT}" != "auto" ]]; then
   [[ "${BANDWIDTH_MBIT}" =~ ^[1-9][0-9]*$ ]] ||
@@ -109,6 +116,7 @@ fi
 [[ "${CONFIGURE_FIREWALL}" =~ ^[01]$ ]] || die "RTMP_CONFIGURE_FIREWALL must be 0 or 1."
 [[ "${FORCE_ROTATE}" =~ ^[01]$ ]] || die "RTMP_FORCE_ROTATE_SECRETS must be 0 or 1."
 [[ "${FRESH_INSTALL}" =~ ^[01]$ ]] || die "RTMP_FRESH_INSTALL must be 0 or 1."
+[[ "${ENABLE_TRANSCODING}" =~ ^[01]$ ]] || die "RTMP_ENABLE_TRANSCODING must be 0 or 1."
 if [[ -n "${DOMAIN}" && ! "${DOMAIN}" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]]; then
   die "RTMP_DOMAIN must be a hostname without a URL scheme, path, port or whitespace."
 fi
@@ -293,7 +301,7 @@ apt-get update
 apt-get install -y --no-install-recommends "${APT_REINSTALL_ARGS[@]}" \
   build-essential clang cmake ninja-build pkg-config git ca-certificates curl \
   liburing-dev liburing2 libssl-dev libsqlite3-dev libsqlite3-0 sqlite3 \
-  nodejs npm iproute2 ethtool kmod
+  ffmpeg nodejs npm iproute2 ethtool kmod
 if ! apt-cache show caddy >/dev/null 2>&1 && [[ "${ID}" == "ubuntu" ]]; then
   apt-get install -y --no-install-recommends "${APT_REINSTALL_ARGS[@]}" software-properties-common
   add-apt-repository -y universe
@@ -422,7 +430,15 @@ fi
 mv -f "${SERVER_STAGED_PATH}" "${SERVER_INSTALL_PATH}"
 log "Installed verified server binary (SHA-256 ${SERVER_BINARY_SHA256})"
 install -m 0640 -o root -g rtmp-server "${SOURCE_DIR}/config/server.example.yaml" /etc/rtmp-server/server.yaml
+install -m 0640 -o root -g rtmp-server "${SOURCE_DIR}/config/transcoding.example.conf" \
+  /etc/rtmp-server/transcoding.conf
+if [[ -n "${TRANSCODING_RULES}" ]]; then
+  printf '%s\n' "${TRANSCODING_RULES}" > /etc/rtmp-server/transcoding.conf
+  chown root:rtmp-server /etc/rtmp-server/transcoding.conf
+  chmod 0640 /etc/rtmp-server/transcoding.conf
+fi
 install -m 0644 -o root -g root "${SOURCE_DIR}/docs/deployment.md" /usr/share/doc/rtmp-server/deployment.md
+install -m 0644 -o root -g root "${SOURCE_DIR}/docs/transcoding.md" /usr/share/doc/rtmp-server/transcoding.md
 cp -a "${SOURCE_DIR}/admin/dist/." /var/www/streamforge/
 cat > /var/www/streamforge/runtime-config.json <<EOF
 {
@@ -479,6 +495,12 @@ RTMP_SERVER_PROVIDED_BUFFER_COUNT=${PROVIDED_BUFFER_COUNT}
 RTMP_SERVER_PROVIDED_BUFFER_SIZE=16384
 RTMP_SERVER_DATABASE_TYPE=sqlite
 RTMP_SERVER_DATABASE_CONNECTION=/var/lib/rtmp-server/rtmp.db
+RTMP_SERVER_TRANSCODING_ENABLED=$(if [[ "${ENABLE_TRANSCODING}" == "1" ]]; then printf true; else printf false; fi)
+RTMP_SERVER_TRANSCODING_PRESET_FILE=/etc/rtmp-server/transcoding.conf
+RTMP_SERVER_TRANSCODING_FFMPEG_PATH=/usr/bin/ffmpeg
+RTMP_SERVER_TRANSCODING_MAX_ACTIVE_JOBS=16
+RTMP_SERVER_TRANSCODING_MAX_OUTPUTS_PER_JOB=8
+RTMP_SERVER_TRANSCODING_MAX_RESTART_ATTEMPTS=5
 RTMP_SERVER_RECORDING_ENABLED=false
 RTMP_SERVER_RECORDING_DIRECTORY=/var/lib/rtmp-server/recordings
 RTMP_SERVER_LOG_LEVEL=info
@@ -486,6 +508,15 @@ RTMP_SERVER_METRICS_ENABLED=true
 EOF
 chown root:rtmp-server "${EXISTING_ENV}"
 chmod 0640 "${EXISTING_ENV}"
+
+# Hardware encoders are optional. Membership exposes /dev/dri and NVIDIA
+# character devices when the host has the matching driver; software
+# transcoding works without either group.
+for encoder_group in video render; do
+  if getent group "${encoder_group}" >/dev/null; then
+    usermod -a -G "${encoder_group}" rtmp-server
+  fi
+done
 
 CREDENTIALS=/root/streamforge-credentials.txt
 cat > "${CREDENTIALS}" <<EOF
@@ -540,7 +571,7 @@ ProtectSystem=strict
 ProtectHome=true
 ReadWritePaths=/var/lib/rtmp-server
 PrivateTmp=true
-PrivateDevices=true
+PrivateDevices=$(if [[ "${ENABLE_TRANSCODING}" == "1" ]]; then printf false; else printf true; fi)
 ProtectProc=invisible
 ProcSubset=pid
 ProtectClock=true
@@ -555,7 +586,7 @@ RestrictRealtime=true
 RestrictNamespaces=true
 RemoveIPC=true
 LockPersonality=true
-MemoryDenyWriteExecute=true
+MemoryDenyWriteExecute=$(if [[ "${ENABLE_TRANSCODING}" == "1" ]]; then printf false; else printf true; fi)
 SystemCallArchitectures=native
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 CapabilityBoundingSet=

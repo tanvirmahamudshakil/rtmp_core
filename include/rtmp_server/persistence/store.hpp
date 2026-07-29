@@ -28,6 +28,13 @@ struct StreamRow {
     std::int64_t created_at_unix = 0;
 };
 
+struct TranscodingAssignmentRow {
+    std::string application;
+    std::string source_stream;
+    std::string template_name;
+    std::string rules;
+};
+
 // Storage-engine-independent persistence contract for the management
 // domain (Phase 9, docs/rtmp_promot.md "Persistence"). Deliberately narrow —
 // just enough for StreamManager to survive a restart — not a general ORM.
@@ -47,6 +54,19 @@ public:
     virtual core::Result<void> upsert_stream(const StreamRow& row) = 0;
     virtual core::Result<void> delete_stream(std::string_view application, std::string_view name) = 0;
     [[nodiscard]] virtual core::Result<std::vector<StreamRow>> load_streams() = 0;
+
+    // Optional for storage implementations used by older unit tests. The
+    // production SQLite store overrides all three methods.
+    virtual core::Result<void> upsert_transcoding_assignment(const TranscodingAssignmentRow&) {
+        return core::Result<void>{};
+    }
+    virtual core::Result<void> delete_transcoding_assignment(std::string_view, std::string_view) {
+        return core::Result<void>{};
+    }
+    [[nodiscard]] virtual core::Result<std::vector<TranscodingAssignmentRow>>
+    load_transcoding_assignments() {
+        return std::vector<TranscodingAssignmentRow>{};
+    }
 };
 
 } // namespace rtmp_server::persistence

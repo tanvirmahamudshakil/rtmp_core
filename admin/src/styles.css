@@ -1439,6 +1439,66 @@ tbody tr:hover { background: #fcfcfd; }
 .form-error { margin-top: 12px; padding: 11px 12px; border-radius: 8px; font-size: 10px; }
 .form-error { color: #b42340; background: #fff1f3; border: 1px solid #ffd5dc; }
 
+.assignment-workspace { padding-bottom: 4px; }
+.assignment-grid {
+  padding: 0 20px 20px;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+}
+.assignment-card {
+  min-width: 0;
+  padding: 16px;
+  background: #fff;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  box-shadow: 0 5px 18px rgba(15, 23, 42, .035);
+}
+.assignment-card.assigned { border-color: #a9ded8; box-shadow: inset 0 3px 0 var(--teal), 0 5px 18px rgba(15, 23, 42, .04); }
+.assignment-card-head { display: flex; align-items: center; gap: 10px; }
+.assignment-card-head > div { min-width: 0; flex: 1; }
+.assignment-card-head strong, .assignment-card-head small { display: block; }
+.assignment-card-head strong { color: var(--ink); font-size: 13px; }
+.assignment-card-head small { margin-top: 3px; overflow: hidden; color: var(--muted); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+.assignment-select { margin-top: 15px; display: grid; gap: 6px; color: var(--soft); font-size: 10px; font-weight: 700; }
+.assignment-select select {
+  width: 100%;
+  height: 40px;
+  padding: 0 11px;
+  color: var(--ink);
+  background: #fbfcfe;
+  border: 1px solid #d9e0e8;
+  border-radius: 8px;
+  outline: none;
+}
+.assignment-select select:focus { border-color: var(--teal); box-shadow: 0 0 0 3px rgba(18, 155, 145, .1); }
+.rendition-list { margin-top: 13px; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 7px; }
+.rendition-list > span { min-width: 0; padding: 9px; background: #f5faf9; border: 1px solid #dbecea; border-radius: 8px; }
+.rendition-list b, .rendition-list small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.rendition-list b { color: #167d76; font-size: 10px; }
+.rendition-list small { margin-top: 4px; color: var(--muted); font-size: 8px; }
+.master-url-row {
+  min-width: 0;
+  margin-top: 10px;
+  padding: 9px 9px 9px 11px;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 9px;
+  background: #f2f8ff;
+  border: 1px solid #d9e8f8;
+  border-radius: 8px;
+}
+.master-url-row > span { color: #3573a7; font-size: 8px; font-weight: 800; }
+.master-url-row code { min-width: 0; overflow: hidden; color: #25465f; font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
+.assignment-empty { margin-top: 13px; min-height: 69px; padding: 13px; display: flex; align-items: center; gap: 9px; color: var(--muted); background: #fafbfc; border: 1px dashed #d8dfe7; border-radius: 9px; font-size: 10px; }
+.assignment-empty svg { flex: none; color: #9aa7b5; }
+.assignment-actions { margin-top: 13px; display: flex; justify-content: flex-end; gap: 8px; }
+.assignment-actions button { min-height: 36px; }
+.assignment-actions .danger-text { margin-right: auto; color: var(--danger); }
+.assignment-loading { margin: 0 20px 12px; display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 10px; }
+.assignment-guidance { margin: 0 20px 20px; padding: 12px 14px; display: flex; align-items: center; gap: 9px; color: #586574; background: #f8fafc; border: 1px solid var(--border); border-radius: 9px; font-size: 10px; }
+
 .spin { animation: spin .85s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
 @keyframes pulse { 0%, 100% { transform: scale(.75); opacity: .75; } 50% { transform: scale(1.3); opacity: 0; } }
@@ -1464,6 +1524,7 @@ tbody tr:hover { background: #fcfcfd; }
   .node-status, .desktop-create { display: none; }
   .system-grid { grid-template-columns: 1fr; }
   .preset-grid { grid-template-columns: 1fr; }
+  .assignment-grid { grid-template-columns: 1fr; }
 }
 
 @media (max-width: 590px) {
@@ -1487,6 +1548,8 @@ tbody tr:hover { background: #fcfcfd; }
   .application-tabs button { padding: 0 10px; }
   .playback-heading { align-items: flex-start; }
   .playback-grid { grid-template-columns: 1fr; padding: 12px; }
+  .assignment-grid { padding: 12px; }
+  .rendition-list { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .playback-card { padding: 13px; }
   .preset-workspace-heading { align-items: flex-start; flex-direction: column; }
   .preset-workspace-heading .primary-button { width: 100%; }

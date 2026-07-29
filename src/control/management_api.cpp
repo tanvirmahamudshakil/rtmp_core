@@ -258,8 +258,26 @@ HttpResponse ManagementApi::handle(const HttpRequest& request) {
 
 HttpResponse ManagementApi::route(const HttpRequest& request, const std::string& request_id) {
     if (request.method == "GET" && request.path == "/metrics") return handle_metrics();
+    if (request.method == "GET" && request.path == "/v1/transcoding/status") {
+        return handle_transcoding_status();
+    }
 
     auto parts = split_path(request.path);
+    if (parts.size() >= 3 && parts[0] == "v1" && parts[1] == "transcoding" &&
+        parts[2] == "assignments") {
+        if (parts.size() == 3 && request.method == "GET") {
+            return handle_list_transcoding_assignments(request);
+        }
+        if (parts.size() == 4) {
+            auto [application, source_stream] = split_stream_id(parts[3]);
+            if (request.method == "PUT") {
+                return handle_put_transcoding_assignment(application, source_stream, request);
+            }
+            if (request.method == "DELETE") {
+                return handle_delete_transcoding_assignment(application, source_stream);
+            }
+        }
+    }
     // Expected shapes: ["v1","applications"], ["v1","streams"],
     // ["v1","streams", "<id>"], ["v1","streams","<id>","<action>"].
     if (parts.size() >= 2 && parts[0] == "v1" && parts[1] == "applications") {
@@ -291,6 +309,59 @@ HttpResponse ManagementApi::route(const HttpRequest& request, const std::string&
     r.status = 404;
     r.body = error_body("not_found", "no such route", request_id);
     return r;
+}
+
+HttpResponse ManagementApi::handle_transcoding_status() {
+    if (!transcoding_status_provider_) {
+        return HttpResponse::json(200, R"({"enabled":false,"capabilities":[],"jobs":[]})");
+    }
+    return HttpResponse::json(200, transcoding_status_provider_());
+}
+
+HttpResponse ManagementApi::handle_list_transcoding_assignments(const HttpRequest& request) {
+    if (!transcoding_assignments_provider_) {
+        return HttpResponse::json(503, R"({"error":"transcoding_unavailable"})");
+    }
+    const auto params = parse_query_params(request.query);
+    const auto application = params.find("application");
+    if (application == params.end() || application->second.empty()) {
+        return HttpResponse::json(400, R"({"error":"application_required"})");
+    }
+    auto result = transcoding_assignments_provider_(percent_decode(application->second));
+    if (!result) return HttpResponse::json(500, error_body("request_failed", result.error().message(), ""));
+    return HttpResponse::json(200, std::move(result).value());
+}
+
+HttpResponse ManagementApi::handle_put_transcoding_assignment(std::string_view application,
+                                                                std::string_view source_stream,
+                                                                const HttpRequest& request) {
+    if (!transcoding_assignment_updater_) {
+        return HttpResponse::json(503, R"({"error":"transcoding_unavailable"})");
+    }
+    const auto header = request.headers.find("x-template-name");
+    if (application.empty() || source_stream.empty() || header == request.headers.end() ||
+        header->second.empty() || header->second.size() > 128 || request.body.empty()) {
+        return HttpResponse::json(400, R"({"error":"invalid_transcoding_assignment"})");
+    }
+    auto result = transcoding_assignment_updater_(application, source_stream, header->second, request.body);
+    if (!result) {
+        return HttpResponse::json(http_status_for(result.error().code()),
+                                  error_body("request_failed", result.error().message(), ""));
+    }
+    return HttpResponse::json(200, std::move(result).value());
+}
+
+HttpResponse ManagementApi::handle_delete_transcoding_assignment(std::string_view application,
+                                                                   std::string_view source_stream) {
+    if (!transcoding_assignment_remover_) {
+        return HttpResponse::json(503, R"({"error":"transcoding_unavailable"})");
+    }
+    auto result = transcoding_assignment_remover_(application, source_stream);
+    if (!result) {
+        return HttpResponse::json(http_status_for(result.error().code()),
+                                  error_body("request_failed", result.error().message(), ""));
+    }
+    return HttpResponse::json(200, R"({"deleted":true})");
 }
 
 HttpResponse ManagementApi::handle_health_live() { return HttpResponse::json(200, R"({"status":"live"})"); }

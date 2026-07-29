@@ -31,6 +31,13 @@ CREATE TABLE IF NOT EXISTS streams (
     created_at_unix INTEGER NOT NULL,
     PRIMARY KEY (application, name)
 );
+CREATE TABLE IF NOT EXISTS transcoding_assignments (
+    application TEXT NOT NULL,
+    source_stream TEXT NOT NULL,
+    template_name TEXT NOT NULL,
+    rules TEXT NOT NULL,
+    PRIMARY KEY (application, source_stream)
+);
 )sql";
 
 Error sqlite_error(sqlite3* db, std::string_view context) {
@@ -173,6 +180,56 @@ Result<std::vector<StreamRow>> SqliteStore::load_streams() {
     }
     if (rc != SQLITE_DONE) return sqlite_error(db_, "step load_streams");
     return out;
+}
+
+Result<void> SqliteStore::upsert_transcoding_assignment(const TranscodingAssignmentRow& row) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    Statement stmt(db_, "INSERT INTO transcoding_assignments "
+                        "(application, source_stream, template_name, rules) VALUES (?, ?, ?, ?) "
+                        "ON CONFLICT(application, source_stream) DO UPDATE SET "
+                        "template_name = excluded.template_name, rules = excluded.rules");
+    if (!stmt.valid()) return sqlite_error(db_, "prepare upsert_transcoding_assignment");
+    sqlite3_bind_text(stmt.get(), 1, row.application.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 2, row.source_stream.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 3, row.template_name.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 4, row.rules.c_str(), -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(stmt.get()) != SQLITE_DONE) {
+        return sqlite_error(db_, "step upsert_transcoding_assignment");
+    }
+    return {};
+}
+
+Result<void> SqliteStore::delete_transcoding_assignment(std::string_view application,
+                                                         std::string_view source_stream) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    Statement stmt(db_, "DELETE FROM transcoding_assignments "
+                        "WHERE application = ? AND source_stream = ?");
+    if (!stmt.valid()) return sqlite_error(db_, "prepare delete_transcoding_assignment");
+    sqlite3_bind_text(stmt.get(), 1, application.data(), static_cast<int>(application.size()), SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 2, source_stream.data(), static_cast<int>(source_stream.size()), SQLITE_TRANSIENT);
+    if (sqlite3_step(stmt.get()) != SQLITE_DONE) {
+        return sqlite_error(db_, "step delete_transcoding_assignment");
+    }
+    return {};
+}
+
+Result<std::vector<TranscodingAssignmentRow>> SqliteStore::load_transcoding_assignments() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    Statement stmt(db_, "SELECT application, source_stream, template_name, rules "
+                        "FROM transcoding_assignments ORDER BY application, source_stream");
+    if (!stmt.valid()) return sqlite_error(db_, "prepare load_transcoding_assignments");
+    std::vector<TranscodingAssignmentRow> rows;
+    int rc = SQLITE_OK;
+    while ((rc = sqlite3_step(stmt.get())) == SQLITE_ROW) {
+        TranscodingAssignmentRow row;
+        row.application = reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 0));
+        row.source_stream = reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 1));
+        row.template_name = reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 2));
+        row.rules = reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 3));
+        rows.push_back(std::move(row));
+    }
+    if (rc != SQLITE_DONE) return sqlite_error(db_, "step load_transcoding_assignments");
+    return rows;
 }
 
 } // namespace rtmp_server::persistence

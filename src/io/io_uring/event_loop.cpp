@@ -730,6 +730,8 @@ void IoUringEventLoop::start_rtmp_session(const std::shared_ptr<TcpConnection>& 
     deps.recorder_factory = services_.recorder_factory;
     deps.viewer_attached_handler = services_.viewer_attached_handler;
     deps.viewer_detached_handler = services_.viewer_detached_handler;
+    deps.publish_start_handler = services_.publish_start_handler;
+    deps.publish_stop_handler = services_.publish_stop_handler;
     deps.client_ip = connection->client_ip();
     deps.playback_queue_limits =
         protocol::commands::QueueLimits{config_.subscriber_queue_max_bytes, config_.subscriber_queue_max_packets};

@@ -40,6 +40,11 @@ public:
     core::Result<void> upsert_stream(const StreamRow& row) override;
     core::Result<void> delete_stream(std::string_view application, std::string_view name) override;
     [[nodiscard]] core::Result<std::vector<StreamRow>> load_streams() override;
+    core::Result<void> upsert_transcoding_assignment(const TranscodingAssignmentRow& row) override;
+    core::Result<void> delete_transcoding_assignment(std::string_view application,
+                                                      std::string_view source_stream) override;
+    [[nodiscard]] core::Result<std::vector<TranscodingAssignmentRow>>
+    load_transcoding_assignments() override;
 
 private:
     explicit SqliteStore(sqlite3* db) noexcept : db_(db) {}

@@ -62,6 +62,8 @@ public:
         commands::PlaybackAuthorizer playback_authorizer;      // optional; stream/token/IP playback gate
         commands::ViewerLifecycleHandler viewer_attached_handler;
         commands::ViewerLifecycleHandler viewer_detached_handler;
+        commands::CommandSession::PublishStartHandler publish_start_handler;
+        commands::CommandSession::PublishStopHandler publish_stop_handler;
         std::string client_ip;                                 // optional; forwarded to playback authorization
         commands::QueueLimits playback_queue_limits;           // optional; defaults per viewer_queue.hpp
     };

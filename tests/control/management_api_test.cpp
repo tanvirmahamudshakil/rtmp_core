@@ -201,6 +201,61 @@ TEST(ManagementApiTest, UnknownRouteReturns404) {
     EXPECT_EQ(response.status, 404);
 }
 
+TEST(ManagementApiTest, TranscodingStatusIsSafeWhenSupervisorIsDisabled) {
+    StreamManager manager(manager_options());
+    ManagementApi api(manager, api_options());
+    auto response = api.handle(authed("GET", "/v1/transcoding/status"));
+    EXPECT_EQ(response.status, 200);
+    EXPECT_NE(response.body.find(R"("enabled":false)"), std::string::npos);
+    EXPECT_NE(response.body.find(R"("jobs":[])"), std::string::npos);
+}
+
+TEST(ManagementApiTest, TranscodingAssignmentsCanBeListedAppliedAndRemoved) {
+    StreamManager manager(manager_options());
+    ManagementApi api(manager, api_options());
+    std::string applied_rules;
+    bool removed = false;
+    api.set_transcoding_assignment_handlers(
+        [](std::string_view application) -> rtmp_server::core::Result<std::string> {
+            EXPECT_EQ(application, "football");
+            return std::string(R"({"items":[]})");
+        },
+        [&applied_rules](std::string_view application, std::string_view source,
+                         std::string_view template_name,
+                         std::string_view rules) -> rtmp_server::core::Result<std::string> {
+            EXPECT_EQ(application, "football");
+            EXPECT_EQ(source, "live2");
+            EXPECT_EQ(template_name, "Sports HD");
+            applied_rules = rules;
+            return std::string(R"({"application":"football","source_stream":"live2"})");
+        },
+        [&removed](std::string_view application,
+                    std::string_view source) -> rtmp_server::core::Result<void> {
+            EXPECT_EQ(application, "football");
+            EXPECT_EQ(source, "live2");
+            removed = true;
+            return {};
+        });
+
+    auto list_request = authed("GET", "/v1/transcoding/assignments");
+    list_request.query = "application=football";
+    auto list = api.handle(list_request);
+    EXPECT_EQ(list.status, 200);
+    EXPECT_EQ(list.body, R"({"items":[]})");
+
+    auto put = authed("PUT", "/v1/transcoding/assignments/football%3Alive2",
+                      "football/live2|720p|live2_720p|default|h264|2500000|high|60|1280|720|"
+                      "letterbox|aac|128000|first");
+    put.headers["x-template-name"] = "Sports HD";
+    auto applied = api.handle(put);
+    EXPECT_EQ(applied.status, 200);
+    EXPECT_FALSE(applied_rules.empty());
+
+    auto deleted = api.handle(authed("DELETE", "/v1/transcoding/assignments/football%3Alive2"));
+    EXPECT_EQ(deleted.status, 200);
+    EXPECT_TRUE(removed);
+}
+
 TEST(ManagementApiTest, RepeatedBadTokensLockOutTheIp) {
     StreamManager manager(manager_options());
     auto options = api_options();

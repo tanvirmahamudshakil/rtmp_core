@@ -75,6 +75,9 @@ add_subdirectory(src/management)
 # per-IP/per-stream resource bounds): same "builds everywhere" posture as
 # src/management, no HTTP server/socket dependency.
 add_subdirectory(src/authentication)
+# Independent transcoder supervision and backend selection. Media encoding
+# runs out-of-process; this library only owns bounded lifecycle/control work.
+add_subdirectory(src/transcoding)
 # Phase 5 management HTTP API: hand-rolled bounded HTTP/1.1 server over
 # plain POSIX sockets (see docs/management-api.md for why no vendored
 # library was used) plus JSON (de)serialization for the endpoint set.
@@ -108,4 +111,5 @@ if(RTMP_SERVER_BUILD_TESTS)
     endif()
     add_subdirectory(tests/authentication)
     add_subdirectory(tests/control)
+    add_subdirectory(tests/transcoding)
 endif()

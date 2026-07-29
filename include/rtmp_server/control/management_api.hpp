@@ -53,6 +53,17 @@ class ManagementApi {
 public:
     using LiveStateProvider = std::function<std::vector<management::LiveState>()>;
     using StreamDeletedHandler = std::function<void(std::string_view application, std::string_view name)>;
+    using TranscodingStatusProvider = std::function<std::string()>;
+    using TranscodingAssignmentsProvider =
+        std::function<core::Result<std::string>(std::string_view application)>;
+    using TranscodingAssignmentUpdater =
+        std::function<core::Result<std::string>(std::string_view application,
+                                                std::string_view source_stream,
+                                                std::string_view template_name,
+                                                std::string_view rules)>;
+    using TranscodingAssignmentRemover =
+        std::function<core::Result<void>(std::string_view application,
+                                         std::string_view source_stream)>;
 
     ManagementApi(management::StreamManager& manager, ManagementApiOptions options);
 
@@ -65,6 +76,16 @@ public:
     void set_live_state_provider(LiveStateProvider provider) { live_state_provider_ = std::move(provider); }
     void set_stream_deleted_handler(StreamDeletedHandler handler) {
         stream_deleted_handler_ = std::move(handler);
+    }
+    void set_transcoding_status_provider(TranscodingStatusProvider provider) {
+        transcoding_status_provider_ = std::move(provider);
+    }
+    void set_transcoding_assignment_handlers(TranscodingAssignmentsProvider provider,
+                                              TranscodingAssignmentUpdater updater,
+                                              TranscodingAssignmentRemover remover) {
+        transcoding_assignments_provider_ = std::move(provider);
+        transcoding_assignment_updater_ = std::move(updater);
+        transcoding_assignment_remover_ = std::move(remover);
     }
 
     // Suitable for HttpServer::set_handler directly.
@@ -89,6 +110,13 @@ private:
     [[nodiscard]] HttpResponse handle_viewers(std::string_view application, std::string_view name);
     [[nodiscard]] HttpResponse handle_disconnect_publisher(std::string_view application, std::string_view name);
     [[nodiscard]] HttpResponse handle_disconnect_viewers(std::string_view application, std::string_view name);
+    [[nodiscard]] HttpResponse handle_transcoding_status();
+    [[nodiscard]] HttpResponse handle_list_transcoding_assignments(const HttpRequest& request);
+    [[nodiscard]] HttpResponse handle_put_transcoding_assignment(std::string_view application,
+                                                                  std::string_view source_stream,
+                                                                  const HttpRequest& request);
+    [[nodiscard]] HttpResponse handle_delete_transcoding_assignment(std::string_view application,
+                                                                     std::string_view source_stream);
 
     void audit(std::string_view action, std::string_view application, std::string_view name, bool success);
 
@@ -102,6 +130,10 @@ private:
     protocol::commands::StreamIdRegistry* stream_ids_ = nullptr;
     LiveStateProvider live_state_provider_;
     StreamDeletedHandler stream_deleted_handler_;
+    TranscodingStatusProvider transcoding_status_provider_;
+    TranscodingAssignmentsProvider transcoding_assignments_provider_;
+    TranscodingAssignmentUpdater transcoding_assignment_updater_;
+    TranscodingAssignmentRemover transcoding_assignment_remover_;
 
     struct FailureWindow {
         std::size_t count = 0;
