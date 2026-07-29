@@ -43,7 +43,10 @@ import { Application, ControlClient, Snapshot, Stream } from "./api";
 type Page = "home" | "applications" | "transcode" | "server";
 type ApplicationTab = "playback" | "transcoding";
 type VideoCodec = "H.263" | "H.264" | "H.265" | "VP8" | "VP9" | "Passthrough" | "Disabled";
-type EncodingImplementation = "Automatic" | "Software" | "Hardware GPU";
+type EncodingImplementation = "Beamr" | "QuickSync" | "NVENC" | "Default";
+type VideoProfile = "baseline" | "main" | "high";
+type FitMode = "match-source" | "fit-width" | "fit-height" | "crop" | "stretch" | "letterbox";
+type AudioCodec = "AAC" | "Vorbis" | "Opus" | "Passthrough" | "Disabled";
 type EncodingPreset = {
   id: string;
   name: string;
@@ -52,6 +55,14 @@ type EncodingPreset = {
   videoCodec: VideoCodec;
   videoBitrate: number;
   implementation: EncodingImplementation;
+  profile: VideoProfile;
+  keyFrameMode: "source" | "interval";
+  keyFrameInterval: number | null;
+  frameWidth: number | null;
+  frameHeight: number | null;
+  fitMode: FitMode;
+  audioCodec: AudioCodec;
+  audioBitrate: number;
   gpuMode: "first" | "specific";
   gpuId: number | null;
 };
@@ -75,12 +86,31 @@ const applicationTabs: { id: ApplicationTab; label: string }[] = [
   { id: "transcoding", label: "Transcoding" }
 ];
 const videoCodecs: VideoCodec[] = ["H.263", "H.264", "H.265", "VP8", "VP9", "Passthrough", "Disabled"];
+const encodingImplementations: EncodingImplementation[] = ["Beamr", "QuickSync", "NVENC", "Default"];
+const videoProfiles: VideoProfile[] = ["baseline", "main", "high"];
+const fitModes: FitMode[] = ["match-source", "fit-width", "fit-height", "crop", "stretch", "letterbox"];
+const audioCodecs: AudioCodec[] = ["AAC", "Vorbis", "Opus", "Passthrough", "Disabled"];
 const transcodingStorageKey = "streamforge-transcoding-templates";
 const newLocalId = () => globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(16).slice(2)}`;
 const loadTranscodingTemplates = (): TranscodingTemplate[] => {
   try {
-    const stored = JSON.parse(localStorage.getItem(transcodingStorageKey) ?? "[]");
-    return Array.isArray(stored) ? stored : [];
+    const stored = JSON.parse(localStorage.getItem(transcodingStorageKey) ?? "[]") as TranscodingTemplate[];
+    if (!Array.isArray(stored)) return [];
+    return stored.map((template) => ({
+      ...template,
+      presets: Array.isArray(template.presets) ? template.presets.map((preset) => ({
+        ...preset,
+        implementation: encodingImplementations.includes(preset.implementation) ? preset.implementation : "Default",
+        profile: preset.profile ?? "high",
+        keyFrameMode: preset.keyFrameMode ?? "source",
+        keyFrameInterval: preset.keyFrameInterval ?? null,
+        frameWidth: preset.frameWidth ?? null,
+        frameHeight: preset.frameHeight ?? null,
+        fitMode: preset.fitMode ?? "match-source",
+        audioCodec: preset.audioCodec ?? "AAC",
+        audioBitrate: preset.audioBitrate ?? 128000
+      })) : []
+    }));
   } catch {
     return [];
   }
@@ -754,7 +784,15 @@ function NewPresetModal({ onClose, onAdd }: { onClose: () => void; onAdd: (prese
   const [description, setDescription] = useState("");
   const [videoCodec, setVideoCodec] = useState<VideoCodec>("H.264");
   const [videoBitrate, setVideoBitrate] = useState("2500000");
-  const [implementation, setImplementation] = useState<EncodingImplementation>("Automatic");
+  const [implementation, setImplementation] = useState<EncodingImplementation>("Default");
+  const [profile, setProfile] = useState<VideoProfile>("high");
+  const [keyFrameMode, setKeyFrameMode] = useState<"source" | "interval">("source");
+  const [keyFrameInterval, setKeyFrameInterval] = useState("60");
+  const [frameWidth, setFrameWidth] = useState("");
+  const [frameHeight, setFrameHeight] = useState("");
+  const [fitMode, setFitMode] = useState<FitMode>("match-source");
+  const [audioCodec, setAudioCodec] = useState<AudioCodec>("AAC");
+  const [audioBitrate, setAudioBitrate] = useState("128000");
   const [gpuMode, setGpuMode] = useState<"first" | "specific">("first");
   const [gpuId, setGpuId] = useState("0");
   return (
@@ -769,6 +807,14 @@ function NewPresetModal({ onClose, onAdd }: { onClose: () => void; onAdd: (prese
           videoCodec,
           videoBitrate: Math.max(0, Number(videoBitrate) || 0),
           implementation,
+          profile,
+          keyFrameMode,
+          keyFrameInterval: keyFrameMode === "interval" ? Math.max(1, Number(keyFrameInterval) || 1) : null,
+          frameWidth: frameWidth ? Math.max(1, Number(frameWidth) || 1) : null,
+          frameHeight: frameHeight ? Math.max(1, Number(frameHeight) || 1) : null,
+          fitMode,
+          audioCodec,
+          audioBitrate: Math.max(0, Number(audioBitrate) || 0),
           gpuMode,
           gpuId: gpuMode === "specific" ? Math.max(0, Number(gpuId) || 0) : null
         });
@@ -801,9 +847,43 @@ function NewPresetModal({ onClose, onAdd }: { onClose: () => void; onAdd: (prese
           </label>
           <label htmlFor="encoding-implementation">Encoding Implementation
             <select id="encoding-implementation" value={implementation} onChange={(event) => setImplementation(event.target.value as EncodingImplementation)}>
-              <option>Automatic</option>
-              <option>Software</option>
-              <option>Hardware GPU</option>
+              {encodingImplementations.map((item) => <option key={item}>{item}</option>)}
+            </select>
+          </label>
+          <label htmlFor="video-profile">Profile
+            <select id="video-profile" value={profile} onChange={(event) => setProfile(event.target.value as VideoProfile)}>
+              {videoProfiles.map((item) => <option key={item}>{item}</option>)}
+            </select>
+          </label>
+        </div>
+
+        <fieldset className="gpu-fieldset keyframe-fieldset">
+          <legend>Key Frame Interval</legend>
+          <label className="radio-option">
+            <input type="radio" name="key-frame-mode" checked={keyFrameMode === "source"} onChange={() => setKeyFrameMode("source")} />
+            <span><strong>Same as source</strong><small>Required for transrating.</small></span>
+          </label>
+          <label className="radio-option">
+            <input type="radio" name="key-frame-mode" checked={keyFrameMode === "interval"} onChange={() => setKeyFrameMode("interval")} />
+            <span><strong>Insert a key frame every:</strong><small>Set a fixed frame interval.</small></span>
+            <div className="compact-unit-input">
+              <input aria-label="Key frame interval" type="number" min="1" value={keyFrameInterval} disabled={keyFrameMode !== "interval"} onChange={(event) => setKeyFrameInterval(event.target.value)} />
+              <span>frames</span>
+            </div>
+          </label>
+        </fieldset>
+
+        <div className="form-section-heading"><span><AppWindow size={17} /></span><div><strong>Frame Size</strong><small>Output dimensions and source fitting</small></div></div>
+        <div className="frame-size-grid">
+          <label htmlFor="frame-width">Width
+            <div className="field-with-unit"><input id="frame-width" type="number" min="1" placeholder="Source" value={frameWidth} onChange={(event) => setFrameWidth(event.target.value)} /><span>px</span></div>
+          </label>
+          <label htmlFor="frame-height">Height
+            <div className="field-with-unit"><input id="frame-height" type="number" min="1" placeholder="Source" value={frameHeight} onChange={(event) => setFrameHeight(event.target.value)} /><span>px</span></div>
+          </label>
+          <label htmlFor="fit-mode">Fit Mode
+            <select id="fit-mode" value={fitMode} onChange={(event) => setFitMode(event.target.value as FitMode)}>
+              {fitModes.map((item) => <option key={item}>{item}</option>)}
             </select>
           </label>
         </div>
@@ -820,6 +900,22 @@ function NewPresetModal({ onClose, onAdd }: { onClose: () => void; onAdd: (prese
             <input className="gpu-id-input" aria-label="GPU ID" type="number" min="0" value={gpuId} disabled={gpuMode !== "specific"} onChange={(event) => setGpuId(event.target.value)} />
           </label>
         </fieldset>
+
+        <div className="form-section-heading"><span><Radio size={17} /></span><div><strong>Audio Settings</strong><small>Codec and outgoing audio bitrate</small></div></div>
+        <div className="audio-settings-grid">
+          <label htmlFor="audio-codec">Audio Codec
+            <select id="audio-codec" value={audioCodec} onChange={(event) => setAudioCodec(event.target.value as AudioCodec)}>
+              {audioCodecs.map((codec) => <option key={codec}>{codec}</option>)}
+            </select>
+          </label>
+          <label htmlFor="audio-bitrate">Audio Bitrate
+            <div className="field-with-unit">
+              <input id="audio-bitrate" type="number" min="0" step="1000" value={audioBitrate} onChange={(event) => setAudioBitrate(event.target.value)} />
+              <span>bps</span>
+            </div>
+            <small>Bits per second (bps)</small>
+          </label>
+        </div>
 
         <div className="modal-actions">
           <button type="button" className="secondary-button" onClick={onClose}>Cancel</button>
@@ -878,6 +974,10 @@ function TranscodePage() {
                 <div className="preset-card-stats">
                   <div><span>Video bitrate</span><strong>{preset.videoBitrate ? `${preset.videoBitrate.toLocaleString()} bps` : "Automatic"}</strong></div>
                   <div><span>Implementation</span><strong>{preset.implementation}</strong></div>
+                  <div><span>Profile</span><strong>{preset.profile}</strong></div>
+                  <div><span>Key frames</span><strong>{preset.keyFrameMode === "source" ? "Same as source" : `Every ${preset.keyFrameInterval} frames`}</strong></div>
+                  <div><span>Frame size</span><strong>{preset.frameWidth && preset.frameHeight ? `${preset.frameWidth} × ${preset.frameHeight}` : "Same as source"} · {preset.fitMode}</strong></div>
+                  <div><span>Audio</span><strong>{preset.audioCodec} · {preset.audioBitrate.toLocaleString()} bps</strong></div>
                   <div><span>GPU</span><strong>{preset.gpuMode === "first" ? "First available" : `GPU ${preset.gpuId}`}</strong></div>
                 </div>
               </article>
