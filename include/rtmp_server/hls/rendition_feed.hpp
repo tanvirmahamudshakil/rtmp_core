@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <span>
+#include <vector>
 
 #include "rtmp_server/hls/segmenter.hpp"
 
@@ -37,6 +38,12 @@ private:
     Segmenter& segmenter_;
     bool video_config_sent_ = false;
     bool audio_config_sent_ = false;
+    // The encoder may legitimately replace parameter sets after a restart or
+    // reconfiguration. Retain the exact values used for the current AVC
+    // decoder configuration so a changed keyframe can refresh it before its
+    // slices are forwarded.
+    std::vector<std::byte> video_sps_;
+    std::vector<std::byte> video_pps_;
 };
 
 } // namespace rtmp_server::hls

@@ -303,6 +303,43 @@ TEST(NativeAacEncoder, EncodesPcmToAdtsFrames) {
         EXPECT_EQ(frame.samples_per_channel, 1024U);
     }
 }
+
+TEST(NativeAacDecoder, DrainsEveryAdtsFrameFromOnePes) {
+    AacParamSet params;
+    params.profile = AacProfile::LowComplexity;
+    params.sample_rate = 48000;
+    params.channels = 2;
+    params.bitrate = 128'000;
+
+    AacEncoder encoder;
+    ASSERT_TRUE(encoder.open(params).ok());
+    std::vector<EncodedAudioFrame> encoded;
+    double phase = 0.0;
+    for (int i = 0; i < 8; ++i) {
+        const PcmBlock block = make_sine_block(48000, 2, 1024, phase);
+        phase += 1024 * 2.0 * 3.14159265358979 * 440.0 / 48000;
+        ASSERT_TRUE(encoder.encode(block, encoded).ok());
+    }
+    ASSERT_TRUE(encoder.flush(encoded).ok());
+    ASSERT_GE(encoded.size(), 3U);
+
+    std::vector<std::byte> pes;
+    std::size_t expected_frames = 0;
+    for (std::size_t i = 0; i < 3; ++i) {
+        pes.insert(pes.end(), encoded[i].adts.begin(), encoded[i].adts.end());
+        expected_frames += encoded[i].samples_per_channel;
+    }
+
+    AacDecoder decoder;
+    ASSERT_TRUE(decoder.configure_adts().ok());
+    PcmBlock decoded;
+    bool produced = false;
+    ASSERT_TRUE(decoder.decode(pes, decoded, produced).ok());
+    ASSERT_TRUE(produced);
+    EXPECT_EQ(decoded.sample_rate, 48000U);
+    EXPECT_EQ(decoded.channels, 2U);
+    EXPECT_EQ(decoded.frames(), expected_frames);
+}
 TEST(NativeSourceTranscoder, FansOneSourceOutToMultipleRenditions) {
     // Build a decodable H.264 source by encoding gradient frames (keyframe
     // carries SPS/PPS), then transcode that source into two renditions.

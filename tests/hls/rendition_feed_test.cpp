@@ -86,3 +86,23 @@ TEST(RenditionFeed, ReframesEncodedEsIntoHlsSegments) {
     // Encoded config should have been derived, so a codecs attribute exists.
     EXPECT_FALSE(segmenter.codecs_attribute().empty());
 }
+
+TEST(RenditionFeed, RefreshesDecoderConfigurationWhenParameterSetsChange) {
+    std::vector<SegmentPtr> segments;
+    Segmenter segmenter([&](SegmentPtr segment) { segments.push_back(std::move(segment)); });
+    RenditionFeed feed(segmenter);
+
+    auto first_pps = pps_nal();
+    auto second_pps = first_pps;
+    ASSERT_FALSE(second_pps.empty());
+    second_pps.back() ^= std::byte{0x01};
+
+    feed.push_video(annexb({sps_nal(), first_pps, slice_nal(5, 100)}), 0, 0, true);
+    feed.push_video(annexb({slice_nal(1, 80)}), 3000, 3000, false);
+    feed.push_video(annexb({sps_nal(), second_pps, slice_nal(5, 100)}), 90000, 90000, true);
+    segmenter.finalize();
+
+    EXPECT_EQ(segmenter.stats().sequence_header_changes, 1U);
+    ASSERT_GE(segments.size(), 2U);
+    EXPECT_TRUE(segments.back()->discontinuity);
+}

@@ -75,6 +75,12 @@ core::Result<void> H264Encoder::open(const H264EncoderConfig& config) {
     param.bEnableSceneChangeDetect = false; // fixed GOP for segment alignment
     param.iSpatialLayerNum = 1;
     param.iTemporalLayerNum = 1;
+    // Renditions are long-lived streams. Keep SPS/PPS identifiers stable
+    // across IDRs so every slice continues to reference the parameter sets
+    // cached by HLS players. Some openh264 builds default to incrementing the
+    // PPS id on every IDR, which makes a stream undecodable if a downstream
+    // bridge retains the original decoder configuration.
+    param.eSpsPpsIdStrategy = CONSTANT_ID;
 
     SSpatialLayerConfig& layer = param.sSpatialLayers[0];
     layer.iVideoWidth = static_cast<int>(config.width);
@@ -94,6 +100,8 @@ core::Result<void> H264Encoder::open(const H264EncoderConfig& config) {
 
     width_ = config.width;
     height_ = config.height;
+    fps_ = config.fps;
+    submitted_frames_ = 0;
     return {};
 }
 
@@ -114,7 +122,14 @@ core::Result<void> H264Encoder::encode(const YuvFrame& frame,
     pic.pData[0] = const_cast<std::uint8_t*>(frame.y.data());
     pic.pData[1] = const_cast<std::uint8_t*>(frame.u.data());
     pic.pData[2] = const_cast<std::uint8_t*>(frame.v.data());
-    pic.uiTimeStamp = frame.pts_90k;
+    // openh264's source-picture timestamp is a millisecond pacing clock used
+    // by rate control; it is not the output media PTS. Drive it from the
+    // configured frame cadence so a discontinuity/reconnect in the MPEG 90 kHz
+    // media timeline cannot look like a multi-minute input gap and provoke a
+    // burst of skipped frames. The original PTS is retained on the emitted AU
+    // below.
+    pic.uiTimeStamp = static_cast<long long>(submitted_frames_ * 1000ULL / fps_);
+    ++submitted_frames_;
 
     SFrameBSInfo info{};
     const int rc = impl_->encoder->EncodeFrame(&pic, &info);

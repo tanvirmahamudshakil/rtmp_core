@@ -60,6 +60,8 @@ private:
     std::unique_ptr<Impl> impl_;
     std::uint32_t width_ = 0;
     std::uint32_t height_ = 0;
+    std::uint32_t fps_ = 1;
+    std::uint64_t submitted_frames_ = 0;
 };
 
 } // namespace rtmp_server::transcoding::native

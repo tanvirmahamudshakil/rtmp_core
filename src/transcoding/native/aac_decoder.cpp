@@ -62,24 +62,39 @@ core::Result<void> AacDecoder::decode(std::span<const std::byte> aac_frame, PcmB
         return decode_error("aacDecoder_Fill failed");
     }
 
-    const AAC_DECODER_ERROR err = aacDecoder_DecodeFrame(
-        impl_->handle, impl_->scratch.data(), static_cast<INT>(impl_->scratch.size()), 0);
-    if (err == AAC_DEC_NOT_ENOUGH_BITS) return {}; // needs more input, not an error
-    if (err != AAC_DEC_OK) return decode_error("aacDecoder_DecodeFrame failed");
+    // A TS audio PES commonly contains several concatenated ADTS frames.
+    // Drain every complete frame accepted by Fill; decoding only once per PES
+    // leaves most audio buffered forever and makes its output clock advance
+    // several times slower than video.
+    out.samples.clear();
+    out.sample_rate = 0;
+    out.channels = 0;
+    for (;;) {
+        const AAC_DECODER_ERROR err = aacDecoder_DecodeFrame(
+            impl_->handle, impl_->scratch.data(), static_cast<INT>(impl_->scratch.size()), 0);
+        if (err == AAC_DEC_NOT_ENOUGH_BITS) break;
+        if (err != AAC_DEC_OK) return decode_error("aacDecoder_DecodeFrame failed");
 
-    const CStreamInfo* info = aacDecoder_GetStreamInfo(impl_->handle);
-    if (info == nullptr || info->sampleRate <= 0 || info->numChannels <= 0) {
-        return decode_error("decoder produced invalid stream info");
+        const CStreamInfo* info = aacDecoder_GetStreamInfo(impl_->handle);
+        if (info == nullptr || info->sampleRate <= 0 || info->numChannels <= 0 ||
+            info->frameSize <= 0) {
+            return decode_error("decoder produced invalid stream info");
+        }
+        const auto sample_rate = static_cast<std::uint32_t>(info->sampleRate);
+        const auto channels = static_cast<std::uint32_t>(info->numChannels);
+        if (!out.samples.empty() &&
+            (out.sample_rate != sample_rate || out.channels != channels)) {
+            return decode_error("AAC format changed within one input packet");
+        }
+        out.sample_rate = sample_rate;
+        out.channels = channels;
+
+        const auto frames = static_cast<std::uint32_t>(info->frameSize);
+        const std::size_t count = static_cast<std::size_t>(frames) * channels;
+        out.samples.insert(out.samples.end(), impl_->scratch.begin(),
+                           impl_->scratch.begin() + static_cast<std::ptrdiff_t>(count));
     }
-    const auto channels = static_cast<std::uint32_t>(info->numChannels);
-    const auto frames = static_cast<std::uint32_t>(info->frameSize);
-    const std::size_t count = static_cast<std::size_t>(frames) * channels;
-
-    out.sample_rate = static_cast<std::uint32_t>(info->sampleRate);
-    out.channels = channels;
-    out.samples.assign(impl_->scratch.begin(),
-                       impl_->scratch.begin() + static_cast<std::ptrdiff_t>(count));
-    produced = frames > 0;
+    produced = !out.samples.empty();
     return {};
 }
 

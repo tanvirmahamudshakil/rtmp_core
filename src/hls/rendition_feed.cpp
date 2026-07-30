@@ -1,5 +1,6 @@
 #include "rtmp_server/hls/rendition_feed.hpp"
 
+#include <algorithm>
 #include <array>
 #include <vector>
 
@@ -26,6 +27,10 @@ void put_u32(std::vector<std::byte>& out, std::uint32_t v) {
 }
 
 std::int64_t to_ms(std::int64_t ts_90k) { return ts_90k / 90; }
+
+bool same_nal(std::span<const std::byte> nal, const std::vector<std::byte>& cached) {
+    return nal.size() == cached.size() && std::equal(nal.begin(), nal.end(), cached.begin());
+}
 
 // Splits an Annex B buffer into individual NAL units (payload without the start
 // code). Handles both 3- and 4-byte start codes.
@@ -88,8 +93,16 @@ void RenditionFeed::push_video(std::span<const std::byte> annexb, std::int64_t p
 
     const std::int64_t dts_ms = to_ms(dts_90k);
 
-    // Emit the AVCDecoderConfigurationRecord once, from the first keyframe.
-    if (!video_config_sent_ && !sps.empty() && !pps.empty() && sps.size() >= 4) {
+    // Emit the first AVCDecoderConfigurationRecord and refresh it whenever the
+    // encoder supplies changed parameter sets. Refreshing before the matching
+    // keyframe prevents a slice from referencing a newer PPS id while the HLS
+    // segmenter/player still holds the old PPS.
+    const bool have_complete_config = !sps.empty() && !pps.empty() && sps.size() >= 4 &&
+                                      sps.size() <= 0xFFFFu && pps.size() <= 0xFFFFu;
+    const bool config_changed =
+        have_complete_config &&
+        (!video_config_sent_ || !same_nal(sps, video_sps_) || !same_nal(pps, video_pps_));
+    if (config_changed) {
         std::vector<std::byte> body;
         put_u8(body, 0x17); // keyframe | AVC
         put_u8(body, 0x00); // AVCPacketType 0 = sequence header
@@ -110,6 +123,8 @@ void RenditionFeed::push_video(std::span<const std::byte> annexb, std::int64_t p
         put_u8(body, static_cast<std::uint32_t>(pps.size() & 0xFF));
         body.insert(body.end(), pps.begin(), pps.end());
         segmenter_.on_video(make_message(9, dts_ms, std::move(body)));
+        video_sps_.assign(sps.begin(), sps.end());
+        video_pps_.assign(pps.begin(), pps.end());
         video_config_sent_ = true;
     }
     if (!video_config_sent_) return; // wait for a keyframe with parameter sets

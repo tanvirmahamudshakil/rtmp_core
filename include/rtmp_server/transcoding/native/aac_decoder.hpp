@@ -39,8 +39,9 @@ public:
     // where each frame carries its own header and no out-of-band config exists.
     [[nodiscard]] core::Result<void> configure_adts();
 
-    // Decodes one raw AAC frame. On success `produced` is true when a PCM block
-    // was written to `out` (rarely a frame yields nothing until primed).
+    // Decodes all complete AAC frames in the supplied access unit/PES. On
+    // success `produced` is true when a PCM block was written to `out` (rarely
+    // a frame yields nothing until the decoder is primed).
     [[nodiscard]] core::Result<void> decode(std::span<const std::byte> aac_frame, PcmBlock& out,
                                             bool& produced);
 
