@@ -7,6 +7,7 @@ add_library(rtmp_server_transcoding STATIC
     # pipeline enabled.
     native/geometry.cpp
     native/hevc_params.cpp
+    native/aac_params.cpp
 )
 
 target_include_directories(rtmp_server_transcoding PUBLIC
@@ -32,11 +33,15 @@ if(RTMP_NATIVE_TRANSCODE_AVAILABLE)
         native/scaler.cpp
         native/hevc_encoder.cpp
         native/video_transcoder.cpp
+        native/aac_decoder.cpp
+        native/aac_encoder.cpp
+        native/audio_transcoder.cpp
     )
     target_link_libraries(rtmp_server_transcoding
         PUBLIC
             PkgConfig::X265
             PkgConfig::OPENH264
+            PkgConfig::FDKAAC
             ${RTMP_LIBYUV_TARGET}
     )
     target_compile_definitions(rtmp_server_transcoding PUBLIC RTMP_NATIVE_TRANSCODE=1)

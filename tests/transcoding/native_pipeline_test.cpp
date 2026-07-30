@@ -2,10 +2,15 @@
 
 #include <algorithm>
 
+#include "rtmp_server/transcoding/native/aac_params.hpp"
 #include "rtmp_server/transcoding/native/geometry.hpp"
 #include "rtmp_server/transcoding/native/hevc_params.hpp"
 #include "rtmp_server/transcoding/preset.hpp"
 #ifdef RTMP_NATIVE_TRANSCODE
+#include <cmath>
+
+#include "rtmp_server/transcoding/native/aac_decoder.hpp"
+#include "rtmp_server/transcoding/native/aac_encoder.hpp"
 #include "rtmp_server/transcoding/native/frame.hpp"
 #include "rtmp_server/transcoding/native/hevc_encoder.hpp"
 #include "rtmp_server/transcoding/native/scaler.hpp"
@@ -134,6 +139,44 @@ TEST(NativeHevcParams, DefaultGopIsTwoSecondsOfFrames) {
     EXPECT_EQ(set.keyint, 120U); // 60 fps * 2 s
 }
 
+// --- AAC audio parameter mapping (pure) ---
+
+TEST(NativeAacParams, FollowsSourceRateAndTargetBitrate) {
+    Preset preset;
+    preset.audio_bitrate = 128'000;
+    const auto set = build_aac_param_set(preset, AacQualityOptions{}, 48000, 2);
+    EXPECT_EQ(set.sample_rate, 48000U); // no resampling
+    EXPECT_EQ(set.channels, 2U);
+    EXPECT_EQ(set.bitrate, 128'000U);
+    EXPECT_EQ(set.profile, AacProfile::LowComplexity);
+    EXPECT_EQ(set.audio_object_type(), 2);
+}
+
+TEST(NativeAacParams, AutoSelectsHeAacV2ForLowBitrateStereo) {
+    Preset preset;
+    preset.audio_bitrate = 48'000; // below the 64k auto-HE threshold
+    const auto set = build_aac_param_set(preset, AacQualityOptions{}, 44100, 2);
+    EXPECT_EQ(set.profile, AacProfile::HighEfficiencyV2);
+    EXPECT_EQ(set.audio_object_type(), 29);
+}
+
+TEST(NativeAacParams, AutoHeFallsBackToHeAacForMono) {
+    Preset preset;
+    preset.audio_bitrate = 48'000;
+    const auto set = build_aac_param_set(preset, AacQualityOptions{}, 44100, 1);
+    EXPECT_EQ(set.profile, AacProfile::HighEfficiency); // PS needs stereo
+    EXPECT_EQ(set.channels, 1U);
+}
+
+TEST(NativeAacParams, RespectsExplicitProfileWhenAutoDisabled) {
+    Preset preset;
+    preset.audio_bitrate = 32'000;
+    AacQualityOptions quality;
+    quality.allow_auto_profile = false;
+    const auto set = build_aac_param_set(preset, quality, 44100, 2);
+    EXPECT_EQ(set.profile, AacProfile::LowComplexity);
+}
+
 #ifdef RTMP_NATIVE_TRANSCODE
 // End-to-end scale + encode, compiled only when the native codec libraries are
 // available. Exercises libyuv and x265 against synthetic frames.
@@ -189,6 +232,54 @@ TEST(NativeHevcEncoder, EncodesFramesAndEmitsKeyframe) {
     for (const auto& au : out) {
         EXPECT_FALSE(au.annexb.empty());
         EXPECT_TRUE(starts_with_annexb(au.annexb));
+    }
+}
+
+PcmBlock make_sine_block(std::uint32_t sample_rate, std::uint32_t channels, std::uint32_t frames,
+                         double phase_start) {
+    PcmBlock block;
+    block.sample_rate = sample_rate;
+    block.channels = channels;
+    block.samples.resize(static_cast<std::size_t>(frames) * channels);
+    const double step = 2.0 * 3.14159265358979 * 440.0 / sample_rate;
+    for (std::uint32_t f = 0; f < frames; ++f) {
+        const auto value =
+            static_cast<std::int16_t>(std::sin(phase_start + f * step) * 12000.0);
+        for (std::uint32_t c = 0; c < channels; ++c)
+            block.samples[static_cast<std::size_t>(f) * channels + c] = value;
+    }
+    return block;
+}
+
+bool is_adts(const std::vector<std::byte>& b) {
+    // ADTS syncword is 12 set bits: 0xFF followed by 0xF0 in the top nibble.
+    return b.size() >= 7 && b[0] == std::byte{0xFF} && (std::to_integer<int>(b[1]) & 0xF0) == 0xF0;
+}
+
+TEST(NativeAacEncoder, EncodesPcmToAdtsFrames) {
+    AacParamSet params;
+    params.profile = AacProfile::LowComplexity;
+    params.sample_rate = 44100;
+    params.channels = 2;
+    params.bitrate = 128'000;
+
+    AacEncoder encoder;
+    ASSERT_TRUE(encoder.open(params).ok());
+    EXPECT_EQ(encoder.frame_length(), 1024U);
+
+    std::vector<EncodedAudioFrame> out;
+    double phase = 0.0;
+    for (int i = 0; i < 20; ++i) {
+        const PcmBlock block = make_sine_block(44100, 2, 1024, phase);
+        phase += 1024 * 2.0 * 3.14159265358979 * 440.0 / 44100;
+        ASSERT_TRUE(encoder.encode(block, out).ok());
+    }
+    ASSERT_TRUE(encoder.flush(out).ok());
+
+    ASSERT_FALSE(out.empty());
+    for (const auto& frame : out) {
+        EXPECT_TRUE(is_adts(frame.adts));
+        EXPECT_EQ(frame.samples_per_channel, 1024U);
     }
 }
 #endif // RTMP_NATIVE_TRANSCODE

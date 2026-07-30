@@ -60,6 +60,7 @@ if(RTMP_ENABLE_NATIVE_TRANSCODE)
     find_package(PkgConfig REQUIRED)
     pkg_check_modules(X265 IMPORTED_TARGET x265)
     pkg_check_modules(OPENH264 IMPORTED_TARGET openh264)
+    pkg_check_modules(FDKAAC IMPORTED_TARGET fdk-aac)
     pkg_check_modules(LIBYUV IMPORTED_TARGET libyuv)
 
     # libyuv frequently ships without a .pc file; fall back to a plain search.
@@ -77,13 +78,13 @@ if(RTMP_ENABLE_NATIVE_TRANSCODE)
         set(RTMP_LIBYUV_TARGET PkgConfig::LIBYUV)
     endif()
 
-    if(X265_FOUND AND OPENH264_FOUND AND RTMP_LIBYUV_TARGET)
+    if(X265_FOUND AND OPENH264_FOUND AND FDKAAC_FOUND AND RTMP_LIBYUV_TARGET)
         set(RTMP_NATIVE_TRANSCODE_AVAILABLE ON)
     else()
         message(FATAL_ERROR
             "RTMP_ENABLE_NATIVE_TRANSCODE=ON but dependencies are missing "
-            "(x265=${X265_FOUND} openh264=${OPENH264_FOUND} libyuv=${LIBYUV_FOUND}). "
-            "Install them, e.g. on Ubuntu: "
-            "sudo apt-get install libx265-dev libopenh264-dev libyuv-dev")
+            "(x265=${X265_FOUND} openh264=${OPENH264_FOUND} fdk-aac=${FDKAAC_FOUND} "
+            "libyuv=${LIBYUV_FOUND}). Install them, e.g. on Ubuntu: "
+            "sudo apt-get install libx265-dev libopenh264-dev libfdk-aac-dev libyuv-dev")
     endif()
 endif()

@@ -308,7 +308,7 @@ apt-get install -y --no-install-recommends "${APT_REINSTALL_ARGS[@]}" \
 # out-of-process FFmpeg supervisor and needs none of these.
 if [[ "${RTMP_ENABLE_NATIVE_TRANSCODE:-0}" == "1" ]]; then
   apt-get install -y --no-install-recommends "${APT_REINSTALL_ARGS[@]}" \
-    libx265-dev libopenh264-dev libyuv-dev
+    libx265-dev libopenh264-dev libfdk-aac-dev libyuv-dev
 fi
 if ! apt-cache show caddy >/dev/null 2>&1 && [[ "${ID}" == "ubuntu" ]]; then
   apt-get install -y --no-install-recommends "${APT_REINSTALL_ARGS[@]}" software-properties-common

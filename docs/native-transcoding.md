@@ -21,6 +21,43 @@ TsMuxer / segment store              # HEVC PES on a 90 kHz clock
 Everything runs software-only: **openh264** decodes H.264, **libyuv** scales
 I420, **x265** encodes HEVC. No GPU, no FFmpeg process.
 
+Audio is transcoded in parallel with **libfdk-aac** — the highest-quality open
+AAC implementation:
+
+```text
+FLV/AAC raw frame
+    |
+AacDecoder   (libfdk-aac)             # AudioSpecificConfig-configured -> S16 PCM
+    |
+AacEncoder   (libfdk-aac)             # AAC-LC / HE-AAC / HE-AACv2, ADTS-framed
+    |
+TsMuxer audio PES
+```
+
+Re-encoding (rather than passing the source AAC through) lets each rendition
+carry its own audio bitrate/profile — e.g. a mobile rung at 48 kbit HE-AACv2 —
+while the source stays high-rate. No resampling is done: the encoder follows the
+source sample rate, so decode and encode frame sizes line up without a rate
+converter. Where a rendition keeps the source audio format unchanged, the
+existing ADTS passthrough path is still the cheaper choice.
+
+## Why libfdk-aac for audio
+
+libfdk-aac beats the generic encoders most at low bitrates, which is exactly
+where a rendition ladder lives:
+
+- **AAC-LC** (AOT 2) — universal, the default above 64 kbit.
+- **HE-AAC** (AOT 5, SBR) and **HE-AACv2** (AOT 29, SBR + parametric stereo) —
+  hold quality far below 64 kbit for mobile rungs. `build_aac_param_set`
+  auto-selects them below a configurable threshold (stereo → HE-AACv2, mono →
+  HE-AAC), and downgrades HE-AACv2 → HE-AAC for non-stereo sources.
+- **Afterburner** — libfdk's extra bit-distribution search, on by default for a
+  measurable quality gain at the same bitrate.
+
+Output PTS is derived from the running output sample count (anchored to the
+first frame), so it stays exact across the encoder's priming delay instead of
+copying possibly-jittery input timestamps.
+
 ## Why HEVC gives the same quality at a lower bitrate
 
 The saving does not come from the codec alone — it comes from how the encoder
@@ -51,16 +88,17 @@ The knobs live in `HevcQualityOptions`; the defaults target live streaming at
 Off by default. Enable with the CMake option after installing the dev packages:
 
 ```bash
-sudo apt-get install libx265-dev libopenh264-dev libyuv-dev
+sudo apt-get install libx265-dev libopenh264-dev libfdk-aac-dev libyuv-dev
 cmake -S . -B build -DRTMP_ENABLE_NATIVE_TRANSCODE=ON
 cmake --build build
 ```
 
 Or during a VPS install: `RTMP_ENABLE_NATIVE_TRANSCODE=1 bash scripts/install-linux.sh`.
 
-The pure geometry and x265 parameter-mapping logic (`native/geometry.cpp`,
-`native/hevc_params.cpp`) compiles and is unit-tested **even without** the
-codec libraries; only the decode/scale/encode wrappers require them. When the
+The pure geometry, x265 and AAC parameter-mapping logic (`native/geometry.cpp`,
+`native/hevc_params.cpp`, `native/aac_params.cpp`) compiles and is unit-tested
+**even without** the codec libraries; only the decode/scale/encode wrappers
+require them. When the
 option is on, `RTMP_NATIVE_TRANSCODE` is defined for consumers.
 
 ## Components
@@ -73,10 +111,11 @@ option is on, `RTMP_NATIVE_TRANSCODE` is defined for consumers.
 | `native/h264_decoder.*` | openh264 Annex B → I420 |
 | `native/scaler.*` | libyuv scale + crop/letterbox execution of a `ScalePlan` |
 | `native/hevc_encoder.*` | x265 I420 → HEVC Annex B access units |
-| `native/video_transcoder.*` | Pipeline glue: FLV sample → HEVC access units |
-
-Audio is unchanged: AAC is passed through, so the existing ADTS/AAC path in the
-muxer carries it without re-encoding.
+| `native/video_transcoder.*` | Video glue: FLV sample → HEVC access units |
+| `native/aac_params.*` | Pure preset → AAC encoder parameters (testable) |
+| `native/aac_decoder.*` | libfdk-aac raw AAC → S16 PCM |
+| `native/aac_encoder.*` | libfdk-aac PCM → ADTS AAC (internal frame buffering) |
+| `native/audio_transcoder.*` | Audio glue: FLV AAC frame → ADTS access units |
 
 ## Integration boundary
 
