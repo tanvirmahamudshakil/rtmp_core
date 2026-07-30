@@ -64,6 +64,16 @@ public:
     using TranscodingAssignmentRemover =
         std::function<core::Result<void>(std::string_view application,
                                          std::string_view source_stream)>;
+    // Source-transcode jobs: pull an external URL, transcode per template, and
+    // re-serve as HLS. The updater receives the parsed inputs and returns the
+    // job JSON; the provider/remover mirror the assignment handlers.
+    using SourceJobsProvider =
+        std::function<core::Result<std::string>(std::string_view application)>;
+    using SourceJobCreator = std::function<core::Result<std::string>(
+        std::string_view application, std::string_view name, std::string_view source_url,
+        std::string_view template_name, std::string_view rules)>;
+    using SourceJobRemover =
+        std::function<core::Result<void>(std::string_view application, std::string_view name)>;
 
     ManagementApi(management::StreamManager& manager, ManagementApiOptions options);
 
@@ -86,6 +96,12 @@ public:
         transcoding_assignments_provider_ = std::move(provider);
         transcoding_assignment_updater_ = std::move(updater);
         transcoding_assignment_remover_ = std::move(remover);
+    }
+    void set_source_job_handlers(SourceJobsProvider provider, SourceJobCreator creator,
+                                 SourceJobRemover remover) {
+        source_jobs_provider_ = std::move(provider);
+        source_job_creator_ = std::move(creator);
+        source_job_remover_ = std::move(remover);
     }
 
     // Suitable for HttpServer::set_handler directly.
@@ -111,6 +127,10 @@ private:
     [[nodiscard]] HttpResponse handle_disconnect_publisher(std::string_view application, std::string_view name);
     [[nodiscard]] HttpResponse handle_disconnect_viewers(std::string_view application, std::string_view name);
     [[nodiscard]] HttpResponse handle_transcoding_status();
+    [[nodiscard]] HttpResponse handle_list_source_jobs(const HttpRequest& request);
+    [[nodiscard]] HttpResponse handle_create_source_job(const HttpRequest& request);
+    [[nodiscard]] HttpResponse handle_delete_source_job(std::string_view application,
+                                                        std::string_view name);
     [[nodiscard]] HttpResponse handle_list_transcoding_assignments(const HttpRequest& request);
     [[nodiscard]] HttpResponse handle_put_transcoding_assignment(std::string_view application,
                                                                   std::string_view source_stream,
@@ -134,6 +154,9 @@ private:
     TranscodingAssignmentsProvider transcoding_assignments_provider_;
     TranscodingAssignmentUpdater transcoding_assignment_updater_;
     TranscodingAssignmentRemover transcoding_assignment_remover_;
+    SourceJobsProvider source_jobs_provider_;
+    SourceJobCreator source_job_creator_;
+    SourceJobRemover source_job_remover_;
 
     struct FailureWindow {
         std::size_t count = 0;

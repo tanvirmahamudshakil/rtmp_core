@@ -317,8 +317,8 @@ TEST(NativeSourceTranscoder, FansOneSourceOutToMultipleRenditions) {
     ASSERT_FALSE(source_aus.empty());
 
     std::vector<RenditionSpec> renditions = {
-        {"480p-ish", 240, 240, 800'000, 15, 96'000},
-        {"240p", 160, 120, 400'000, 15, 64'000},
+        {"480p-ish", "out_480", 240, 240, 800'000, 15, 96'000},
+        {"240p", "out_240", 160, 120, 400'000, 15, 64'000},
     };
     SourceTranscoder transcoder(renditions, 30);
     ASSERT_TRUE(transcoder.start().ok());
@@ -360,8 +360,8 @@ TEST(NativeSourceTranscoder, ReEncodesAudioPerRendition) {
     }
     ASSERT_FALSE(adts_frames.empty());
 
-    std::vector<RenditionSpec> renditions = {{"hi", 0, 0, 0, 15, 96'000},
-                                             {"lo", 0, 0, 0, 15, 48'000}};
+    std::vector<RenditionSpec> renditions = {{"hi", "out_hi", 0, 0, 0, 15, 96'000},
+                                             {"lo", "out_lo", 0, 0, 0, 15, 48'000}};
     SourceTranscoder transcoder(renditions, 30);
     ASSERT_TRUE(transcoder.start().ok());
 

@@ -19,7 +19,8 @@ namespace rtmp_server::transcoding::native {
 
 // One rendition of the output ladder, derived from a transcoding-template preset.
 struct RenditionSpec {
-    std::string name;
+    std::string name;           // preset/label
+    std::string output_stream;  // output stream key (e.g. "restream_720p")
     std::uint32_t width = 0;  // 0 = keep source width
     std::uint32_t height = 0; // 0 = keep source height
     std::uint32_t video_bitrate = 2'500'000;

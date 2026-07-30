@@ -39,12 +39,17 @@ if(RTMP_NATIVE_TRANSCODE_AVAILABLE)
         native/aac_encoder.cpp
         native/audio_transcoder.cpp
         native/source_transcoder.cpp
+        native/http_client.cpp
+        native/hls_source_puller.cpp
+        native/source_job_manager.cpp
     )
     target_link_libraries(rtmp_server_transcoding
         PUBLIC
+            rtmp_server_hls
             PkgConfig::X265
             PkgConfig::OPENH264
             PkgConfig::FDKAAC
+            PkgConfig::LIBCURL
             ${RTMP_LIBYUV_TARGET}
     )
     target_compile_definitions(rtmp_server_transcoding PUBLIC RTMP_NATIVE_TRANSCODE=1)

@@ -25,6 +25,9 @@
 #include "rtmp_server/protocol/commands/stream_ids.hpp"
 #include "rtmp_server/protocol/commands/stream_registry.hpp"
 #include "rtmp_server/transcoding/supervisor.hpp"
+#ifdef RTMP_NATIVE_TRANSCODE
+#include "rtmp_server/transcoding/native/source_job_manager.hpp"
+#endif
 
 namespace {
 
@@ -192,9 +195,15 @@ int main(int argc, char** argv) {
     // keep pulling HLS from a stream the operator has disabled.
     hls_handler.set_stream_enabled_checker(
         [&stream_manager](const std::string& application, const std::string& stream) {
+            // Block a stream (or its application) only when it exists and is
+            // explicitly disabled. Streams registered purely for HLS serving —
+            // e.g. source-transcode rendition outputs, which have no managed
+            // stream record — are served normally.
             const auto app = stream_manager.find_application(application);
+            if (app && !app->enabled) return false;
             const auto meta = stream_manager.find_stream(application, stream);
-            return app && app->enabled && meta && meta->enabled;
+            if (meta && !meta->enabled) return false;
+            return true;
         });
     services.recorder_factory =
         [&hls_handler](std::string_view application,
@@ -448,6 +457,127 @@ int main(int argc, char** argv) {
                 return {};
             });
     }
+#ifdef RTMP_NATIVE_TRANSCODE
+    // Source-transcode jobs: pull an external URL (rtmp:// or an http(s) .m3u8),
+    // transcode it per a template with the in-process FFmpeg-free pipeline, and
+    // re-serve the renditions as one adaptive master .m3u8. Each rendition's
+    // segment store is registered with the HLS handler for delivery.
+    rtmp_server::transcoding::native::SourceJobManager::Hooks source_hooks;
+    source_hooks.register_store = [&hls_handler](const std::string& application,
+                                                 const std::string& stream,
+                                                 std::shared_ptr<rtmp_server::hls::SegmentStore> store) {
+        hls_handler.register_stream(application, stream, std::move(store));
+    };
+    source_hooks.unregister_store = [&hls_handler](const std::string& application,
+                                                   const std::string& stream) {
+        hls_handler.unregister_stream(application, stream);
+    };
+    source_hooks.set_renditions = [&hls_handler](const std::string& application,
+                                                 const std::string& master,
+                                                 std::vector<rtmp_server::hls::Rendition> renditions) {
+        hls_handler.set_renditions(application, master, std::move(renditions));
+    };
+    rtmp_server::transcoding::native::SourceJobManager source_job_manager(std::move(source_hooks),
+                                                                          "/hls");
+
+    const auto source_job_json = [](const rtmp_server::transcoding::native::SourceJobSnapshot& job) {
+        auto esc = [](std::string_view v) {
+            std::string out;
+            for (char c : v) {
+                if (c == '"' || c == '\\') out.push_back('\\');
+                out.push_back(c);
+            }
+            return out;
+        };
+        std::ostringstream os;
+        os << R"({"id":")" << esc(job.application + ":" + job.name) << R"(","application":")"
+           << esc(job.application) << R"(","name":")" << esc(job.name) << R"(","source_url":")"
+           << esc(job.source_url) << R"(","template_name":")" << esc(job.template_name)
+           << R"(","master_hls_path":")" << esc(job.master_hls_path) << R"(","status":")"
+           << esc(job.status) << R"(","detail":")" << esc(job.detail) << R"(","outputs":[)";
+        for (std::size_t i = 0; i < job.renditions.size(); ++i) {
+            const auto& r = job.renditions[i];
+            if (i) os << ',';
+            os << R"({"name":")" << esc(r.name) << R"(","stream":")" << esc(r.output_stream)
+               << R"(","video_codec":"h264","video_bitrate":)" << r.video_bitrate << R"(,"width":)"
+               << r.width << R"(,"height":)" << r.height << "}";
+        }
+        os << "]}";
+        return os.str();
+    };
+
+    management_api.set_source_job_handlers(
+        [&source_job_manager, source_job_json](std::string_view application)
+            -> rtmp_server::core::Result<std::string> {
+            std::ostringstream os;
+            os << R"({"items":[)";
+            const auto jobs = source_job_manager.list(std::string(application));
+            for (std::size_t i = 0; i < jobs.size(); ++i) {
+                if (i) os << ',';
+                os << source_job_json(jobs[i]);
+            }
+            os << "]}";
+            return os.str();
+        },
+        [&source_job_manager, &config, source_job_json](
+            std::string_view application, std::string_view name, std::string_view source_url,
+            std::string_view template_name,
+            std::string_view rules) -> rtmp_server::core::Result<std::string> {
+            auto parsed = rtmp_server::transcoding::PresetCatalogue::parse(rules);
+            if (!parsed) return parsed.error();
+            rtmp_server::transcoding::native::SourceJobConfig cfg;
+            cfg.application = std::string(application);
+            cfg.name = std::string(name);
+            cfg.source_url = std::string(source_url);
+            cfg.template_name = std::string(template_name);
+            for (const auto& rule : parsed.value().rules()) {
+                for (const auto& preset : rule.presets) {
+                    using rtmp_server::transcoding::AudioCodec;
+                    using rtmp_server::transcoding::BackendKind;
+                    using rtmp_server::transcoding::VideoCodec;
+                    const bool video_ok = preset.video_codec == VideoCodec::H264 ||
+                                          preset.video_codec == VideoCodec::Passthrough ||
+                                          preset.video_codec == VideoCodec::Disabled;
+                    const bool audio_ok = preset.audio_codec == AudioCodec::Aac ||
+                                          preset.audio_codec == AudioCodec::Passthrough ||
+                                          preset.audio_codec == AudioCodec::Disabled;
+                    if (!video_ok || !audio_ok || preset.backend != BackendKind::Software) {
+                        return rtmp_server::core::Error(
+                            rtmp_server::core::ErrorCode::InvalidConfiguration,
+                            rtmp_server::core::ErrorCategory::Configuration,
+                            "source transcode supports H.264 + AAC on the software backend only");
+                    }
+                    rtmp_server::transcoding::native::RenditionSpec spec;
+                    spec.name = preset.name;
+                    spec.output_stream = preset.outgoing_stream_name;
+                    spec.width = preset.width.value_or(0);
+                    spec.height = preset.height.value_or(0);
+                    spec.video_bitrate = static_cast<std::uint32_t>(preset.video_bitrate);
+                    spec.gop = preset.keyframe_interval.value_or(60);
+                    spec.audio_bitrate = static_cast<std::uint32_t>(preset.audio_bitrate);
+                    cfg.renditions.push_back(std::move(spec));
+                }
+            }
+            if (cfg.renditions.size() > config.transcoding_max_outputs_per_job) {
+                return rtmp_server::core::Error(rtmp_server::core::ErrorCode::InvalidConfiguration,
+                                                rtmp_server::core::ErrorCategory::Configuration,
+                                                "too many renditions for one source job");
+            }
+            auto snapshot = source_job_manager.create(cfg);
+            if (!snapshot) return snapshot.error();
+            return source_job_json(snapshot.value());
+        },
+        [&source_job_manager](std::string_view application,
+                              std::string_view name) -> rtmp_server::core::Result<void> {
+            if (!source_job_manager.remove(std::string(application), std::string(name))) {
+                return rtmp_server::core::Error(rtmp_server::core::ErrorCode::NotFound,
+                                                rtmp_server::core::ErrorCategory::Configuration,
+                                                "no such source job");
+            }
+            return {};
+        });
+#endif
+
     management_api.set_live_state_provider([&stream_manager, &stream_registry, &stream_id_registry, &pool] {
         std::vector<rtmp_server::management::LiveState> states;
         const auto registrations = stream_registry.snapshot();

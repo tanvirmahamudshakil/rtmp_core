@@ -36,6 +36,62 @@ HttpRequest authed(std::string method, std::string path, std::string body = "") 
 
 } // namespace
 
+TEST(ManagementApiTest, SourceJobsCanBeCreatedListedAndRemoved) {
+    StreamManager manager(manager_options());
+    ManagementApi api(manager, api_options());
+
+    std::string created_for;
+    api.set_source_job_handlers(
+        [&](std::string_view application) -> rtmp_server::core::Result<std::string> {
+            return std::string(R"({"items":[{"application":")") + std::string(application) + R"("}]})";
+        },
+        [&](std::string_view application, std::string_view name, std::string_view source_url,
+            std::string_view /*tmpl*/, std::string_view /*rules*/)
+            -> rtmp_server::core::Result<std::string> {
+            created_for = std::string(application) + "/" + std::string(name) + " <- " + std::string(source_url);
+            return std::string(R"({"id":")") + std::string(application) + ":" + std::string(name) +
+                   R"(","status":"running"})";
+        },
+        [&](std::string_view, std::string_view) -> rtmp_server::core::Result<void> { return {}; });
+
+    // Create via POST with the header-carried inputs.
+    HttpRequest post = authed("POST", "/v1/transcoding/source-jobs", "live/restream|720p|restream_720p|default|h264|2500000|high|60|1280|720|letterbox|aac|128000|first|HD");
+    post.headers["x-application"] = "live";
+    post.headers["x-output-name"] = "restream";
+    post.headers["x-source-url"] = "https://cdn.example.com/live/index.m3u8";
+    post.headers["x-template-name"] = "ladder";
+    auto create = api.handle(post);
+    EXPECT_EQ(create.status, 200);
+    EXPECT_NE(create.body.find("\"status\":\"running\""), std::string::npos);
+    EXPECT_EQ(created_for, "live/restream <- https://cdn.example.com/live/index.m3u8");
+
+    // List.
+    HttpRequest list_req = authed("GET", "/v1/transcoding/source-jobs");
+    list_req.query = "application=live";
+    auto list = api.handle(list_req);
+    EXPECT_EQ(list.status, 200);
+    EXPECT_NE(list.body.find("\"application\":\"live\""), std::string::npos);
+
+    // Delete.
+    auto del = api.handle(authed("DELETE", "/v1/transcoding/source-jobs/live:restream"));
+    EXPECT_EQ(del.status, 200);
+    EXPECT_NE(del.body.find("\"deleted\":true"), std::string::npos);
+}
+
+TEST(ManagementApiTest, SourceJobCreateRejectsMissingHeaders) {
+    StreamManager manager(manager_options());
+    ManagementApi api(manager, api_options());
+    api.set_source_job_handlers(
+        [](std::string_view) -> rtmp_server::core::Result<std::string> { return std::string("{}"); },
+        [](std::string_view, std::string_view, std::string_view, std::string_view,
+           std::string_view) -> rtmp_server::core::Result<std::string> { return std::string("{}"); },
+        [](std::string_view, std::string_view) -> rtmp_server::core::Result<void> { return {}; });
+
+    // No X-* headers, empty body: rejected as a bad request.
+    auto response = api.handle(authed("POST", "/v1/transcoding/source-jobs"));
+    EXPECT_EQ(response.status, 400);
+}
+
 TEST(ManagementApiTest, HealthLiveNeedsNoAuth) {
     StreamManager manager(manager_options());
     ManagementApi api(manager, api_options());
