@@ -8,6 +8,7 @@ add_library(rtmp_server_transcoding STATIC
     native/geometry.cpp
     native/hevc_params.cpp
     native/aac_params.cpp
+    native/hls_playlist.cpp
 )
 
 target_include_directories(rtmp_server_transcoding PUBLIC
