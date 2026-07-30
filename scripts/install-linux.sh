@@ -302,6 +302,14 @@ apt-get install -y --no-install-recommends "${APT_REINSTALL_ARGS[@]}" \
   build-essential clang cmake ninja-build pkg-config git ca-certificates curl \
   liburing-dev liburing2 libssl-dev libsqlite3-dev libsqlite3-0 sqlite3 \
   ffmpeg nodejs npm iproute2 ethtool kmod
+
+# Optional in-process x265 HEVC transcoding pipeline (docs/native-transcoding.md).
+# Only pulled when RTMP_ENABLE_NATIVE_TRANSCODE=1; the stock build uses the
+# out-of-process FFmpeg supervisor and needs none of these.
+if [[ "${RTMP_ENABLE_NATIVE_TRANSCODE:-0}" == "1" ]]; then
+  apt-get install -y --no-install-recommends "${APT_REINSTALL_ARGS[@]}" \
+    libx265-dev libopenh264-dev libyuv-dev
+fi
 if ! apt-cache show caddy >/dev/null 2>&1 && [[ "${ID}" == "ubuntu" ]]; then
   apt-get install -y --no-install-recommends "${APT_REINSTALL_ARGS[@]}" software-properties-common
   add-apt-repository -y universe

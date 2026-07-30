@@ -46,3 +46,44 @@ if(NOT RTMP_SERVER_CORE_ONLY AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
     )
     unset(CMAKE_REQUIRED_INCLUDES)
 endif()
+
+# Optional native CPU H.264 -> HEVC transcoding pipeline (openh264 decode,
+# libyuv scale, x265 encode). Off by default so a stock build needs none of
+# these libraries; the pure geometry/parameter logic still compiles and is
+# tested regardless. Enable with -DRTMP_ENABLE_NATIVE_TRANSCODE=ON after
+# installing the dev packages (see docs/native-transcoding.md).
+option(RTMP_ENABLE_NATIVE_TRANSCODE
+    "Build the in-process x265 HEVC transcoding pipeline (needs x265, openh264, libyuv)" OFF)
+
+set(RTMP_NATIVE_TRANSCODE_AVAILABLE OFF)
+if(RTMP_ENABLE_NATIVE_TRANSCODE)
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(X265 IMPORTED_TARGET x265)
+    pkg_check_modules(OPENH264 IMPORTED_TARGET openh264)
+    pkg_check_modules(LIBYUV IMPORTED_TARGET libyuv)
+
+    # libyuv frequently ships without a .pc file; fall back to a plain search.
+    if(NOT LIBYUV_FOUND)
+        find_library(LIBYUV_LIBRARY NAMES yuv libyuv)
+        find_path(LIBYUV_INCLUDE_DIR NAMES libyuv.h)
+        if(LIBYUV_LIBRARY AND LIBYUV_INCLUDE_DIR)
+            add_library(rtmp_libyuv UNKNOWN IMPORTED)
+            set_target_properties(rtmp_libyuv PROPERTIES
+                IMPORTED_LOCATION "${LIBYUV_LIBRARY}"
+                INTERFACE_INCLUDE_DIRECTORIES "${LIBYUV_INCLUDE_DIR}")
+            set(RTMP_LIBYUV_TARGET rtmp_libyuv)
+        endif()
+    else()
+        set(RTMP_LIBYUV_TARGET PkgConfig::LIBYUV)
+    endif()
+
+    if(X265_FOUND AND OPENH264_FOUND AND RTMP_LIBYUV_TARGET)
+        set(RTMP_NATIVE_TRANSCODE_AVAILABLE ON)
+    else()
+        message(FATAL_ERROR
+            "RTMP_ENABLE_NATIVE_TRANSCODE=ON but dependencies are missing "
+            "(x265=${X265_FOUND} openh264=${OPENH264_FOUND} libyuv=${LIBYUV_FOUND}). "
+            "Install them, e.g. on Ubuntu: "
+            "sudo apt-get install libx265-dev libopenh264-dev libyuv-dev")
+    endif()
+endif()
