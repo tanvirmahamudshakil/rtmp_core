@@ -303,10 +303,13 @@ apt-get install -y --no-install-recommends "${APT_REINSTALL_ARGS[@]}" \
   liburing-dev liburing2 libssl-dev libsqlite3-dev libsqlite3-0 sqlite3 \
   ffmpeg nodejs npm iproute2 ethtool kmod
 
-# Optional in-process x265 HEVC transcoding pipeline (docs/native-transcoding.md).
-# Only pulled when RTMP_ENABLE_NATIVE_TRANSCODE=1; the stock build uses the
-# out-of-process FFmpeg supervisor and needs none of these.
-if [[ "${RTMP_ENABLE_NATIVE_TRANSCODE:-0}" == "1" ]]; then
+# In-process FFmpeg-free transcoding pipeline + source-transcode jobs
+# (docs/native-transcoding.md): openh264 (H.264 decode/encode), x265 (HEVC),
+# libfdk-aac (AAC), libyuv (scale), libcurl (HLS source pull). Installed by
+# default so every feature works out of the box; set RTMP_ENABLE_NATIVE_TRANSCODE=0
+# to build the leaner FFmpeg-supervisor-only origin instead.
+NATIVE_TRANSCODE="${RTMP_ENABLE_NATIVE_TRANSCODE:-1}"
+if [[ "${NATIVE_TRANSCODE}" == "1" ]]; then
   apt-get install -y --no-install-recommends "${APT_REINSTALL_ARGS[@]}" \
     libx265-dev libopenh264-dev libfdk-aac-dev libcurl4-openssl-dev libyuv-dev
 fi
@@ -392,7 +395,13 @@ if (( NOFILE > 1048576 )); then NOFILE=1048576; fi
 log "Building hardened C++ server with ${WORKERS} media workers"
 export CC=clang
 export CXX=clang++
-cmake --fresh --preset production
+# Enable the in-process native transcoding pipeline in the build when its
+# libraries were installed above, so source-transcode jobs are available.
+NATIVE_TRANSCODE_CMAKE_ARGS=()
+if [[ "${NATIVE_TRANSCODE}" == "1" ]]; then
+  NATIVE_TRANSCODE_CMAKE_ARGS+=(-DRTMP_ENABLE_NATIVE_TRANSCODE=ON)
+fi
+cmake --fresh --preset production "${NATIVE_TRANSCODE_CMAKE_ARGS[@]}"
 cmake --build --preset production --clean-first --parallel "${CPU_COUNT}"
 SERVER_BINARY="${SOURCE_DIR}/build/production/apps/rtmp_server/rtmp_server"
 [[ -x "${SERVER_BINARY}" ]] || die "Production server binary was not produced."
