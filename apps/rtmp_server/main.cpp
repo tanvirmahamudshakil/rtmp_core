@@ -187,6 +187,15 @@ int main(int argc, char** argv) {
     rtmp_server::control::HlsHttpOptions hls_options;
     hls_options.require_playback_token = false;
     rtmp_server::control::HlsHttpHandler hls_handler(std::move(hls_options));
+    // Disabling a stream (or its application) takes its .m3u8 links offline
+    // immediately, mirroring the RTMP publish/play gate above — no viewer can
+    // keep pulling HLS from a stream the operator has disabled.
+    hls_handler.set_stream_enabled_checker(
+        [&stream_manager](const std::string& application, const std::string& stream) {
+            const auto app = stream_manager.find_application(application);
+            const auto meta = stream_manager.find_stream(application, stream);
+            return app && app->enabled && meta && meta->enabled;
+        });
     services.recorder_factory =
         [&hls_handler](std::string_view application,
                        std::string_view stream) -> std::shared_ptr<rtmp_server::protocol::commands::RecorderSink> {

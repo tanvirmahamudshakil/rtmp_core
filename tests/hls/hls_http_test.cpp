@@ -111,6 +111,30 @@ TEST(HlsHttpTest, UnknownStreamAndUnknownSegmentReturn404) {
     EXPECT_EQ(handler.handle(get("/hls/too/few")).status, 404);
 }
 
+TEST(HlsHttpTest, DisabledStreamServesNoPlaylistsOrSegments) {
+    HlsHttpHandler handler{HlsHttpOptions{}};
+    handler.register_stream("live", "demo", populated_store());
+
+    bool enabled = true;
+    handler.set_stream_enabled_checker(
+        [&](const std::string& application, const std::string& stream) {
+            return enabled && application == "live" && stream == "demo";
+        });
+
+    // Enabled: normal service.
+    EXPECT_EQ(handler.handle(get("/hls/live/demo/index.m3u8")).status, 200);
+
+    // Disabled: playlists and segments 404, as if the stream did not exist.
+    enabled = false;
+    EXPECT_EQ(handler.handle(get("/hls/live/demo/index.m3u8")).status, 404);
+    EXPECT_EQ(handler.handle(get("/hls/live/demo/segment-2.ts")).status, 404);
+    EXPECT_EQ(handler.handle(get("/hls/live/demo/master.m3u8")).status, 404);
+
+    // Re-enabled: service resumes.
+    enabled = true;
+    EXPECT_EQ(handler.handle(get("/hls/live/demo/index.m3u8")).status, 200);
+}
+
 TEST(HlsHttpTest, EvictedSegment404IsNotCacheable) {
     // A CDN caching this 404 would keep serving it after the stream
     // recovers, so it must be explicitly no-store.

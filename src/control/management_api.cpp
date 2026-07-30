@@ -484,11 +484,19 @@ HttpResponse ManagementApi::handle_patch_stream(std::string_view application, st
     auto fields = parse_flat_json(request.body);
     bool any = false;
     if (auto it = fields.find("enabled"); it != fields.end()) {
-        auto result = manager_.set_enabled(application, name, it->second == "true");
+        const bool enable = it->second == "true";
+        auto result = manager_.set_enabled(application, name, enable);
         audit("set_enabled", application, name, result.ok());
         if (!result.ok())
             return HttpResponse::json(http_status_for(result.error().code()),
                                        error_body("request_failed", result.error().message(), ""));
+        // Disabling must take effect now, not just for future connections: drop
+        // the live publisher and viewers so the RTMP feed and its HLS window
+        // stop immediately (the HLS handler already 404s a disabled stream).
+        if (!enable && registry_ != nullptr) {
+            static_cast<void>(manager_.disconnect_viewers(application, name, *registry_));
+            static_cast<void>(manager_.disconnect_publisher(application, name, *registry_));
+        }
         any = true;
     }
     if (auto it = fields.find("recording_enabled"); it != fields.end()) {
