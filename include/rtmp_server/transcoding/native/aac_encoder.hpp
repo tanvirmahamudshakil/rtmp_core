@@ -45,6 +45,7 @@ public:
     [[nodiscard]] std::uint32_t sample_rate() const noexcept { return sample_rate_; }
 
 private:
+    [[nodiscard]] core::Result<void> open_with_aot(const AacParamSet& params, int aot);
     [[nodiscard]] core::Result<void> drain(std::vector<EncodedAudioFrame>& out, bool flushing);
     [[nodiscard]] core::Result<bool> encode_one(const std::int16_t* interleaved, int in_samples,
                                                 EncodedAudioFrame& frame);

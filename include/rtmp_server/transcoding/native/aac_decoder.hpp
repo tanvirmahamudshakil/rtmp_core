@@ -31,8 +31,13 @@ public:
     AacDecoder(const AacDecoder&) = delete;
     AacDecoder& operator=(const AacDecoder&) = delete;
 
-    // Configures the decoder from the raw AudioSpecificConfig bytes.
+    // Configures the decoder from the raw AudioSpecificConfig bytes (for RTMP/FLV
+    // sources, which deliver the config out of band).
     [[nodiscard]] core::Result<void> configure(std::span<const std::byte> audio_specific_config);
+
+    // Configures the decoder for self-describing ADTS input (an HLS/TS source),
+    // where each frame carries its own header and no out-of-band config exists.
+    [[nodiscard]] core::Result<void> configure_adts();
 
     // Decodes one raw AAC frame. On success `produced` is true when a PCM block
     // was written to `out` (rarely a frame yields nothing until primed).

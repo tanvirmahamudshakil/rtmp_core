@@ -32,6 +32,20 @@ core::Result<void> AacEncoder::open(const AacParamSet& params) {
     channels_ = params.channels == 0 ? 2 : params.channels;
     sample_rate_ = params.sample_rate == 0 ? 44100 : params.sample_rate;
 
+    // Try the requested audio-object type first; if this libfdk build cannot
+    // configure it (some builds lack HE-AAC / HE-AACv2), fall back to AAC-LC
+    // rather than failing the whole rendition.
+    const int requested = params.audio_object_type();
+    if (auto r = open_with_aot(params, requested); r) return {};
+    if (requested == 2) return open_with_aot(params, 2); // already LC: surface its error
+    return open_with_aot(params, 2);
+}
+
+core::Result<void> AacEncoder::open_with_aot(const AacParamSet& params, int aot) {
+    if (impl_->handle != nullptr) {
+        aacEncClose(&impl_->handle);
+        impl_->handle = nullptr;
+    }
     if (aacEncOpen(&impl_->handle, 0, channels_) != AACENC_OK || impl_->handle == nullptr) {
         return encode_error("aacEncOpen failed");
     }
@@ -41,7 +55,7 @@ core::Result<void> AacEncoder::open(const AacParamSet& params) {
         }
         return {};
     };
-    if (auto r = set(AACENC_AOT, static_cast<UINT>(params.audio_object_type()), "AOT"); !r) return r;
+    if (auto r = set(AACENC_AOT, static_cast<UINT>(aot), "AOT"); !r) return r;
     if (auto r = set(AACENC_SAMPLERATE, sample_rate_, "SAMPLERATE"); !r) return r;
     if (auto r = set(AACENC_CHANNELMODE, channels_ == 1 ? MODE_1 : MODE_2, "CHANNELMODE"); !r)
         return r;

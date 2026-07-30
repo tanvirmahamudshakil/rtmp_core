@@ -37,6 +37,7 @@ if(RTMP_NATIVE_TRANSCODE_AVAILABLE)
         native/aac_decoder.cpp
         native/aac_encoder.cpp
         native/audio_transcoder.cpp
+        native/source_transcoder.cpp
     )
     target_link_libraries(rtmp_server_transcoding
         PUBLIC

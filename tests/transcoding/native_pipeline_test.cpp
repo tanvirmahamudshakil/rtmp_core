@@ -15,6 +15,7 @@
 #include "rtmp_server/transcoding/native/h264_encoder.hpp"
 #include "rtmp_server/transcoding/native/hevc_encoder.hpp"
 #include "rtmp_server/transcoding/native/scaler.hpp"
+#include "rtmp_server/transcoding/native/source_transcoder.hpp"
 #endif
 
 namespace {
@@ -301,6 +302,87 @@ TEST(NativeAacEncoder, EncodesPcmToAdtsFrames) {
         EXPECT_TRUE(is_adts(frame.adts));
         EXPECT_EQ(frame.samples_per_channel, 1024U);
     }
+}
+TEST(NativeSourceTranscoder, FansOneSourceOutToMultipleRenditions) {
+    // Build a decodable H.264 source by encoding gradient frames (keyframe
+    // carries SPS/PPS), then transcode that source into two renditions.
+    const auto source_config = build_h264_config(320, 240, 30, 1'500'000, 15, 1);
+    H264Encoder source_encoder;
+    ASSERT_TRUE(source_encoder.open(source_config).ok());
+    std::vector<EncodedAccessUnit> source_aus;
+    for (int i = 0; i < 20; ++i) {
+        const YuvFrame f = make_gradient_frame(320, 240, i * 3000, i);
+        ASSERT_TRUE(source_encoder.encode(f, source_aus).ok());
+    }
+    ASSERT_FALSE(source_aus.empty());
+
+    std::vector<RenditionSpec> renditions = {
+        {"480p-ish", 240, 240, 800'000, 15, 96'000},
+        {"240p", 160, 120, 400'000, 15, 64'000},
+    };
+    SourceTranscoder transcoder(renditions, 30);
+    ASSERT_TRUE(transcoder.start().ok());
+    ASSERT_EQ(transcoder.rendition_count(), 2U);
+
+    std::vector<int> per_rendition_outputs(2, 0);
+    bool saw_keyframe = false;
+    transcoder.set_video_output([&](std::size_t rendition, const EncodedAccessUnit& au) {
+        ASSERT_LT(rendition, per_rendition_outputs.size());
+        EXPECT_FALSE(au.annexb.empty());
+        EXPECT_TRUE(starts_with_annexb(au.annexb));
+        per_rendition_outputs[rendition]++;
+        if (au.keyframe) saw_keyframe = true;
+    });
+
+    for (const auto& au : source_aus) {
+        ASSERT_TRUE(transcoder.on_video(au.annexb, au.pts_90k, au.dts_90k, au.keyframe).ok());
+    }
+
+    EXPECT_GT(per_rendition_outputs[0], 0);
+    EXPECT_GT(per_rendition_outputs[1], 0);
+    EXPECT_TRUE(saw_keyframe);
+}
+
+TEST(NativeSourceTranscoder, ReEncodesAudioPerRendition) {
+    // Make an ADTS source with the AAC encoder, then re-encode per rendition.
+    AacParamSet source_params;
+    source_params.sample_rate = 44100;
+    source_params.channels = 2;
+    source_params.bitrate = 128'000;
+    AacEncoder source_encoder;
+    ASSERT_TRUE(source_encoder.open(source_params).ok());
+    std::vector<EncodedAudioFrame> adts_frames;
+    double phase = 0.0;
+    for (int i = 0; i < 20; ++i) {
+        const PcmBlock block = make_sine_block(44100, 2, 1024, phase);
+        phase += 1024 * 2.0 * 3.14159265358979 * 440.0 / 44100;
+        ASSERT_TRUE(source_encoder.encode(block, adts_frames).ok());
+    }
+    ASSERT_FALSE(adts_frames.empty());
+
+    std::vector<RenditionSpec> renditions = {{"hi", 0, 0, 0, 15, 96'000},
+                                             {"lo", 0, 0, 0, 15, 48'000}};
+    SourceTranscoder transcoder(renditions, 30);
+    ASSERT_TRUE(transcoder.start().ok());
+
+    std::vector<int> audio_outputs(2, 0);
+    transcoder.set_audio_output(
+        [&](std::size_t rendition, const EncodedAudioFrame& frame, std::int64_t pts) {
+            ASSERT_LT(rendition, audio_outputs.size());
+            EXPECT_FALSE(frame.adts.empty());
+            EXPECT_GE(pts, 0);
+            audio_outputs[rendition]++;
+        });
+
+    std::int64_t pts = 0;
+    for (const auto& frame : adts_frames) {
+        auto r = transcoder.on_audio(frame.adts, pts);
+        ASSERT_TRUE(r.ok()) << r.error().message();
+        pts += 1024 * 90000 / 44100;
+    }
+
+    EXPECT_GT(audio_outputs[0], 0);
+    EXPECT_GT(audio_outputs[1], 0);
 }
 #endif // RTMP_NATIVE_TRANSCODE
 

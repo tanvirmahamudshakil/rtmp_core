@@ -42,6 +42,14 @@ core::Result<void> AacDecoder::configure(std::span<const std::byte> audio_specif
     return {};
 }
 
+core::Result<void> AacDecoder::configure_adts() {
+    if (impl_->handle != nullptr) return {};
+    // TT_MP4_ADTS: each frame is self-describing, so no ConfigRaw is needed.
+    impl_->handle = aacDecoder_Open(TT_MP4_ADTS, 1);
+    if (impl_->handle == nullptr) return decode_error("aacDecoder_Open (ADTS) failed");
+    return {};
+}
+
 core::Result<void> AacDecoder::decode(std::span<const std::byte> aac_frame, PcmBlock& out,
                                       bool& produced) {
     produced = false;
