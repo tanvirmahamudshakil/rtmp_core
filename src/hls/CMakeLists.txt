@@ -8,6 +8,7 @@ add_library(rtmp_server_hls STATIC
     segmenter.cpp
     segment_store.cpp
     stream_sink.cpp
+    rendition_feed.cpp
 )
 
 target_include_directories(rtmp_server_hls PUBLIC
