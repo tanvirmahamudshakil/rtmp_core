@@ -1219,7 +1219,7 @@ function NewPresetModal({ onClose, onAdd }: { onClose: () => void; onAdd: (prese
   const [outgoingStreamName, setOutgoingStreamName] = useState("");
   const [description, setDescription] = useState("");
   const [videoCodec, setVideoCodec] = useState<VideoCodec>("H.264");
-  const [videoBitrate, setVideoBitrate] = useState("2500000");
+  const [videoBitrateKbps, setVideoBitrateKbps] = useState("2500");
   const [implementation, setImplementation] = useState<EncodingImplementation>("Default");
   const [profile, setProfile] = useState<VideoProfile>("high");
   const [keyFrameMode, setKeyFrameMode] = useState<"source" | "interval">("source");
@@ -1229,7 +1229,7 @@ function NewPresetModal({ onClose, onAdd }: { onClose: () => void; onAdd: (prese
   const [frameHeight, setFrameHeight] = useState("");
   const [fitMode, setFitMode] = useState<FitMode>("letterbox");
   const [audioCodec, setAudioCodec] = useState<AudioCodec>("AAC");
-  const [audioBitrate, setAudioBitrate] = useState("128000");
+  const [audioBitrateKbps, setAudioBitrateKbps] = useState("128");
   const [gpuMode, setGpuMode] = useState<"first" | "specific">("first");
   const [gpuId, setGpuId] = useState("0");
   const selectedResolution = frameResolutions.find((resolution) => resolution.id === frameResolution) ?? frameResolutions[0];
@@ -1253,7 +1253,7 @@ function NewPresetModal({ onClose, onAdd }: { onClose: () => void; onAdd: (prese
           outgoingStreamName: outgoingStreamName.trim(),
           description: description.trim(),
           videoCodec,
-          videoBitrate: Math.max(0, Number(videoBitrate) || 0),
+          videoBitrate: Math.max(0, Number(videoBitrateKbps) || 0) * 1000,
           implementation,
           profile,
           keyFrameMode,
@@ -1262,7 +1262,7 @@ function NewPresetModal({ onClose, onAdd }: { onClose: () => void; onAdd: (prese
           frameHeight: sourceResolution ? null : outputHeight,
           fitMode: sourceResolution ? "match-source" : fitMode,
           audioCodec,
-          audioBitrate: Math.max(0, Number(audioBitrate) || 0),
+          audioBitrate: Math.max(0, Number(audioBitrateKbps) || 0) * 1000,
           gpuMode,
           gpuId: gpuMode === "specific" ? Math.max(0, Number(gpuId) || 0) : null
         });
@@ -1288,10 +1288,10 @@ function NewPresetModal({ onClose, onAdd }: { onClose: () => void; onAdd: (prese
           </label>
           <label htmlFor="video-bitrate">Video Bitrate
             <div className="field-with-unit">
-              <input id="video-bitrate" type="number" min="0" step="1000" value={videoBitrate} onChange={(event) => setVideoBitrate(event.target.value)} />
-              <span>bps</span>
+              <input id="video-bitrate" type="number" min="0" step="100" value={videoBitrateKbps} onChange={(event) => setVideoBitrateKbps(event.target.value)} />
+              <span>kbps</span>
             </div>
-            <small>Bits per second (bps)</small>
+            <small>Kilobits per second (kbps)</small>
           </label>
           <label htmlFor="encoding-implementation">Encoding Implementation
             <select id="encoding-implementation" value={implementation} onChange={(event) => setImplementation(event.target.value as EncodingImplementation)}>
@@ -1377,10 +1377,10 @@ function NewPresetModal({ onClose, onAdd }: { onClose: () => void; onAdd: (prese
           </label>
           <label htmlFor="audio-bitrate">Audio Bitrate
             <div className="field-with-unit">
-              <input id="audio-bitrate" type="number" min="0" step="1000" value={audioBitrate} onChange={(event) => setAudioBitrate(event.target.value)} />
-              <span>bps</span>
+              <input id="audio-bitrate" type="number" min="0" step="8" value={audioBitrateKbps} onChange={(event) => setAudioBitrateKbps(event.target.value)} />
+              <span>kbps</span>
             </div>
-            <small>Bits per second (bps)</small>
+            <small>Kilobits per second (kbps)</small>
           </label>
         </div>
 
@@ -1440,12 +1440,12 @@ function TranscodePage({
                 <div className="preset-card-head"><span><Video size={18} /></span><div><strong>{preset.name}</strong><small>{preset.outgoingStreamName}</small></div><b>{preset.videoCodec}</b></div>
                 {preset.description && <p>{preset.description}</p>}
                 <div className="preset-card-stats">
-                  <div><span>Video bitrate</span><strong>{preset.videoBitrate ? `${preset.videoBitrate.toLocaleString()} bps` : "Automatic"}</strong></div>
+                  <div><span>Video bitrate</span><strong>{preset.videoBitrate ? `${(preset.videoBitrate / 1000).toLocaleString()} kbps` : "Automatic"}</strong></div>
                   <div><span>Implementation</span><strong>{preset.implementation}</strong></div>
                   <div><span>Profile</span><strong>{preset.profile}</strong></div>
                   <div><span>Key frames</span><strong>{preset.keyFrameMode === "source" ? "Same as source" : `Every ${preset.keyFrameInterval} frames`}</strong></div>
                   <div><span>Frame size</span><strong>{preset.frameWidth && preset.frameHeight ? `${preset.frameWidth} × ${preset.frameHeight}` : "Same as source"} · {preset.fitMode}</strong></div>
-                  <div><span>Audio</span><strong>{preset.audioCodec} · {preset.audioBitrate.toLocaleString()} bps</strong></div>
+                  <div><span>Audio</span><strong>{preset.audioCodec} · {(preset.audioBitrate / 1000).toLocaleString()} kbps</strong></div>
                   <div><span>GPU</span><strong>{preset.gpuMode === "first" ? "First available" : `GPU ${preset.gpuId}`}</strong></div>
                 </div>
               </article>

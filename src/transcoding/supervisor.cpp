@@ -7,6 +7,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <thread>
 
 #include "rtmp_server/core/error.hpp"
 #include "rtmp_server/observability/logger.hpp"
@@ -481,6 +482,20 @@ core::Result<std::vector<std::string>> TranscoderSupervisor::build_arguments(
                 if (preset.backend == BackendKind::Software) {
                     append(args, "-preset", "veryfast");
                     append(args, "-tune", "zerolatency");
+                    // libx264 defaults to one thread per CPU core. Left
+                    // uncapped, concurrent jobs (multiple renditions of one
+                    // stream, or multiple streams up to max_active_jobs) each
+                    // try to claim every core and contend with each other,
+                    // which is what turns a real-time encode into a
+                    // behind-realtime one and produces the discontinuities
+                    // that follow from restart loops. Divide the host's
+                    // cores across the worst-case concurrent encoder count.
+                    const auto hardware = std::thread::hardware_concurrency();
+                    const std::size_t concurrent_encoders =
+                        std::max<std::size_t>(1, options_.max_active_jobs * presets.size());
+                    const std::size_t threads =
+                        std::max<std::size_t>(1, hardware > 0 ? hardware / concurrent_encoders : 1);
+                    append(args, "-threads", std::to_string(threads));
                 } else if (preset.backend == BackendKind::Nvenc) {
                     append(args, "-preset", "p4");
                     append(args, "-tune", "ll");

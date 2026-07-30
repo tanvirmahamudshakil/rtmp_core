@@ -1,6 +1,7 @@
 #include "rtmp_server/transcoding/native/source_transcoder.hpp"
 
 #include <algorithm>
+#include <thread>
 
 #include "rtmp_server/core/error.hpp"
 #include "rtmp_server/transcoding/native/aac_params.hpp"
@@ -40,6 +41,13 @@ core::Result<void> SourceTranscoder::start() {
         rendition->spec = spec;
         renditions_.push_back(std::move(rendition));
     }
+    // One thread per extra rendition is enough to spread the fan-out; beyond
+    // hardware_concurrency() more workers would only add contention, and a
+    // single rendition needs no pool at all (parallel_for runs it inline).
+    const auto hardware = std::thread::hardware_concurrency();
+    const std::size_t pool_size =
+        std::min(renditions_.size(), static_cast<std::size_t>(hardware > 0 ? hardware : 1));
+    if (pool_size > 1) render_pool_ = std::make_unique<core::ThreadPool>(pool_size);
     started_ = true;
     return {};
 }
@@ -65,17 +73,43 @@ core::Result<void> SourceTranscoder::on_video(std::span<const std::byte> annexb,
     if (!produced) return {};
     (void)dts_90k; // openh264 realtime output has DTS == PTS
 
-    for (std::size_t i = 0; i < renditions_.size(); ++i) {
+    // Each rendition writes only to its own Rendition (scaler/encoder/scaled
+    // buffer) and its own video_output_ index, so running them concurrently
+    // is safe: no shared mutable state besides the read-only decoded_ frame.
+    std::vector<core::Error> errors(renditions_.size());
+    std::vector<bool> failed(renditions_.size(), false);
+
+    auto process = [&](std::size_t i) {
         auto& rendition = *renditions_[i];
-        if (auto r = ensure_video(rendition, decoded_.width, decoded_.height); !r) return r.error();
-
+        if (auto r = ensure_video(rendition, decoded_.width, decoded_.height); !r) {
+            errors[i] = r.error();
+            failed[i] = true;
+            return;
+        }
         const ScalePlan plan = plan_for(rendition.spec, decoded_.width, decoded_.height);
-        if (auto r = rendition.scaler.scale(decoded_, plan, rendition.scaled); !r) return r.error();
-
+        if (auto r = rendition.scaler.scale(decoded_, plan, rendition.scaled); !r) {
+            errors[i] = r.error();
+            failed[i] = true;
+            return;
+        }
         std::vector<EncodedAccessUnit> encoded;
-        if (auto r = rendition.video_encoder.encode(rendition.scaled, encoded); !r) return r.error();
+        if (auto r = rendition.video_encoder.encode(rendition.scaled, encoded); !r) {
+            errors[i] = r.error();
+            failed[i] = true;
+            return;
+        }
         if (video_output_)
             for (const auto& au : encoded) video_output_(i, au);
+    };
+
+    if (render_pool_) {
+        render_pool_->parallel_for(renditions_.size(), process);
+    } else {
+        for (std::size_t i = 0; i < renditions_.size(); ++i) process(i);
+    }
+
+    for (std::size_t i = 0; i < renditions_.size(); ++i) {
+        if (failed[i]) return errors[i];
     }
     return {};
 }

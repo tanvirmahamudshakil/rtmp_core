@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "rtmp_server/core/result.hpp"
+#include "rtmp_server/core/thread_pool.hpp"
 #include "rtmp_server/transcoding/native/aac_decoder.hpp"
 #include "rtmp_server/transcoding/native/aac_encoder.hpp"
 #include "rtmp_server/transcoding/native/frame.hpp"
@@ -99,6 +100,13 @@ private:
     AudioOutput audio_output_;
     bool started_ = false;
     bool audio_configured_ = false;
+
+    // Scale+encode is CPU-bound per rendition; fanning renditions across a
+    // pool (rather than looping them serially on this call's thread) is what
+    // lets a 3-4 rendition ladder use several cores per frame instead of
+    // pegging one core and falling behind real time. Sized to renditions_
+    // in start(), capped by hardware_concurrency().
+    std::unique_ptr<core::ThreadPool> render_pool_;
 };
 
 } // namespace rtmp_server::transcoding::native

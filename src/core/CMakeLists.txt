@@ -4,6 +4,7 @@ add_library(rtmp_server_core STATIC
     random.cpp
     hmac.cpp
     config.cpp
+    thread_pool.cpp
     ${CMAKE_SOURCE_DIR}/src/observability/logger.cpp
     ${CMAKE_SOURCE_DIR}/src/observability/audit_log.cpp
     ${CMAKE_SOURCE_DIR}/src/observability/metrics.cpp
