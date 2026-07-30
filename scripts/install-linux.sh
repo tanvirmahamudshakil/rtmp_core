@@ -671,12 +671,31 @@ if [[ "${ENABLE_FAIR_QUEUE}" == "1" ]]; then
   cat > /etc/default/rtmp-network <<EOF
 RTMP_INTERFACE=${PRIMARY_INTERFACE}
 RTMP_SHAPE_MBIT=${SHAPE_MBIT}
+RTMP_QUEUE_COUNT=${WORKERS}
 EOF
   cat > /usr/local/sbin/rtmp-network-tune <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 . /etc/default/rtmp-network
 [[ -n "${RTMP_INTERFACE:-}" && "${RTMP_SHAPE_MBIT:-0}" =~ ^[0-9]+$ ]] || exit 1
+
+# NIC queue count matched to WorkerPool worker count, so RSS spreads
+# interrupts/softirqs across the same cores the io_uring workers run on
+# instead of funnelling every packet through one queue/core. Best-effort:
+# most virtualised NICs (virtio-net on KVM-based VPS providers) expose a
+# fixed single queue and reject -L, so failure here is expected and silent.
+if [[ "${RTMP_QUEUE_COUNT:-0}" =~ ^[0-9]+$ ]] && (( RTMP_QUEUE_COUNT > 1 )); then
+  MAX_QUEUES="$(ethtool -l "${RTMP_INTERFACE}" 2>/dev/null |
+    awk '/^Combined:/{q=$2} END{print q+0}')"
+  if (( MAX_QUEUES > 1 )); then
+    TARGET_QUEUES=$(( RTMP_QUEUE_COUNT < MAX_QUEUES ? RTMP_QUEUE_COUNT : MAX_QUEUES ))
+    ethtool -L "${RTMP_INTERFACE}" combined "${TARGET_QUEUES}" >/dev/null 2>&1 || true
+  fi
+fi
+# Larger rx/tx rings absorb short bursts (viewer stampede, keyframe spikes)
+# without drops. Not all drivers/providers honour this value; ignored if not.
+ethtool -G "${RTMP_INTERFACE}" rx 4096 tx 4096 >/dev/null 2>&1 || true
+
 if (( RTMP_SHAPE_MBIT <= 10000 )) && modprobe sch_cake 2>/dev/null; then
   tc qdisc replace dev "${RTMP_INTERFACE}" root cake bandwidth "${RTMP_SHAPE_MBIT}Mbit" \
     besteffort dual-dsthost nat nowash
