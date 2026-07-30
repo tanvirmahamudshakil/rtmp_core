@@ -86,6 +86,16 @@ public:
     [[nodiscard]] HttpResponse handle(const HttpRequest& request);
     void set_next(HttpHandler next) { next_ = std::move(next); }
 
+    // Predicate consulted on every request: when it returns false for a
+    // stream, playlists and segments 404 as if the stream did not exist. This
+    // is how disabling a stream in the management API takes its HLS (.m3u8)
+    // links offline, matching the RTMP publish/play gate. Unset = always served.
+    using StreamEnabledChecker =
+        std::function<bool(const std::string& application, const std::string& stream)>;
+    void set_stream_enabled_checker(StreamEnabledChecker checker) {
+        enabled_checker_ = std::move(checker);
+    }
+
     struct Stats {
         std::uint64_t playlist_requests = 0;
         std::uint64_t segment_requests = 0;
@@ -113,6 +123,7 @@ private:
 
     HlsHttpOptions options_;
     HttpHandler next_;
+    StreamEnabledChecker enabled_checker_;
 
     mutable std::mutex mutex_;
     std::unordered_map<std::string, StreamEntry> streams_; // key: "app/stream"

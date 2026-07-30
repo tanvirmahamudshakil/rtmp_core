@@ -33,6 +33,22 @@ export type TranscodingAssignment = {
   outputs: TranscodingOutput[];
 };
 
+// A transcode driven from an external source URL (RTMP or HLS/TS carrying
+// H.264/AAC) rather than from a stream published to this origin. The source is
+// pulled, transcoded per the chosen template, and re-served as one adaptive
+// master .m3u8 with a media playlist per rendition.
+export type SourceTranscodeJob = {
+  id: string;
+  application: string;
+  name: string;
+  source_url: string;
+  template_name: string;
+  master_hls_path: string;
+  outputs: TranscodingOutput[];
+  status: "starting" | "running" | "error";
+  detail?: string;
+};
+
 export type Snapshot = {
   applications: Application[];
   streams: Stream[];
@@ -68,6 +84,7 @@ let demoStreams: Stream[] = [
   { application: "backup", name: "disaster-recovery", enabled: false, recording_enabled: false, rtmp_url: demoRtmpUrl("backup", "disaster-recovery"), hls_path: "/hls/backup/disaster-recovery/index.m3u8", is_live: false, viewer_count: 0 }
 ];
 let demoAssignments: TranscodingAssignment[] = [];
+let demoSourceJobs: SourceTranscodeJob[] = [];
 
 const demoMetrics: Record<string, number> = {
   active_connections: 6624,
@@ -304,6 +321,74 @@ export class ControlClient {
     }
     await this.request<{ deleted: boolean }>(
       `/v1/transcoding/assignments/${encodeURIComponent(`${stream.application}:${stream.name}`)}`,
+      { method: "DELETE" }
+    );
+  }
+
+  async listSourceTranscodes(application: string): Promise<SourceTranscodeJob[]> {
+    if (this.demo) {
+      return demoSourceJobs.filter((job) => job.application === application).map((job) => ({ ...job, outputs: [...job.outputs] }));
+    }
+    const response = await this.request<{ items: SourceTranscodeJob[] }>(
+      `/v1/transcoding/source-jobs?application=${encodeURIComponent(application)}`
+    );
+    return response.items;
+  }
+
+  async createSourceTranscode(
+    application: string,
+    name: string,
+    sourceUrl: string,
+    templateName: string,
+    rules: string,
+    outputs: TranscodingOutput[]
+  ): Promise<SourceTranscodeJob> {
+    if (this.demo) {
+      const job: SourceTranscodeJob = {
+        id: `${application}:${name}`,
+        application,
+        name,
+        source_url: sourceUrl,
+        template_name: templateName,
+        master_hls_path: `/hls/${application}/${name}/master.m3u8`,
+        outputs,
+        status: "running"
+      };
+      demoSourceJobs = [...demoSourceJobs.filter((item) => item.id !== job.id), job];
+      return job;
+    }
+    const response = await fetch(`${this.baseUrl}/v1/transcoding/source-jobs`, {
+      method: "POST",
+      headers: {
+        Accept: "application/json",
+        "Content-Type": "text/plain; charset=utf-8",
+        "X-Application": application,
+        "X-Output-Name": name,
+        "X-Source-Url": sourceUrl,
+        "X-Template-Name": templateName
+      },
+      body: rules
+    });
+    if (!response.ok) {
+      let message = `Request failed (${response.status})`;
+      try {
+        const body = (await response.json()) as { message?: string };
+        if (body.message) message = body.message;
+      } catch {
+        // Keep status-based fallback.
+      }
+      throw new ApiError(message, response.status, response.headers.get("X-Request-Id") ?? undefined);
+    }
+    return response.json() as Promise<SourceTranscodeJob>;
+  }
+
+  async removeSourceTranscode(job: SourceTranscodeJob): Promise<void> {
+    if (this.demo) {
+      demoSourceJobs = demoSourceJobs.filter((item) => item.id !== job.id);
+      return;
+    }
+    await this.request<{ deleted: boolean }>(
+      `/v1/transcoding/source-jobs/${encodeURIComponent(job.id)}`,
       { method: "DELETE" }
     );
   }

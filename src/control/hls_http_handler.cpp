@@ -304,6 +304,14 @@ HttpResponse HlsHttpHandler::handle(const HttpRequest& request) {
     const std::string& stream = parts[1];
     const std::string& resource = parts[2];
 
+    // A disabled stream serves no playlists or segments: its .m3u8 links stop
+    // working the moment it is disabled, in lockstep with the RTMP gate.
+    if (enabled_checker_ && !enabled_checker_(application, stream)) {
+        std::lock_guard lock(mutex_);
+        stats_.not_found += 1;
+        return plain(404, "not found");
+    }
+
     if (!authorized(request, application, stream)) {
         {
             std::lock_guard lock(mutex_);

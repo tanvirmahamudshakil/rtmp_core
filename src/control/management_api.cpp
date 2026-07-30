@@ -278,6 +278,15 @@ HttpResponse ManagementApi::route(const HttpRequest& request, const std::string&
             }
         }
     }
+    if (parts.size() >= 3 && parts[0] == "v1" && parts[1] == "transcoding" &&
+        parts[2] == "source-jobs") {
+        if (parts.size() == 3 && request.method == "GET") return handle_list_source_jobs(request);
+        if (parts.size() == 3 && request.method == "POST") return handle_create_source_job(request);
+        if (parts.size() == 4 && request.method == "DELETE") {
+            auto [application, name] = split_stream_id(parts[3]);
+            return handle_delete_source_job(application, name);
+        }
+    }
     // Expected shapes: ["v1","applications"], ["v1","streams"],
     // ["v1","streams", "<id>"], ["v1","streams","<id>","<action>"].
     if (parts.size() >= 2 && parts[0] == "v1" && parts[1] == "applications") {
@@ -357,6 +366,49 @@ HttpResponse ManagementApi::handle_delete_transcoding_assignment(std::string_vie
         return HttpResponse::json(503, R"({"error":"transcoding_unavailable"})");
     }
     auto result = transcoding_assignment_remover_(application, source_stream);
+    if (!result) {
+        return HttpResponse::json(http_status_for(result.error().code()),
+                                  error_body("request_failed", result.error().message(), ""));
+    }
+    return HttpResponse::json(200, R"({"deleted":true})");
+}
+
+HttpResponse ManagementApi::handle_list_source_jobs(const HttpRequest& request) {
+    if (!source_jobs_provider_) return HttpResponse::json(503, R"({"error":"transcoding_unavailable"})");
+    const auto params = parse_query_params(request.query);
+    const auto application = params.find("application");
+    if (application == params.end() || application->second.empty()) {
+        return HttpResponse::json(400, R"({"error":"application_required"})");
+    }
+    auto result = source_jobs_provider_(percent_decode(application->second));
+    if (!result) return HttpResponse::json(500, error_body("request_failed", result.error().message(), ""));
+    return HttpResponse::json(200, std::move(result).value());
+}
+
+HttpResponse ManagementApi::handle_create_source_job(const HttpRequest& request) {
+    if (!source_job_creator_) return HttpResponse::json(503, R"({"error":"transcoding_unavailable"})");
+    const auto app = request.headers.find("x-application");
+    const auto name = request.headers.find("x-output-name");
+    const auto source = request.headers.find("x-source-url");
+    const auto tmpl = request.headers.find("x-template-name");
+    const auto end = request.headers.end();
+    if (app == end || name == end || source == end || tmpl == end || app->second.empty() ||
+        name->second.empty() || source->second.empty() || request.body.empty()) {
+        return HttpResponse::json(400, R"({"error":"invalid_source_job"})");
+    }
+    auto result = source_job_creator_(app->second, name->second, source->second, tmpl->second,
+                                      request.body);
+    if (!result) {
+        return HttpResponse::json(http_status_for(result.error().code()),
+                                  error_body("request_failed", result.error().message(), ""));
+    }
+    return HttpResponse::json(200, std::move(result).value());
+}
+
+HttpResponse ManagementApi::handle_delete_source_job(std::string_view application,
+                                                     std::string_view name) {
+    if (!source_job_remover_) return HttpResponse::json(503, R"({"error":"transcoding_unavailable"})");
+    auto result = source_job_remover_(application, name);
     if (!result) {
         return HttpResponse::json(http_status_for(result.error().code()),
                                   error_body("request_failed", result.error().message(), ""));
@@ -484,11 +536,19 @@ HttpResponse ManagementApi::handle_patch_stream(std::string_view application, st
     auto fields = parse_flat_json(request.body);
     bool any = false;
     if (auto it = fields.find("enabled"); it != fields.end()) {
-        auto result = manager_.set_enabled(application, name, it->second == "true");
+        const bool enable = it->second == "true";
+        auto result = manager_.set_enabled(application, name, enable);
         audit("set_enabled", application, name, result.ok());
         if (!result.ok())
             return HttpResponse::json(http_status_for(result.error().code()),
                                        error_body("request_failed", result.error().message(), ""));
+        // Disabling must take effect now, not just for future connections: drop
+        // the live publisher and viewers so the RTMP feed and its HLS window
+        // stop immediately (the HLS handler already 404s a disabled stream).
+        if (!enable && registry_ != nullptr) {
+            static_cast<void>(manager_.disconnect_viewers(application, name, *registry_));
+            static_cast<void>(manager_.disconnect_publisher(application, name, *registry_));
+        }
         any = true;
     }
     if (auto it = fields.find("recording_enabled"); it != fields.end()) {

@@ -14,6 +14,7 @@ add_library(rtmp_server_media STATIC
     h264/avc.cpp
     aac/adts.cpp
     ts/ts_muxer.cpp
+    ts/ts_demuxer.cpp
     ${CMAKE_SOURCE_DIR}/src/recording/recorder.cpp
     ${CMAKE_SOURCE_DIR}/src/recording/async_file_sink.cpp
     ${CMAKE_SOURCE_DIR}/src/recording/retention.cpp
