@@ -12,6 +12,7 @@
 #include "rtmp_server/transcoding/native/aac_decoder.hpp"
 #include "rtmp_server/transcoding/native/aac_encoder.hpp"
 #include "rtmp_server/transcoding/native/frame.hpp"
+#include "rtmp_server/transcoding/native/h264_encoder.hpp"
 #include "rtmp_server/transcoding/native/hevc_encoder.hpp"
 #include "rtmp_server/transcoding/native/scaler.hpp"
 #endif
@@ -232,6 +233,25 @@ TEST(NativeHevcEncoder, EncodesFramesAndEmitsKeyframe) {
     for (const auto& au : out) {
         EXPECT_FALSE(au.annexb.empty());
         EXPECT_TRUE(starts_with_annexb(au.annexb));
+    }
+}
+
+TEST(NativeH264Encoder, EncodesFramesRealtimeAndEmitsKeyframe) {
+    const auto config = build_h264_config(320, 240, 30, 1'000'000, 15, 1);
+    H264Encoder encoder;
+    ASSERT_TRUE(encoder.open(config).ok());
+
+    std::vector<EncodedAccessUnit> out;
+    for (int i = 0; i < 30; ++i) {
+        const YuvFrame f = make_gradient_frame(320, 240, i * 3000, i);
+        ASSERT_TRUE(encoder.encode(f, out).ok());
+    }
+    ASSERT_FALSE(out.empty());
+    EXPECT_TRUE(std::any_of(out.begin(), out.end(), [](const auto& au) { return au.keyframe; }));
+    for (const auto& au : out) {
+        EXPECT_FALSE(au.annexb.empty());
+        EXPECT_TRUE(starts_with_annexb(au.annexb));
+        EXPECT_EQ(au.dts_90k, au.pts_90k); // no B-frames
     }
 }
 

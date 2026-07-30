@@ -30,6 +30,7 @@ target_compile_features(rtmp_server_transcoding PUBLIC cxx_std_23)
 if(RTMP_NATIVE_TRANSCODE_AVAILABLE)
     target_sources(rtmp_server_transcoding PRIVATE
         native/h264_decoder.cpp
+        native/h264_encoder.cpp
         native/scaler.cpp
         native/hevc_encoder.cpp
         native/video_transcoder.cpp
