@@ -38,10 +38,10 @@ import {
   Zap
 } from "lucide-react";
 import { Dispatch, FormEvent, ReactNode, SetStateAction, useCallback, useEffect, useState } from "react";
-import { Application, ControlClient, Snapshot, Stream, TranscodingAssignment, TranscodingOutput } from "./api";
+import { Application, ControlClient, Snapshot, SourceTranscodeJob, Stream, TranscodingAssignment, TranscodingOutput } from "./api";
 
 type Page = "home" | "applications" | "transcode" | "server";
-type ApplicationTab = "playback" | "transcoding";
+type ApplicationTab = "playback" | "transcoding" | "source";
 type VideoCodec = "H.263" | "H.264" | "H.265" | "VP8" | "VP9" | "Passthrough" | "Disabled";
 type EncodingImplementation = "Beamr" | "QuickSync" | "NVENC" | "Default";
 type VideoProfile = "baseline" | "main" | "high";
@@ -83,13 +83,21 @@ const pageTitles: Record<Page, { title: string; subtitle: string }> = {
 };
 const applicationTabs: { id: ApplicationTab; label: string }[] = [
   { id: "playback", label: "Playback URLs" },
-  { id: "transcoding", label: "Transcoding" }
+  { id: "transcoding", label: "Transcoding" },
+  { id: "source", label: "Source Transcode" }
 ];
 const videoCodecs: VideoCodec[] = ["H.263", "H.264", "H.265", "VP8", "VP9", "Passthrough", "Disabled"];
 const encodingImplementations: EncodingImplementation[] = ["Beamr", "QuickSync", "NVENC", "Default"];
 const videoProfiles: VideoProfile[] = ["baseline", "main", "high"];
 const fitModes: FitMode[] = ["match-source", "fit-width", "fit-height", "crop", "stretch", "letterbox"];
 const audioCodecs: AudioCodec[] = ["AAC", "Vorbis", "Opus", "Passthrough", "Disabled"];
+// What the in-process, FFmpeg-free native pipeline can actually do today: H.264
+// (openh264) and H.265 (x265) video, AAC (libfdk-aac) audio, software backend
+// only. Everything else is disabled in the pickers until its codec/backend is
+// built, so an operator cannot select a rendition the origin cannot produce.
+const builtVideoCodecs = new Set<VideoCodec>(["H.264", "H.265", "Passthrough", "Disabled"]);
+const builtImplementations = new Set<EncodingImplementation>(["Default"]);
+const builtAudioCodecs = new Set<AudioCodec>(["AAC", "Passthrough", "Disabled"]);
 const transcodingStorageKey = "streamforge-transcoding-templates";
 const newLocalId = () => globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(16).slice(2)}`;
 const loadTranscodingTemplates = (): TranscodingTemplate[] => {
@@ -175,6 +183,20 @@ const buildTemplateRules = (stream: Stream, template: TranscodingTemplate) => {
     ].join("|");
   });
   return { rules: lines.join("\n"), outputs };
+};
+
+// Rules for a source-driven job. The origin overrides the input with the source
+// URL, so the pseudo-stream only shapes the output names and rendition ladder.
+const buildSourceRules = (application: string, outputName: string, template: TranscodingTemplate) => {
+  const pseudo = {
+    application,
+    name: outputName,
+    enabled: true,
+    recording_enabled: false,
+    rtmp_url: "",
+    hls_path: ""
+  } as Stream;
+  return buildTemplateRules(pseudo, template);
 };
 
 const metric = (snapshot: Snapshot, name: string) => snapshot.metrics[name] ?? 0;
@@ -593,6 +615,11 @@ function ApplicationDetailPage({
   const [selectedTemplates, setSelectedTemplates] = useState<Record<string, string>>({});
   const [assignmentBusy, setAssignmentBusy] = useState<string | null>(null);
   const [assignmentsLoading, setAssignmentsLoading] = useState(false);
+  const [sourceJobs, setSourceJobs] = useState<SourceTranscodeJob[]>([]);
+  const [sourceUrl, setSourceUrl] = useState("");
+  const [outputName, setOutputName] = useState("");
+  const [sourceTemplateId, setSourceTemplateId] = useState("");
+  const [sourceBusy, setSourceBusy] = useState(false);
   const renditionStreamNames = new Set(assignments.flatMap((assignment) => assignment.outputs.map((output) => output.stream)));
   const sourceStreams = applicationStreams.filter((stream) => !renditionStreamNames.has(stream.name));
 
@@ -673,6 +700,71 @@ function ApplicationDetailPage({
     }
   };
 
+  const loadSourceJobs = useCallback(async () => {
+    try {
+      setSourceJobs(await client.listSourceTranscodes(application.name));
+    } catch (error) {
+      onNotify("error", error instanceof Error ? error.message : "Could not load source transcodes.");
+    }
+  }, [application.name, client, onNotify]);
+
+  useEffect(() => {
+    if (activeTab === "source") loadSourceJobs();
+  }, [activeTab, loadSourceJobs]);
+
+  const startSourceTranscode = async () => {
+    const template = templates.find((item) => item.id === sourceTemplateId);
+    const source = sourceUrl.trim();
+    const name = safeRuleName(outputName, "");
+    if (!source) {
+      onNotify("error", "Enter a source URL (rtmp:// or an https .m3u8).");
+      return;
+    }
+    if (!name) {
+      onNotify("error", "Enter an output name for the transcoded stream.");
+      return;
+    }
+    if (!template || !template.presets.length) {
+      onNotify("error", "Select a transcoding template with at least one preset.");
+      return;
+    }
+    const unsupported = template.presets.find((preset) =>
+      !["H.264", "Passthrough", "Disabled"].includes(preset.videoCodec) ||
+      !["AAC", "Passthrough", "Disabled"].includes(preset.audioCodec) ||
+      preset.implementation !== "Default"
+    );
+    if (unsupported) {
+      onNotify("error", `${unsupported.name} uses a codec/backend that is not built. Use H.264 + AAC on the Default backend.`);
+      return;
+    }
+    setSourceBusy(true);
+    try {
+      const { rules, outputs } = buildSourceRules(application.name, name, template);
+      const job = await client.createSourceTranscode(application.name, name, source, template.name, rules, outputs);
+      setSourceJobs((current) => [...current.filter((item) => item.id !== job.id), job]);
+      onNotify("success", `Transcoding ${source} into ${outputs.length} rendition${outputs.length === 1 ? "" : "s"}.`);
+      setSourceUrl("");
+      setOutputName("");
+    } catch (error) {
+      onNotify("error", error instanceof Error ? error.message : "Could not start the source transcode.");
+    } finally {
+      setSourceBusy(false);
+    }
+  };
+
+  const removeSourceTranscode = async (job: SourceTranscodeJob) => {
+    setSourceBusy(true);
+    try {
+      await client.removeSourceTranscode(job);
+      setSourceJobs((current) => current.filter((item) => item.id !== job.id));
+      onNotify("success", `Stopped ${job.name}.`);
+    } catch (error) {
+      onNotify("error", error instanceof Error ? error.message : "Could not stop the source transcode.");
+    } finally {
+      setSourceBusy(false);
+    }
+  };
+
   const renderTab = () => {
     if (activeTab === "playback") {
       return (
@@ -710,6 +802,83 @@ function ApplicationDetailPage({
             {!applicationStreams.length && (
               <div className="empty-state full"><Radio size={28} /><strong>No playback URLs yet</strong><span>Playback links will appear when streams are registered for this application.</span></div>
             )}
+          </div>
+        </section>
+      );
+    }
+    if (activeTab === "source") {
+      return (
+        <section className="assignment-workspace">
+          <div className="playback-heading">
+            <div><span className="eyebrow">PULL · TRANSCODE · RE-SERVE</span><h2>Transcode from a source URL</h2><p>Point at an external source (rtmp:// or an https .m3u8 carrying H.264/AAC). It is transcoded per the chosen template and re-served as one adaptive master .m3u8.</p></div>
+            <span className="panel-count">{sourceJobs.length} running</span>
+          </div>
+          <article className="assignment-card source-form">
+            <label className="assignment-select">Source URL
+              <input
+                type="text"
+                inputMode="url"
+                placeholder="rtmp://host/app/stream  or  https://host/live/index.m3u8"
+                value={sourceUrl}
+                onChange={(event) => setSourceUrl(event.target.value)}
+              />
+            </label>
+            <label className="assignment-select">Output name
+              <input
+                type="text"
+                placeholder="my-restream"
+                value={outputName}
+                onChange={(event) => setOutputName(event.target.value)}
+              />
+            </label>
+            <label className="assignment-select">Transcoding template
+              <select value={sourceTemplateId} onChange={(event) => setSourceTemplateId(event.target.value)}>
+                <option value="">Select a template</option>
+                {templates.map((template) => (
+                  <option key={template.id} value={template.id}>{template.name} · {template.presets.length} resolutions</option>
+                ))}
+              </select>
+            </label>
+            <div className="assignment-actions">
+              <button className="primary-button" disabled={sourceBusy} onClick={startSourceTranscode}>
+                {sourceBusy ? <RefreshCw className="spin" size={16} /> : <Plus size={16} />}
+                Start transcode
+              </button>
+            </div>
+            {!templates.length && <div className="assignment-guidance"><Workflow size={18} /><span>Create a template from the sidebar Transcode page first.</span></div>}
+          </article>
+          <div className="assignment-grid">
+            {sourceJobs.map((job) => {
+              const masterUrl = absoluteUrl(job.master_hls_path);
+              return (
+                <article className="assignment-card assigned" key={job.id}>
+                  <div className="assignment-card-head">
+                    <span className="stream-avatar"><Workflow size={17} /></span>
+                    <div><strong>{job.name}</strong><small title={job.source_url}>{job.source_url}</small></div>
+                    <StatusPill live={job.status === "running"} label={job.status === "running" ? "Live" : job.status} />
+                  </div>
+                  <div className="rendition-list">
+                    {job.outputs.map((output) => (
+                      <span key={output.stream}>
+                        <b>{output.width && output.height ? `${output.width}×${output.height}` : output.name}</b>
+                        <small>{bitrate(output.video_bitrate)} · {output.video_codec.toUpperCase()}</small>
+                      </span>
+                    ))}
+                  </div>
+                  <div className="master-url-row">
+                    <span>MASTER M3U8</span><code title={masterUrl}>{masterUrl}</code>
+                    <IconButton label="Copy adaptive master URL" onClick={() => copyUrl(masterUrl)}>
+                      {copiedUrl === masterUrl ? <Check size={16} /> : <Copy size={16} />}
+                    </IconButton>
+                  </div>
+                  {job.detail && <div className="assignment-empty"><Layers3 size={19} /><span>{job.detail}</span></div>}
+                  <div className="assignment-actions">
+                    <button className="secondary-button danger-text" disabled={sourceBusy} onClick={() => removeSourceTranscode(job)}><Trash2 size={15} /> Stop</button>
+                  </div>
+                </article>
+              );
+            })}
+            {!sourceJobs.length && <div className="empty-state full"><Radio size={28} /><strong>No source transcodes</strong><span>Add a source URL above to start transcoding into an adaptive ladder.</span></div>}
           </div>
         </section>
       );
@@ -1035,7 +1204,7 @@ function NewPresetModal({ onClose, onAdd }: { onClose: () => void; onAdd: (prese
         <div className="preset-video-grid">
           <label htmlFor="video-codec">Video Codec
             <select id="video-codec" value={videoCodec} onChange={(event) => setVideoCodec(event.target.value as VideoCodec)}>
-              {videoCodecs.map((codec) => <option key={codec}>{codec}</option>)}
+              {videoCodecs.map((codec) => <option key={codec} value={codec} disabled={!builtVideoCodecs.has(codec)}>{codec}{builtVideoCodecs.has(codec) ? "" : " — not built"}</option>)}
             </select>
           </label>
           <label htmlFor="video-bitrate">Video Bitrate
@@ -1047,7 +1216,7 @@ function NewPresetModal({ onClose, onAdd }: { onClose: () => void; onAdd: (prese
           </label>
           <label htmlFor="encoding-implementation">Encoding Implementation
             <select id="encoding-implementation" value={implementation} onChange={(event) => setImplementation(event.target.value as EncodingImplementation)}>
-              {encodingImplementations.map((item) => <option key={item}>{item}</option>)}
+              {encodingImplementations.map((item) => <option key={item} value={item} disabled={!builtImplementations.has(item)}>{item}{builtImplementations.has(item) ? "" : " — not built"}</option>)}
             </select>
           </label>
           <label htmlFor="video-profile">Profile
@@ -1105,7 +1274,7 @@ function NewPresetModal({ onClose, onAdd }: { onClose: () => void; onAdd: (prese
         <div className="audio-settings-grid">
           <label htmlFor="audio-codec">Audio Codec
             <select id="audio-codec" value={audioCodec} onChange={(event) => setAudioCodec(event.target.value as AudioCodec)}>
-              {audioCodecs.map((codec) => <option key={codec}>{codec}</option>)}
+              {audioCodecs.map((codec) => <option key={codec} value={codec} disabled={!builtAudioCodecs.has(codec)}>{codec}{builtAudioCodecs.has(codec) ? "" : " — not built"}</option>)}
             </select>
           </label>
           <label htmlFor="audio-bitrate">Audio Bitrate
