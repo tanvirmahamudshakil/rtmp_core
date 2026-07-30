@@ -16,24 +16,11 @@ core::Error source_error(std::string message) {
 
 constexpr std::uint64_t kClockHz = 90000;
 
-// A rendition target size given the source size: 0 dimensions keep the source.
-void resolve_size(const RenditionSpec& spec, std::uint32_t src_w, std::uint32_t src_h,
-                  std::uint32_t& out_w, std::uint32_t& out_h) {
-    out_w = spec.width ? spec.width : src_w;
-    out_h = spec.height ? spec.height : src_h;
-    out_w -= out_w % 2;
-    out_h -= out_h % 2;
-    if (out_w < 2) out_w = 2;
-    if (out_h < 2) out_h = 2;
-}
-
-// Builds a fit-width-style scale plan (aspect-preserving to the target box).
-ScalePlan plan_for(std::uint32_t src_w, std::uint32_t src_h, std::uint32_t out_w,
-                   std::uint32_t out_h) {
+ScalePlan plan_for(const RenditionSpec& spec, std::uint32_t src_w, std::uint32_t src_h) {
     Preset preset;
-    preset.width = out_w;
-    preset.height = out_h;
-    preset.fit_mode = (out_w == src_w && out_h == src_h) ? FitMode::MatchSource : FitMode::Stretch;
+    if (spec.width) preset.width = spec.width;
+    if (spec.height) preset.height = spec.height;
+    preset.fit_mode = spec.fit_mode;
     return compute_scale_plan(preset, src_w, src_h);
 }
 
@@ -60,11 +47,9 @@ core::Result<void> SourceTranscoder::start() {
 core::Result<void> SourceTranscoder::ensure_video(Rendition& rendition, std::uint32_t src_w,
                                                   std::uint32_t src_h) {
     if (rendition.video_open) return {};
-    std::uint32_t out_w = 0;
-    std::uint32_t out_h = 0;
-    resolve_size(rendition.spec, src_w, src_h, out_w, out_h);
-    const auto config = build_h264_config(out_w, out_h, fps_, rendition.spec.video_bitrate,
-                                          rendition.spec.gop, 1);
+    const ScalePlan plan = plan_for(rendition.spec, src_w, src_h);
+    const auto config = build_h264_config(plan.out_w, plan.out_h, fps_,
+                                          rendition.spec.video_bitrate, rendition.spec.gop, 1);
     if (auto r = rendition.video_encoder.open(config); !r) return r.error();
     rendition.video_open = true;
     return {};
@@ -84,10 +69,7 @@ core::Result<void> SourceTranscoder::on_video(std::span<const std::byte> annexb,
         auto& rendition = *renditions_[i];
         if (auto r = ensure_video(rendition, decoded_.width, decoded_.height); !r) return r.error();
 
-        std::uint32_t out_w = 0;
-        std::uint32_t out_h = 0;
-        resolve_size(rendition.spec, decoded_.width, decoded_.height, out_w, out_h);
-        const ScalePlan plan = plan_for(decoded_.width, decoded_.height, out_w, out_h);
+        const ScalePlan plan = plan_for(rendition.spec, decoded_.width, decoded_.height);
         if (auto r = rendition.scaler.scale(decoded_, plan, rendition.scaled); !r) return r.error();
 
         std::vector<EncodedAccessUnit> encoded;

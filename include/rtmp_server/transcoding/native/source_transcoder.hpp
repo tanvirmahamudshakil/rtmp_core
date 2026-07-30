@@ -14,6 +14,7 @@
 #include "rtmp_server/transcoding/native/h264_decoder.hpp"
 #include "rtmp_server/transcoding/native/h264_encoder.hpp"
 #include "rtmp_server/transcoding/native/scaler.hpp"
+#include "rtmp_server/transcoding/preset.hpp"
 
 namespace rtmp_server::transcoding::native {
 
@@ -26,6 +27,7 @@ struct RenditionSpec {
     std::uint32_t video_bitrate = 2'500'000;
     std::uint32_t gop = 60;
     std::uint32_t audio_bitrate = 128'000;
+    FitMode fit_mode = FitMode::Stretch;
 };
 
 // The FFmpeg-free source transcoder core. It decodes a source's H.264/AAC

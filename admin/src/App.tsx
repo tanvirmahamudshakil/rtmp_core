@@ -89,7 +89,30 @@ const applicationTabs: { id: ApplicationTab; label: string }[] = [
 const videoCodecs: VideoCodec[] = ["H.263", "H.264", "H.265", "VP8", "VP9", "Passthrough", "Disabled"];
 const encodingImplementations: EncodingImplementation[] = ["Beamr", "QuickSync", "NVENC", "Default"];
 const videoProfiles: VideoProfile[] = ["baseline", "main", "high"];
-const fitModes: FitMode[] = ["match-source", "fit-width", "fit-height", "crop", "stretch", "letterbox"];
+const allFitModes: FitMode[] = ["match-source", "fit-width", "fit-height", "crop", "stretch", "letterbox"];
+const outputFitModes: FitMode[] = ["letterbox", "crop", "stretch"];
+const fitModeLabels: Record<FitMode, string> = {
+  "match-source": "Match source",
+  "fit-width": "Fit width",
+  "fit-height": "Fit height",
+  crop: "Crop to fill",
+  stretch: "Stretch",
+  letterbox: "Letterbox"
+};
+const frameResolutions = [
+  { id: "source", label: "Source resolution", width: null, height: null },
+  { id: "256x144", label: "144p · 256 × 144", width: 256, height: 144 },
+  { id: "426x240", label: "240p · 426 × 240", width: 426, height: 240 },
+  { id: "640x360", label: "360p · 640 × 360", width: 640, height: 360 },
+  { id: "854x480", label: "480p · 854 × 480", width: 854, height: 480 },
+  { id: "960x540", label: "540p · 960 × 540", width: 960, height: 540 },
+  { id: "1280x720", label: "720p HD · 1280 × 720", width: 1280, height: 720 },
+  { id: "1920x1080", label: "1080p Full HD · 1920 × 1080", width: 1920, height: 1080 },
+  { id: "2560x1440", label: "1440p QHD · 2560 × 1440", width: 2560, height: 1440 },
+  { id: "3840x2160", label: "2160p 4K · 3840 × 2160", width: 3840, height: 2160 },
+  { id: "custom", label: "Custom resolution…", width: null, height: null }
+] as const;
+type FrameResolutionId = (typeof frameResolutions)[number]["id"];
 const audioCodecs: AudioCodec[] = ["AAC", "Vorbis", "Opus", "Passthrough", "Disabled"];
 // What the in-process, FFmpeg-free native pipeline can actually do today: H.264
 // (openh264) and H.265 (x265) video, AAC (libfdk-aac) audio, software backend
@@ -100,24 +123,51 @@ const builtImplementations = new Set<EncodingImplementation>(["Default"]);
 const builtAudioCodecs = new Set<AudioCodec>(["AAC", "Passthrough", "Disabled"]);
 const transcodingStorageKey = "streamforge-transcoding-templates";
 const newLocalId = () => globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+const validFrameDimension = (value: unknown): value is number =>
+  typeof value === "number" && Number.isInteger(value) && value >= 16 && value <= 8192 && value % 2 === 0;
 const loadTranscodingTemplates = (): TranscodingTemplate[] => {
   try {
     const stored = JSON.parse(localStorage.getItem(transcodingStorageKey) ?? "[]") as TranscodingTemplate[];
     if (!Array.isArray(stored)) return [];
     return stored.map((template) => ({
       ...template,
-      presets: Array.isArray(template.presets) ? template.presets.map((preset) => ({
-        ...preset,
-        implementation: encodingImplementations.includes(preset.implementation) ? preset.implementation : "Default",
-        profile: preset.profile ?? "high",
-        keyFrameMode: preset.keyFrameMode ?? "source",
-        keyFrameInterval: preset.keyFrameInterval ?? null,
-        frameWidth: preset.frameWidth ?? null,
-        frameHeight: preset.frameHeight ?? null,
-        fitMode: preset.fitMode ?? "match-source",
-        audioCodec: preset.audioCodec ?? "AAC",
-        audioBitrate: preset.audioBitrate ?? 128000
-      })) : []
+      presets: Array.isArray(template.presets) ? template.presets.map((preset) => {
+        let frameWidth = validFrameDimension(preset.frameWidth) ? preset.frameWidth : null;
+        let frameHeight = validFrameDimension(preset.frameHeight) ? preset.frameHeight : null;
+        let fitMode: FitMode = allFitModes.includes(preset.fitMode) ? preset.fitMode : "match-source";
+        // Older control-panel builds allowed dimensions to be saved with
+        // match-source, which made the transcoder ignore those dimensions.
+        // Preserve valid requested sizes; reset malformed legacy values to
+        // source resolution instead of submitting another invalid rule.
+        if (fitMode === "match-source") {
+          if (frameWidth && frameHeight) {
+            fitMode = "letterbox";
+          } else {
+            frameWidth = null;
+            frameHeight = null;
+          }
+        } else if (
+          (fitMode === "fit-width" && !frameWidth) ||
+          (fitMode === "fit-height" && !frameHeight) ||
+          (["crop", "stretch", "letterbox"].includes(fitMode) && (!frameWidth || !frameHeight))
+        ) {
+          frameWidth = null;
+          frameHeight = null;
+          fitMode = "match-source";
+        }
+        return {
+          ...preset,
+          implementation: encodingImplementations.includes(preset.implementation) ? preset.implementation : "Default",
+          profile: preset.profile ?? "high",
+          keyFrameMode: preset.keyFrameMode ?? "source",
+          keyFrameInterval: preset.keyFrameInterval ?? null,
+          frameWidth,
+          frameHeight,
+          fitMode,
+          audioCodec: preset.audioCodec ?? "AAC",
+          audioBitrate: preset.audioBitrate ?? 128000
+        };
+      }) : []
     }));
   } catch {
     return [];
@@ -1174,13 +1224,25 @@ function NewPresetModal({ onClose, onAdd }: { onClose: () => void; onAdd: (prese
   const [profile, setProfile] = useState<VideoProfile>("high");
   const [keyFrameMode, setKeyFrameMode] = useState<"source" | "interval">("source");
   const [keyFrameInterval, setKeyFrameInterval] = useState("60");
+  const [frameResolution, setFrameResolution] = useState<FrameResolutionId>("source");
   const [frameWidth, setFrameWidth] = useState("");
   const [frameHeight, setFrameHeight] = useState("");
-  const [fitMode, setFitMode] = useState<FitMode>("match-source");
+  const [fitMode, setFitMode] = useState<FitMode>("letterbox");
   const [audioCodec, setAudioCodec] = useState<AudioCodec>("AAC");
   const [audioBitrate, setAudioBitrate] = useState("128000");
   const [gpuMode, setGpuMode] = useState<"first" | "specific">("first");
   const [gpuId, setGpuId] = useState("0");
+  const selectedResolution = frameResolutions.find((resolution) => resolution.id === frameResolution) ?? frameResolutions[0];
+  const sourceResolution = frameResolution === "source";
+  const customResolution = frameResolution === "custom";
+  const customWidth = Number(frameWidth);
+  const customHeight = Number(frameHeight);
+  const validCustomDimensions = !customResolution || (
+    Number.isInteger(customWidth) && customWidth >= 16 && customWidth <= 8192 && customWidth % 2 === 0 &&
+    Number.isInteger(customHeight) && customHeight >= 16 && customHeight <= 8192 && customHeight % 2 === 0
+  );
+  const outputWidth = customResolution ? customWidth : selectedResolution.width;
+  const outputHeight = customResolution ? customHeight : selectedResolution.height;
   return (
     <Modal title="Add encoding preset" description="Configure the outgoing video encoding profile." onClose={onClose} wide>
       <form className="modal-form preset-form" onSubmit={(event: FormEvent) => {
@@ -1196,9 +1258,9 @@ function NewPresetModal({ onClose, onAdd }: { onClose: () => void; onAdd: (prese
           profile,
           keyFrameMode,
           keyFrameInterval: keyFrameMode === "interval" ? Math.max(1, Number(keyFrameInterval) || 1) : null,
-          frameWidth: frameWidth ? Math.max(1, Number(frameWidth) || 1) : null,
-          frameHeight: frameHeight ? Math.max(1, Number(frameHeight) || 1) : null,
-          fitMode,
+          frameWidth: sourceResolution ? null : outputWidth,
+          frameHeight: sourceResolution ? null : outputHeight,
+          fitMode: sourceResolution ? "match-source" : fitMode,
           audioCodec,
           audioBitrate: Math.max(0, Number(audioBitrate) || 0),
           gpuMode,
@@ -1260,17 +1322,36 @@ function NewPresetModal({ onClose, onAdd }: { onClose: () => void; onAdd: (prese
         </fieldset>
 
         <div className="form-section-heading"><span><AppWindow size={17} /></span><div><strong>Frame Size</strong><small>Output dimensions and source fitting</small></div></div>
-        <div className="frame-size-grid">
-          <label htmlFor="frame-width">Width
-            <div className="field-with-unit"><input id="frame-width" type="number" min="1" placeholder="Source" value={frameWidth} onChange={(event) => setFrameWidth(event.target.value)} /><span>px</span></div>
-          </label>
-          <label htmlFor="frame-height">Height
-            <div className="field-with-unit"><input id="frame-height" type="number" min="1" placeholder="Source" value={frameHeight} onChange={(event) => setFrameHeight(event.target.value)} /><span>px</span></div>
-          </label>
-          <label htmlFor="fit-mode">Fit Mode
-            <select id="fit-mode" value={fitMode} onChange={(event) => setFitMode(event.target.value as FitMode)}>
-              {fitModes.map((item) => <option key={item}>{item}</option>)}
+        <div className={`frame-size-grid${customResolution ? " custom-resolution" : ""}`}>
+          <label htmlFor="frame-resolution">Resolution
+            <select id="frame-resolution" value={frameResolution} onChange={(event) => {
+              const next = event.target.value as FrameResolutionId;
+              setFrameResolution(next);
+              if (next !== "custom") {
+                setFrameWidth("");
+                setFrameHeight("");
+              }
+            }}>
+              {frameResolutions.map((resolution) => <option key={resolution.id} value={resolution.id}>{resolution.label}</option>)}
             </select>
+            <small>{sourceResolution ? "Keep the input frame dimensions." : "The encoder output will use this exact frame size."}</small>
+          </label>
+          {customResolution && <>
+            <label htmlFor="frame-width">Width
+              <div className="field-with-unit"><input id="frame-width" type="number" min="16" max="8192" step="2" required placeholder="1280" value={frameWidth} onChange={(event) => setFrameWidth(event.target.value)} /><span>px</span></div>
+            </label>
+            <label htmlFor="frame-height">Height
+              <div className="field-with-unit"><input id="frame-height" type="number" min="16" max="8192" step="2" required placeholder="720" value={frameHeight} onChange={(event) => setFrameHeight(event.target.value)} /><span>px</span></div>
+              <small>Use even values from 16 to 8192 pixels.</small>
+            </label>
+          </>}
+          <label htmlFor="fit-mode">Fit Mode
+            <select id="fit-mode" value={sourceResolution ? "match-source" : fitMode} disabled={sourceResolution} onChange={(event) => setFitMode(event.target.value as FitMode)}>
+              {sourceResolution
+                ? <option value="match-source">{fitModeLabels["match-source"]}</option>
+                : outputFitModes.map((item) => <option key={item} value={item}>{fitModeLabels[item]}</option>)}
+            </select>
+            <small>{sourceResolution ? "No scaling is applied." : "Letterbox preserves aspect ratio and guarantees the selected output size."}</small>
           </label>
         </div>
 
@@ -1305,7 +1386,7 @@ function NewPresetModal({ onClose, onAdd }: { onClose: () => void; onAdd: (prese
 
         <div className="modal-actions">
           <button type="button" className="secondary-button" onClick={onClose}>Cancel</button>
-          <button className="primary-button" disabled={!name.trim() || !outgoingStreamName.trim()}><Plus size={17} /> Add preset</button>
+          <button className="primary-button" disabled={!name.trim() || !outgoingStreamName.trim() || !validCustomDimensions}><Plus size={17} /> Add preset</button>
         </div>
       </form>
     </Modal>

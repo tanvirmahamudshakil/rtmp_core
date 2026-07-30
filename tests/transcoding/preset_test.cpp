@@ -62,4 +62,16 @@ TEST(TranscodingPreset, RejectsUnboundedOrInvalidValues) {
     EXPECT_NE(catalogue.error().message().find("video bitrate"), std::string::npos);
 }
 
+TEST(TranscodingPreset, RejectsInvalidOrOddFrameDimensions) {
+    auto non_numeric = rtmp_server::transcoding::PresetCatalogue::parse(
+        "football/live2|hd|out|default|h264|2500000|high|60|wide|720|letterbox|aac|128000|first\n");
+    ASSERT_FALSE(non_numeric.ok());
+    EXPECT_NE(non_numeric.error().message().find("width must be an integer"), std::string::npos);
+
+    auto odd = rtmp_server::transcoding::PresetCatalogue::parse(
+        "football/live2|hd|out|default|h264|2500000|high|60|1279|720|letterbox|aac|128000|first\n");
+    ASSERT_FALSE(odd.ok());
+    EXPECT_NE(odd.error().message().find("must be even"), std::string::npos);
+}
+
 } // namespace

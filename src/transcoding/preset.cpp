@@ -205,11 +205,21 @@ Result<PresetCatalogue> PresetCatalogue::parse_stream(std::istream& input) {
             }
             preset.keyframe_interval = *interval;
         }
-        if (!fields[8].empty()) preset.width = number<std::uint32_t>(fields[8]);
-        if (!fields[9].empty()) preset.height = number<std::uint32_t>(fields[9]);
+        if (!fields[8].empty()) {
+            preset.width = number<std::uint32_t>(fields[8]);
+            if (!preset.width) return invalid(line_number, "frame width must be an integer");
+        }
+        if (!fields[9].empty()) {
+            preset.height = number<std::uint32_t>(fields[9]);
+            if (!preset.height) return invalid(line_number, "frame height must be an integer");
+        }
         if ((preset.width && (*preset.width < 16 || *preset.width > 8192)) ||
             (preset.height && (*preset.height < 16 || *preset.height > 8192))) {
             return invalid(line_number, "frame dimensions must be 16..8192");
+        }
+        if ((preset.width && *preset.width % 2 != 0) ||
+            (preset.height && *preset.height % 2 != 0)) {
+            return invalid(line_number, "frame dimensions must be even numbers");
         }
         if (preset.fit_mode == FitMode::Stretch || preset.fit_mode == FitMode::Crop ||
             preset.fit_mode == FitMode::Letterbox) {

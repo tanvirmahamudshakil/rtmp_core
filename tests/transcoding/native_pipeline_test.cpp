@@ -354,7 +354,7 @@ TEST(NativeSourceTranscoder, FansOneSourceOutToMultipleRenditions) {
     ASSERT_FALSE(source_aus.empty());
 
     std::vector<RenditionSpec> renditions = {
-        {"480p-ish", "out_480", 240, 240, 800'000, 15, 96'000},
+        {"480p-ish", "out_480", 240, 240, 800'000, 15, 96'000, FitMode::Letterbox},
         {"240p", "out_240", 160, 120, 400'000, 15, 64'000},
     };
     SourceTranscoder transcoder(renditions, 30);
@@ -363,12 +363,25 @@ TEST(NativeSourceTranscoder, FansOneSourceOutToMultipleRenditions) {
 
     std::vector<int> per_rendition_outputs(2, 0);
     bool saw_keyframe = false;
+    bool saw_exact_letterbox_size = false;
+    H264Decoder rendition_decoder;
+    ASSERT_TRUE(rendition_decoder.initialize().ok());
+    YuvFrame rendition_frame;
     transcoder.set_video_output([&](std::size_t rendition, const EncodedAccessUnit& au) {
         ASSERT_LT(rendition, per_rendition_outputs.size());
         EXPECT_FALSE(au.annexb.empty());
         EXPECT_TRUE(starts_with_annexb(au.annexb));
         per_rendition_outputs[rendition]++;
         if (au.keyframe) saw_keyframe = true;
+        if (rendition == 0) {
+            bool produced = false;
+            ASSERT_TRUE(rendition_decoder.decode(au.annexb, au.pts_90k, rendition_frame, produced).ok());
+            if (produced) {
+                EXPECT_EQ(rendition_frame.width, 240U);
+                EXPECT_EQ(rendition_frame.height, 240U);
+                saw_exact_letterbox_size = true;
+            }
+        }
     });
 
     for (const auto& au : source_aus) {
@@ -378,6 +391,7 @@ TEST(NativeSourceTranscoder, FansOneSourceOutToMultipleRenditions) {
     EXPECT_GT(per_rendition_outputs[0], 0);
     EXPECT_GT(per_rendition_outputs[1], 0);
     EXPECT_TRUE(saw_keyframe);
+    EXPECT_TRUE(saw_exact_letterbox_size);
 }
 
 TEST(NativeSourceTranscoder, ReEncodesAudioPerRendition) {

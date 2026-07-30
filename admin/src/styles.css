@@ -1288,7 +1288,9 @@ tbody tr:hover { background: #fcfcfd; }
 .form-section-heading strong { color: #344054; font-size: 11px; }
 .form-section-heading small { margin-top: 3px; color: var(--muted); font-size: 9px; }
 .preset-video-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
-.frame-size-grid { display: grid; grid-template-columns: 1fr 1fr 1.25fr; gap: 12px; }
+.frame-size-grid { display: grid; grid-template-columns: 1.35fr 1fr; gap: 12px; }
+.frame-size-grid.custom-resolution { grid-template-columns: 1.35fr .8fr .8fr 1fr; }
+.frame-size-grid select:disabled { color: #667085; background: #f4f6f8; cursor: not-allowed; }
 .audio-settings-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
 .field-with-unit {
   height: 43px;

@@ -556,6 +556,7 @@ int main(int argc, char** argv) {
                     spec.video_bitrate = static_cast<std::uint32_t>(preset.video_bitrate);
                     spec.gop = preset.keyframe_interval.value_or(60);
                     spec.audio_bitrate = static_cast<std::uint32_t>(preset.audio_bitrate);
+                    spec.fit_mode = preset.fit_mode;
                     cfg.renditions.push_back(std::move(spec));
                 }
             }
