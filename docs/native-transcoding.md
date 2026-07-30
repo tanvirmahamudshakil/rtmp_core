@@ -88,10 +88,31 @@ The knobs live in `HevcQualityOptions`; the defaults target live streaming at
 Off by default. Enable with the CMake option after installing the dev packages:
 
 ```bash
-sudo apt-get install libx265-dev libopenh264-dev libfdk-aac-dev libyuv-dev
+sudo apt-get install libx265-dev libopenh264-dev libfdk-aac-dev libcurl4-openssl-dev libyuv-dev
 cmake -S . -B build -DRTMP_ENABLE_NATIVE_TRANSCODE=ON
 cmake --build build
 ```
+
+## Source-transcode jobs (pull an external URL)
+
+Beyond transcoding streams published to this origin, the native pipeline can
+pull an **external source URL**, transcode it per a template, and re-serve it as
+one adaptive master `.m3u8`:
+
+```text
+source URL (rtmp:// or https .m3u8, H.264/AAC)
+    → HttpClient (libcurl) fetch playlist + segments
+    → TsDemuxer → decode once (openh264 / libfdk-aac)
+    → per rendition: libyuv scale + openh264 H.264 encode + AAC re-encode
+    → RenditionFeed → Segmenter → SegmentStore
+    → /hls/{app}/{name}/master.m3u8
+```
+
+Output is **H.264 + AAC** (openh264 realtime, low latency) so the existing HLS
+packaging serves it unchanged. Managed via `POST /v1/transcoding/source-jobs`
+(and GET/DELETE), or the admin UI's **Source Transcode** tab. Only the software
+backend with H.264/AAC is accepted — other codecs/backends are disabled in the
+UI and rejected by the API until built. libcurl is required for this path.
 
 Or during a VPS install: `RTMP_ENABLE_NATIVE_TRANSCODE=1 bash scripts/install-linux.sh`.
 
