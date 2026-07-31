@@ -462,7 +462,10 @@ std::vector<LiveState> StreamManager::live_state(const protocol::commands::Strea
             state.viewer_count = 0;
             if (raw_key) {
                 auto id = stream_ids.find(app_name, *raw_key);
-                if (id) state.viewer_count = fanout.subscriber_count(*id);
+                // Unique by client IP, not raw connection count: the same
+                // viewer reloading or opening a second tab on this link
+                // should not inflate the count the admin panel shows.
+                if (id) state.viewer_count = fanout.unique_viewer_count(*id);
             }
             out.push_back(std::move(state));
         }

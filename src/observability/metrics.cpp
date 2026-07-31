@@ -1,8 +1,10 @@
 #include "rtmp_server/observability/metrics.hpp"
 
 #include <algorithm>
+#include <cstring>
 #include <format>
 #include <limits>
+#include <thread>
 
 #if defined(__APPLE__)
 #include <mach/mach.h>
@@ -47,6 +49,38 @@ std::int64_t query_resident_set_bytes() noexcept {
 #endif
 }
 
+// Total CPU time (user+system) this process has consumed so far, in clock
+// ticks, or -1 if unavailable (platform not supported, or /proc unreadable —
+// e.g. a restricted container). refresh_process_metrics() turns two samples
+// of this into a milli-cores rate; a single sample is meaningless.
+std::int64_t query_process_cpu_ticks() noexcept {
+#if defined(__linux__)
+    std::FILE* file = std::fopen("/proc/self/stat", "re");
+    if (file == nullptr) return -1;
+    char buffer[512];
+    const std::size_t n = std::fread(buffer, 1, sizeof(buffer) - 1, file);
+    std::fclose(file);
+    if (n == 0) return -1;
+    buffer[n] = '\0';
+    // Field 2 (comm) may itself contain spaces/parens, so resume parsing
+    // after the last ')' rather than counting space-separated fields from
+    // the start of the line.
+    const char* rparen = std::strrchr(buffer, ')');
+    if (rparen == nullptr) return -1;
+    char state = '\0';
+    long long ppid = 0, pgrp = 0, session = 0, tty_nr = 0, tpgid = 0, flags = 0;
+    long long minflt = 0, cminflt = 0, majflt = 0, cmajflt = 0, utime = 0, stime = 0;
+    const int matched = std::sscanf(rparen + 1,
+                                     " %c %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld", &state,
+                                     &ppid, &pgrp, &session, &tty_nr, &tpgid, &flags, &minflt, &cminflt, &majflt,
+                                     &cmajflt, &utime, &stime);
+    if (matched != 13) return -1;
+    return utime + stime;
+#else
+    return -1;
+#endif
+}
+
 } // namespace
 
 std::span<const MetricDescriptor> metric_catalog() noexcept { return kCatalog; }
@@ -79,6 +113,10 @@ bool is_valid_dynamic_name(std::string_view name) noexcept {
 Metrics::Metrics() {
     for (auto& slot : slots_) slot.store(0, std::memory_order_relaxed);
     for (auto& slot : connections_per_worker_) slot.store(0, std::memory_order_relaxed);
+    // Fixed for the process lifetime — set once here rather than on every
+    // /metrics scrape.
+    const auto cores = std::thread::hardware_concurrency();
+    set(MetricId::CpuCoresAvailable, cores > 0 ? static_cast<std::int64_t>(cores) : 1);
 }
 
 void Metrics::increment(MetricId id, std::uint64_t delta) noexcept {
@@ -177,6 +215,34 @@ void Metrics::refresh_derived(std::chrono::steady_clock::time_point now) noexcep
 void Metrics::refresh_process_metrics() noexcept {
     const std::int64_t rss = query_resident_set_bytes();
     if (rss > 0) set(MetricId::ProcessMemoryBytes, rss);
+
+    const std::int64_t ticks = query_process_cpu_ticks();
+    if (ticks < 0) return; // unsupported platform — leave the gauge untouched
+
+    const auto now = std::chrono::steady_clock::now();
+    std::lock_guard<std::mutex> lock(cpu_mutex_);
+    if (!has_cpu_baseline_) {
+        has_cpu_baseline_ = true;
+        last_cpu_sample_ = now;
+        last_cpu_ticks_ = ticks;
+        return; // a rate needs two samples, same as refresh_derived()
+    }
+
+    const auto elapsed = std::chrono::duration_cast<std::chrono::duration<double>>(now - last_cpu_sample_).count();
+    if (elapsed <= 0.0) return;
+
+#if defined(__linux__)
+    const long raw_hz = ::sysconf(_SC_CLK_TCK);
+#else
+    const long raw_hz = 100;
+#endif
+    const double ticks_per_second = raw_hz > 0 ? static_cast<double>(raw_hz) : 100.0;
+    const double cpu_seconds = static_cast<double>(ticks - last_cpu_ticks_) / ticks_per_second;
+    const double milli_cores = (cpu_seconds / elapsed) * 1000.0;
+    set(MetricId::WorkerCpuUsage, static_cast<std::int64_t>(std::max(0.0, milli_cores)));
+
+    last_cpu_sample_ = now;
+    last_cpu_ticks_ = ticks;
 }
 
 void Metrics::increment_counter(std::string_view name, std::uint64_t delta) {

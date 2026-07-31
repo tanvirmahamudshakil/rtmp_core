@@ -93,7 +93,10 @@ namespace rtmp_server::observability {
     X(RecordingFailures, "recording_failures", Counter, "Recording write/rotate/finalize failures")                   \
     /* -- process ------------------------------------------------------------ */                                    \
     X(ProcessMemoryBytes, "process_memory_bytes", Gauge, "Resident set size of this process")                         \
-    X(WorkerCpuUsage, "worker_cpu_usage", Gauge, "Aggregate worker CPU utilisation, in milli-cores (1000 = 1 core)")  \
+    X(WorkerCpuUsage, "worker_cpu_usage", Gauge, "This process's CPU utilisation since the previous sample, in "     \
+                                                 "milli-cores (1000 = 1 core fully busy)")                            \
+    X(CpuCoresAvailable, "cpu_cores_available", Gauge, "CPU cores visible to this process "                          \
+                                                        "(std::thread::hardware_concurrency())")                      \
     /* -- registry self-observability ---------------------------------------- */                                    \
     X(MetricsRejectedNames, "metrics_rejected_names_total", Counter,                                                  \
       "Dynamic metric writes rejected for an invalid or over-budget name")
@@ -221,6 +224,11 @@ private:
     std::int64_t last_ingress_bytes_ = 0;
     std::int64_t last_egress_bytes_ = 0;
     bool has_rate_baseline_ = false;
+
+    mutable std::mutex cpu_mutex_;
+    std::chrono::steady_clock::time_point last_cpu_sample_{};
+    std::int64_t last_cpu_ticks_ = 0;
+    bool has_cpu_baseline_ = false;
 
     mutable std::mutex mutex_;
     std::map<std::string, std::uint64_t> counters_;

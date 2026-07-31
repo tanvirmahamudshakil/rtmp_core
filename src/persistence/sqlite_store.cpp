@@ -38,6 +38,11 @@ CREATE TABLE IF NOT EXISTS transcoding_assignments (
     rules TEXT NOT NULL,
     PRIMARY KEY (application, source_stream)
 );
+CREATE TABLE IF NOT EXISTS templates (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    presets TEXT NOT NULL
+);
 )sql";
 
 Error sqlite_error(sqlite3* db, std::string_view context) {
@@ -229,6 +234,44 @@ Result<std::vector<TranscodingAssignmentRow>> SqliteStore::load_transcoding_assi
         rows.push_back(std::move(row));
     }
     if (rc != SQLITE_DONE) return sqlite_error(db_, "step load_transcoding_assignments");
+    return rows;
+}
+
+Result<void> SqliteStore::upsert_template(const TemplateRow& row) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    Statement stmt(db_, "INSERT INTO templates (id, name, presets) VALUES (?, ?, ?) "
+                        "ON CONFLICT(id) DO UPDATE SET name = excluded.name, presets = excluded.presets");
+    if (!stmt.valid()) return sqlite_error(db_, "prepare upsert_template");
+    sqlite3_bind_text(stmt.get(), 1, row.id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 2, row.name.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 3, row.presets_json.c_str(), -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(stmt.get()) != SQLITE_DONE) return sqlite_error(db_, "step upsert_template");
+    return {};
+}
+
+Result<void> SqliteStore::delete_template(std::string_view id) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    Statement stmt(db_, "DELETE FROM templates WHERE id = ?");
+    if (!stmt.valid()) return sqlite_error(db_, "prepare delete_template");
+    sqlite3_bind_text(stmt.get(), 1, id.data(), static_cast<int>(id.size()), SQLITE_TRANSIENT);
+    if (sqlite3_step(stmt.get()) != SQLITE_DONE) return sqlite_error(db_, "step delete_template");
+    return {};
+}
+
+Result<std::vector<TemplateRow>> SqliteStore::load_templates() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    Statement stmt(db_, "SELECT id, name, presets FROM templates ORDER BY name");
+    if (!stmt.valid()) return sqlite_error(db_, "prepare load_templates");
+    std::vector<TemplateRow> rows;
+    int rc = SQLITE_OK;
+    while ((rc = sqlite3_step(stmt.get())) == SQLITE_ROW) {
+        TemplateRow row;
+        row.id = reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 0));
+        row.name = reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 1));
+        row.presets_json = reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 2));
+        rows.push_back(std::move(row));
+    }
+    if (rc != SQLITE_DONE) return sqlite_error(db_, "step load_templates");
     return rows;
 }
 

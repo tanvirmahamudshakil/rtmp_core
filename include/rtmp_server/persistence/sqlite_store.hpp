@@ -46,6 +46,10 @@ public:
     [[nodiscard]] core::Result<std::vector<TranscodingAssignmentRow>>
     load_transcoding_assignments() override;
 
+    core::Result<void> upsert_template(const TemplateRow& row) override;
+    core::Result<void> delete_template(std::string_view id) override;
+    [[nodiscard]] core::Result<std::vector<TemplateRow>> load_templates() override;
+
 private:
     explicit SqliteStore(sqlite3* db) noexcept : db_(db) {}
 

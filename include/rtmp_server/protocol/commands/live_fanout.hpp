@@ -5,7 +5,10 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <string>
+#include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "rtmp_server/observability/metrics.hpp"
@@ -133,8 +136,11 @@ public:
     // only metadata/sequence headers are replayed (see GopCache class doc).
     // `subscriber_id` must be unique among concurrently-subscribed sinks
     // for this stream_id; not owned, caller must outlive the subscription
-    // or unsubscribe first.
-    void subscribe(StreamId stream_id, SubscriberId subscriber_id, PlaybackSink* sink);
+    // or unsubscribe first. `client_ip` (optional) is recorded only for
+    // unique_viewer_count()'s dedup below — LiveFanout never uses it to
+    // route or authorize anything.
+    void subscribe(StreamId stream_id, SubscriberId subscriber_id, PlaybackSink* sink,
+                    std::string_view client_ip = {});
 
     // Removes a subscription. Idempotent: safe to call even if never
     // subscribed, or already removed (e.g. via eviction or
@@ -154,6 +160,15 @@ public:
     void publisher_stopped(StreamId stream_id, bool is_replayed = false);
 
     [[nodiscard]] std::size_t subscriber_count(StreamId stream_id) const;
+
+    // Distinct client IPs currently subscribed to stream_id — the same
+    // person reconnecting (reload, a second tab, a brief network hiccup
+    // that reopens the RTMP session) counts once instead of once per
+    // connection. A subscriber recorded with no client_ip (client_ip was
+    // never supplied to subscribe()) always counts as its own unique
+    // viewer, so callers that don't pass an IP see the old raw-count
+    // behaviour rather than an undercount.
+    [[nodiscard]] std::size_t unique_viewer_count(StreamId stream_id) const;
 
     // Phase 7 observability. Optional and non-owning; the embedder (server
     // main, or a test) owns the registry and must outlive this LiveFanout.
@@ -186,6 +201,7 @@ private:
         PlaybackSink* sink;
         ViewerQueue queue;
         std::size_t consecutive_transport_drops = 0;
+        std::string client_ip; // empty when the caller didn't supply one
     };
 
     struct StreamState {

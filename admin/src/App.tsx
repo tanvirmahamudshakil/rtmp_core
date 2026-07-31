@@ -37,8 +37,8 @@ import {
   X,
   Zap
 } from "lucide-react";
-import { Dispatch, FormEvent, ReactNode, SetStateAction, useCallback, useEffect, useState } from "react";
-import { Application, ControlClient, Snapshot, SourceTranscodeJob, Stream, TranscodingAssignment, TranscodingOutput } from "./api";
+import { FormEvent, ReactNode, useCallback, useEffect, useState } from "react";
+import { Application, ControlClient, Snapshot, SourceTranscodeJob, Stream, TemplateRecord, TranscodingAssignment, TranscodingOutput } from "./api";
 
 type Page = "home" | "applications" | "transcode" | "server";
 type ApplicationTab = "playback" | "transcoding" | "source";
@@ -65,6 +65,7 @@ type EncodingPreset = {
   audioBitrate: number;
   gpuMode: "first" | "specific";
   gpuId: number | null;
+  enabled: boolean;
 };
 type TranscodingTemplate = {
   id: string;
@@ -121,58 +122,56 @@ const audioCodecs: AudioCodec[] = ["AAC", "Vorbis", "Opus", "Passthrough", "Disa
 const builtVideoCodecs = new Set<VideoCodec>(["H.264", "H.265", "Passthrough", "Disabled"]);
 const builtImplementations = new Set<EncodingImplementation>(["Default"]);
 const builtAudioCodecs = new Set<AudioCodec>(["AAC", "Passthrough", "Disabled"]);
-const transcodingStorageKey = "streamforge-transcoding-templates";
 const newLocalId = () => globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(16).slice(2)}`;
 const validFrameDimension = (value: unknown): value is number =>
   typeof value === "number" && Number.isInteger(value) && value >= 16 && value <= 8192 && value % 2 === 0;
-const loadTranscodingTemplates = (): TranscodingTemplate[] => {
-  try {
-    const stored = JSON.parse(localStorage.getItem(transcodingStorageKey) ?? "[]") as TranscodingTemplate[];
-    if (!Array.isArray(stored)) return [];
-    return stored.map((template) => ({
-      ...template,
-      presets: Array.isArray(template.presets) ? template.presets.map((preset) => {
-        let frameWidth = validFrameDimension(preset.frameWidth) ? preset.frameWidth : null;
-        let frameHeight = validFrameDimension(preset.frameHeight) ? preset.frameHeight : null;
-        let fitMode: FitMode = allFitModes.includes(preset.fitMode) ? preset.fitMode : "match-source";
-        // Older control-panel builds allowed dimensions to be saved with
-        // match-source, which made the transcoder ignore those dimensions.
-        // Preserve valid requested sizes; reset malformed legacy values to
-        // source resolution instead of submitting another invalid rule.
-        if (fitMode === "match-source") {
-          if (frameWidth && frameHeight) {
-            fitMode = "letterbox";
-          } else {
-            frameWidth = null;
-            frameHeight = null;
-          }
-        } else if (
-          (fitMode === "fit-width" && !frameWidth) ||
-          (fitMode === "fit-height" && !frameHeight) ||
-          (["crop", "stretch", "letterbox"].includes(fitMode) && (!frameWidth || !frameHeight))
-        ) {
-          frameWidth = null;
-          frameHeight = null;
-          fitMode = "match-source";
-        }
-        return {
-          ...preset,
-          implementation: encodingImplementations.includes(preset.implementation) ? preset.implementation : "Default",
-          profile: preset.profile ?? "high",
-          keyFrameMode: preset.keyFrameMode ?? "source",
-          keyFrameInterval: preset.keyFrameInterval ?? null,
-          frameWidth,
-          frameHeight,
-          fitMode,
-          audioCodec: preset.audioCodec ?? "AAC",
-          audioBitrate: preset.audioBitrate ?? 128000
-        };
-      }) : []
-    }));
-  } catch {
-    return [];
+// Normalizes a preset coming back from the server (or an older admin build)
+// into the shape this UI relies on — same defaulting/repair logic that used
+// to run against localStorage, now run against the SQLite-backed template API.
+const normalizePreset = (preset: EncodingPreset): EncodingPreset => {
+  let frameWidth = validFrameDimension(preset.frameWidth) ? preset.frameWidth : null;
+  let frameHeight = validFrameDimension(preset.frameHeight) ? preset.frameHeight : null;
+  let fitMode: FitMode = allFitModes.includes(preset.fitMode) ? preset.fitMode : "match-source";
+  // Older control-panel builds allowed dimensions to be saved with
+  // match-source, which made the transcoder ignore those dimensions.
+  // Preserve valid requested sizes; reset malformed legacy values to
+  // source resolution instead of submitting another invalid rule.
+  if (fitMode === "match-source") {
+    if (frameWidth && frameHeight) {
+      fitMode = "letterbox";
+    } else {
+      frameWidth = null;
+      frameHeight = null;
+    }
+  } else if (
+    (fitMode === "fit-width" && !frameWidth) ||
+    (fitMode === "fit-height" && !frameHeight) ||
+    (["crop", "stretch", "letterbox"].includes(fitMode) && (!frameWidth || !frameHeight))
+  ) {
+    frameWidth = null;
+    frameHeight = null;
+    fitMode = "match-source";
   }
+  return {
+    ...preset,
+    implementation: encodingImplementations.includes(preset.implementation) ? preset.implementation : "Default",
+    profile: preset.profile ?? "high",
+    keyFrameMode: preset.keyFrameMode ?? "source",
+    keyFrameInterval: preset.keyFrameInterval ?? null,
+    frameWidth,
+    frameHeight,
+    fitMode,
+    audioCodec: preset.audioCodec ?? "AAC",
+    audioBitrate: preset.audioBitrate ?? 128000,
+    enabled: preset.enabled ?? true
+  };
 };
+const templatesFromRecords = (records: TemplateRecord[]): TranscodingTemplate[] =>
+  records.map((record) => ({
+    id: record.id,
+    name: record.name,
+    presets: Array.isArray(record.presets) ? (record.presets as EncodingPreset[]).map(normalizePreset) : []
+  }));
 
 const safeRuleName = (value: string, fallback: string) => {
   const safe = value.trim().replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "");
@@ -202,7 +201,8 @@ const audioRuleValue: Record<AudioCodec, string> = {
 };
 const buildTemplateRules = (stream: Stream, template: TranscodingTemplate) => {
   const outputs: TranscodingOutput[] = [];
-  const lines = template.presets.map((preset, index) => {
+  const activePresets = template.presets.filter((preset) => preset.enabled);
+  const lines = activePresets.map((preset, index) => {
     const outputSuffix = safeRuleName(preset.outgoingStreamName, `output-${index + 1}`);
     const outputStream = safeRuleName(`${stream.name}_${outputSuffix}`, `${stream.name}_output-${index + 1}`);
     outputs.push({
@@ -479,7 +479,7 @@ function Overview({
         <MetricCard icon={<ArrowUpRight size={20} />} label="Bandwidth out" value={bitrate(egress)}
           helper={`${utilization.toFixed(1)}% of available uplink`} tone="blue" />
         <MetricCard icon={<Cpu size={20} />} label="Server load"
-          value={`${(metric(snapshot, "worker_cpu_usage") / 1000).toFixed(1)} cores`}
+          value={`${(metric(snapshot, "worker_cpu_usage") / 1000).toFixed(2)} / ${compact(metric(snapshot, "cpu_cores_available") || 1)} cores`}
           helper={`${bytes(metric(snapshot, "process_memory_bytes"))} resident memory`} tone="purple" />
       </section>
 
@@ -648,7 +648,8 @@ function ApplicationDetailPage({
   activeTab,
   setActiveTab,
   onBack,
-  onNotify
+  onNotify,
+  onDeleteRequest
 }: {
   application: Application;
   streams: Stream[];
@@ -658,6 +659,7 @@ function ApplicationDetailPage({
   setActiveTab: (tab: ApplicationTab) => void;
   onBack: () => void;
   onNotify: (type: "success" | "error", message: string) => void;
+  onDeleteRequest: (application: Application) => void;
 }) {
   const applicationStreams = streams.filter((stream) => stream.application === application.name);
   const [copiedUrl, setCopiedUrl] = useState<string | null>(null);
@@ -670,6 +672,7 @@ function ApplicationDetailPage({
   const [outputName, setOutputName] = useState("");
   const [sourceTemplateId, setSourceTemplateId] = useState("");
   const [sourceBusy, setSourceBusy] = useState(false);
+  const [pendingDeleteJob, setPendingDeleteJob] = useState<SourceTranscodeJob | null>(null);
   const renditionStreamNames = new Set(assignments.flatMap((assignment) => assignment.outputs.map((output) => output.stream)));
   const sourceStreams = applicationStreams.filter((stream) => !renditionStreamNames.has(stream.name));
 
@@ -918,8 +921,7 @@ function ApplicationDetailPage({
                   <div className="assignment-card-head">
                     <span className="stream-avatar"><Workflow size={17} /></span>
                     <div><strong>{job.name}</strong><small title={job.source_url}>{job.source_url}</small></div>
-                    <StatusPill live={job.status === "running"} label={job.status === "running" ? "Live" : job.status} />
-                    <span className={job.enabled ? "enabled-text" : "disabled-text"}>{job.enabled ? "Enabled" : "Disabled"}</span>
+                    <StatusPill live={job.status === "running"} label={job.status === "running" ? "Live" : job.enabled ? job.status : "Paused"} />
                   </div>
                   <div className="rendition-list">
                     {job.outputs.map((output) => (
@@ -929,18 +931,22 @@ function ApplicationDetailPage({
                       </span>
                     ))}
                   </div>
-                  <div className="master-url-row">
-                    <span>MASTER M3U8</span><code title={masterUrl}>{masterUrl}</code>
-                    <IconButton label="Copy adaptive master URL" onClick={() => copyUrl(masterUrl)}>
-                      {copiedUrl === masterUrl ? <Check size={16} /> : <Copy size={16} />}
-                    </IconButton>
-                  </div>
+                  {job.enabled ? (
+                    <div className="master-url-row">
+                      <span>MASTER M3U8</span><code title={masterUrl}>{masterUrl}</code>
+                      <IconButton label="Copy adaptive master URL" onClick={() => copyUrl(masterUrl)}>
+                        {copiedUrl === masterUrl ? <Check size={16} /> : <Copy size={16} />}
+                      </IconButton>
+                    </div>
+                  ) : (
+                    <div className="assignment-empty"><SlidersHorizontal size={19} /><span>Paused — the master link is offline until you resume it. The job itself is kept, not deleted.</span></div>
+                  )}
                   {job.detail && <div className="assignment-empty"><Layers3 size={19} /><span>{job.detail}</span></div>}
                   <div className="assignment-actions">
+                    <button className="secondary-button danger-text" disabled={sourceBusy} onClick={() => setPendingDeleteJob(job)}><Trash2 size={15} /> Delete</button>
                     <button className="secondary-button" disabled={sourceBusy} onClick={() => toggleSourceTranscode(job)}>
-                      <SlidersHorizontal size={15} /> {job.enabled ? "Disable" : "Enable"}
+                      <SlidersHorizontal size={15} /> {job.enabled ? "Pause" : "Resume"}
                     </button>
-                    <button className="secondary-button danger-text" disabled={sourceBusy} onClick={() => removeSourceTranscode(job)}><Trash2 size={15} /> Stop</button>
                   </div>
                 </article>
               );
@@ -1025,6 +1031,7 @@ function ApplicationDetailPage({
             <span className="app-icon tone-0"><AppWindow size={22} /></span>
             <div><span className="eyebrow">APPLICATION</span><h2>{application.name}</h2><p>RTMP namespace /{application.name}</p></div>
             <StatusPill live={application.enabled} label={application.enabled ? "Enabled" : "Disabled"} />
+            <IconButton label="Delete application" danger onClick={() => onDeleteRequest(application)}><Trash2 size={16} /></IconButton>
           </div>
         </div>
         <div className="application-tabs" role="tablist" aria-label={`${application.name} sections`}>
@@ -1043,6 +1050,26 @@ function ApplicationDetailPage({
         </div>
       </section>
       <div className="application-tab-panel" role="tabpanel">{renderTab()}</div>
+      {pendingDeleteJob && (
+        <Modal
+          title={`Delete ${pendingDeleteJob.name}?`}
+          description={pendingDeleteJob.source_url}
+          onClose={() => setPendingDeleteJob(null)}
+        >
+          <div className="delete-warning">
+            <Trash2 size={21} />
+            <div><strong>This cannot be undone.</strong><span>The source pull stops and its adaptive master link goes offline immediately.</span></div>
+          </div>
+          <div className="modal-actions">
+            <button className="secondary-button" onClick={() => setPendingDeleteJob(null)}>Cancel</button>
+            <button className="danger-button" onClick={() => {
+              const job = pendingDeleteJob;
+              setPendingDeleteJob(null);
+              removeSourceTranscode(job);
+            }}><Trash2 size={17} /> Delete source transcode</button>
+          </div>
+        </Modal>
+      )}
     </div>
   );
 }
@@ -1176,6 +1203,8 @@ function SystemPage({ snapshot }: { snapshot: Snapshot }) {
         <section className="panel">
           <div className="panel-heading"><div><span className="eyebrow">RESOURCE SNAPSHOT</span><h2>Process telemetry</h2></div></div>
           <div className="telemetry-grid">
+            <div><span>CPU usage</span><strong>{(metric(snapshot, "worker_cpu_usage") / ((metric(snapshot, "cpu_cores_available") || 1) * 10)).toFixed(1)}%</strong></div>
+            <div><span>CPU cores</span><strong>{compact(metric(snapshot, "cpu_cores_available") || 1)}</strong></div>
             <div><span>Memory RSS</span><strong>{bytes(metric(snapshot, "process_memory_bytes"))}</strong></div>
             <div><span>GOP cache</span><strong>{bytes(metric(snapshot, "gop_cache_bytes"))}</strong></div>
             <div><span>Egress total</span><strong>{bytes(metric(snapshot, "egress_bytes_total"))}</strong></div>
@@ -1193,10 +1222,18 @@ function SystemPage({ snapshot }: { snapshot: Snapshot }) {
   );
 }
 
-function NewTemplateModal({ onClose, onAdd }: { onClose: () => void; onAdd: (name: string) => void }) {
-  const [name, setName] = useState("");
+function NewTemplateModal({
+  onClose,
+  onAdd,
+  editing
+}: {
+  onClose: () => void;
+  onAdd: (name: string) => void;
+  editing?: TranscodingTemplate | null;
+}) {
+  const [name, setName] = useState(editing?.name ?? "");
   return (
-    <Modal title="Add new template" description="Give this transcoding template a clear name." onClose={onClose}>
+    <Modal title={editing ? "Rename template" : "Add new template"} description="Give this transcoding template a clear name." onClose={onClose}>
       <form className="modal-form" onSubmit={(event: FormEvent) => {
         event.preventDefault();
         onAdd(name.trim());
@@ -1207,31 +1244,42 @@ function NewTemplateModal({ onClose, onAdd }: { onClose: () => void; onAdd: (nam
         </label>
         <div className="modal-actions">
           <button type="button" className="secondary-button" onClick={onClose}>Cancel</button>
-          <button className="primary-button" disabled={!name.trim()}><Plus size={17} /> Add template</button>
+          <button className="primary-button" disabled={!name.trim()}><Plus size={17} /> {editing ? "Save changes" : "Add template"}</button>
         </div>
       </form>
     </Modal>
   );
 }
 
-function NewPresetModal({ onClose, onAdd }: { onClose: () => void; onAdd: (preset: EncodingPreset) => void }) {
-  const [name, setName] = useState("");
-  const [outgoingStreamName, setOutgoingStreamName] = useState("");
-  const [description, setDescription] = useState("");
-  const [videoCodec, setVideoCodec] = useState<VideoCodec>("H.264");
-  const [videoBitrateKbps, setVideoBitrateKbps] = useState("2500");
-  const [implementation, setImplementation] = useState<EncodingImplementation>("Default");
-  const [profile, setProfile] = useState<VideoProfile>("high");
-  const [keyFrameMode, setKeyFrameMode] = useState<"source" | "interval">("source");
-  const [keyFrameInterval, setKeyFrameInterval] = useState("60");
-  const [frameResolution, setFrameResolution] = useState<FrameResolutionId>("source");
-  const [frameWidth, setFrameWidth] = useState("");
-  const [frameHeight, setFrameHeight] = useState("");
-  const [fitMode, setFitMode] = useState<FitMode>("letterbox");
-  const [audioCodec, setAudioCodec] = useState<AudioCodec>("AAC");
-  const [audioBitrateKbps, setAudioBitrateKbps] = useState("128");
-  const [gpuMode, setGpuMode] = useState<"first" | "specific">("first");
-  const [gpuId, setGpuId] = useState("0");
+function NewPresetModal({
+  onClose,
+  onAdd,
+  editing
+}: {
+  onClose: () => void;
+  onAdd: (preset: EncodingPreset) => void;
+  editing?: EncodingPreset | null;
+}) {
+  const [name, setName] = useState(editing?.name ?? "");
+  const [outgoingStreamName, setOutgoingStreamName] = useState(editing?.outgoingStreamName ?? "");
+  const [description, setDescription] = useState(editing?.description ?? "");
+  const [videoCodec, setVideoCodec] = useState<VideoCodec>(editing?.videoCodec ?? "H.264");
+  const [videoBitrateKbps, setVideoBitrateKbps] = useState(editing ? String(editing.videoBitrate / 1000) : "2500");
+  const [implementation, setImplementation] = useState<EncodingImplementation>(editing?.implementation ?? "Default");
+  const [profile, setProfile] = useState<VideoProfile>(editing?.profile ?? "high");
+  const [keyFrameMode, setKeyFrameMode] = useState<"source" | "interval">(editing?.keyFrameMode ?? "source");
+  const [keyFrameInterval, setKeyFrameInterval] = useState(editing?.keyFrameInterval ? String(editing.keyFrameInterval) : "60");
+  const initialResolution = editing?.frameWidth && editing?.frameHeight
+    ? (frameResolutions.find((item) => item.width === editing.frameWidth && item.height === editing.frameHeight)?.id ?? "custom")
+    : "source";
+  const [frameResolution, setFrameResolution] = useState<FrameResolutionId>(initialResolution);
+  const [frameWidth, setFrameWidth] = useState(initialResolution === "custom" ? String(editing?.frameWidth ?? "") : "");
+  const [frameHeight, setFrameHeight] = useState(initialResolution === "custom" ? String(editing?.frameHeight ?? "") : "");
+  const [fitMode, setFitMode] = useState<FitMode>(editing?.fitMode && editing.fitMode !== "match-source" ? editing.fitMode : "letterbox");
+  const [audioCodec, setAudioCodec] = useState<AudioCodec>(editing?.audioCodec ?? "AAC");
+  const [audioBitrateKbps, setAudioBitrateKbps] = useState(editing ? String(editing.audioBitrate / 1000) : "128");
+  const [gpuMode, setGpuMode] = useState<"first" | "specific">(editing?.gpuMode ?? "first");
+  const [gpuId, setGpuId] = useState(editing?.gpuId !== undefined && editing?.gpuId !== null ? String(editing.gpuId) : "0");
   const selectedResolution = frameResolutions.find((resolution) => resolution.id === frameResolution) ?? frameResolutions[0];
   const sourceResolution = frameResolution === "source";
   const customResolution = frameResolution === "custom";
@@ -1244,11 +1292,12 @@ function NewPresetModal({ onClose, onAdd }: { onClose: () => void; onAdd: (prese
   const outputWidth = customResolution ? customWidth : selectedResolution.width;
   const outputHeight = customResolution ? customHeight : selectedResolution.height;
   return (
-    <Modal title="Add encoding preset" description="Configure the outgoing video encoding profile." onClose={onClose} wide>
+    <Modal title={editing ? "Edit encoding preset" : "Add encoding preset"} description="Configure the outgoing video encoding profile." onClose={onClose} wide>
       <form className="modal-form preset-form" onSubmit={(event: FormEvent) => {
         event.preventDefault();
         onAdd({
-          id: newLocalId(),
+          id: editing?.id ?? newLocalId(),
+          enabled: editing?.enabled ?? true,
           name: name.trim(),
           outgoingStreamName: outgoingStreamName.trim(),
           description: description.trim(),
@@ -1386,7 +1435,7 @@ function NewPresetModal({ onClose, onAdd }: { onClose: () => void; onAdd: (prese
 
         <div className="modal-actions">
           <button type="button" className="secondary-button" onClick={onClose}>Cancel</button>
-          <button className="primary-button" disabled={!name.trim() || !outgoingStreamName.trim() || !validCustomDimensions}><Plus size={17} /> Add preset</button>
+          <button className="primary-button" disabled={!name.trim() || !outgoingStreamName.trim() || !validCustomDimensions}><Plus size={17} /> {editing ? "Save preset" : "Add preset"}</button>
         </div>
       </form>
     </Modal>
@@ -1395,27 +1444,116 @@ function NewPresetModal({ onClose, onAdd }: { onClose: () => void; onAdd: (prese
 
 function TranscodePage({
   templates,
-  setTemplates
+  client,
+  onNotify,
+  refreshTemplates
 }: {
   templates: TranscodingTemplate[];
-  setTemplates: Dispatch<SetStateAction<TranscodingTemplate[]>>;
+  client: ControlClient;
+  onNotify: (type: "success" | "error", message: string) => void;
+  refreshTemplates: () => Promise<void>;
 }) {
   const [selectedTemplateId, setSelectedTemplateId] = useState<string | null>(null);
   const [showTemplateModal, setShowTemplateModal] = useState(false);
+  const [renamingTemplate, setRenamingTemplate] = useState<TranscodingTemplate | null>(null);
+  const [pendingDeleteTemplate, setPendingDeleteTemplate] = useState<TranscodingTemplate | null>(null);
   const [showPresetModal, setShowPresetModal] = useState(false);
+  const [editingPreset, setEditingPreset] = useState<EncodingPreset | null>(null);
+  const [pendingDeletePreset, setPendingDeletePreset] = useState<EncodingPreset | null>(null);
+  const [busy, setBusy] = useState(false);
   const selectedTemplate = templates.find((template) => template.id === selectedTemplateId) ?? null;
 
-  const addTemplate = (name: string) => {
-    const template: TranscodingTemplate = { id: newLocalId(), name, presets: [] };
-    setTemplates((current) => [...current, template]);
-    setShowTemplateModal(false);
+  const errorMessage = (error: unknown, fallback: string) => (error instanceof Error ? error.message : fallback);
+
+  const addTemplate = async (name: string) => {
+    setBusy(true);
+    try {
+      await client.putTemplate(newLocalId(), name, []);
+      await refreshTemplates();
+      setShowTemplateModal(false);
+      onNotify("success", "Template created.");
+    } catch (error) {
+      onNotify("error", errorMessage(error, "Could not create the template."));
+    } finally {
+      setBusy(false);
+    }
   };
-  const addPreset = (preset: EncodingPreset) => {
-    if (!selectedTemplateId) return;
-    setTemplates((current) => current.map((template) =>
-      template.id === selectedTemplateId ? { ...template, presets: [...template.presets, preset] } : template
-    ));
-    setShowPresetModal(false);
+  const renameTemplate = async (name: string) => {
+    if (!renamingTemplate) return;
+    setBusy(true);
+    try {
+      await client.putTemplate(renamingTemplate.id, name, renamingTemplate.presets);
+      await refreshTemplates();
+      setRenamingTemplate(null);
+      onNotify("success", "Template renamed.");
+    } catch (error) {
+      onNotify("error", errorMessage(error, "Could not rename the template."));
+    } finally {
+      setBusy(false);
+    }
+  };
+  const deleteTemplate = async () => {
+    if (!pendingDeleteTemplate) return;
+    setBusy(true);
+    try {
+      await client.deleteTemplate(pendingDeleteTemplate.id);
+      if (selectedTemplateId === pendingDeleteTemplate.id) setSelectedTemplateId(null);
+      setPendingDeleteTemplate(null);
+      await refreshTemplates();
+      onNotify("success", "Template deleted.");
+    } catch (error) {
+      onNotify("error", errorMessage(error, "Could not delete the template."));
+    } finally {
+      setBusy(false);
+    }
+  };
+  const savePreset = async (preset: EncodingPreset) => {
+    if (!selectedTemplate) return;
+    const exists = selectedTemplate.presets.some((item) => item.id === preset.id);
+    const nextPresets = exists
+      ? selectedTemplate.presets.map((item) => (item.id === preset.id ? preset : item))
+      : [...selectedTemplate.presets, preset];
+    setBusy(true);
+    try {
+      await client.putTemplate(selectedTemplate.id, selectedTemplate.name, nextPresets);
+      await refreshTemplates();
+      setShowPresetModal(false);
+      setEditingPreset(null);
+    } catch (error) {
+      onNotify("error", errorMessage(error, "Could not save the preset."));
+    } finally {
+      setBusy(false);
+    }
+  };
+  const togglePreset = async (preset: EncodingPreset) => {
+    if (!selectedTemplate) return;
+    const nextPresets = selectedTemplate.presets.map((item) =>
+      item.id === preset.id ? { ...item, enabled: !item.enabled } : item
+    );
+    setBusy(true);
+    try {
+      await client.putTemplate(selectedTemplate.id, selectedTemplate.name, nextPresets);
+      await refreshTemplates();
+    } catch (error) {
+      onNotify("error", errorMessage(error, "Could not update the preset."));
+    } finally {
+      setBusy(false);
+    }
+  };
+  const deletePreset = async () => {
+    if (!selectedTemplate || !pendingDeletePreset) return;
+    const nextPresets = selectedTemplate.presets.filter((item) => item.id !== pendingDeletePreset.id);
+    setBusy(true);
+    try {
+      await client.putTemplate(selectedTemplate.id, selectedTemplate.name, nextPresets);
+      setPendingDeletePreset(null);
+      await refreshTemplates();
+      onNotify("success", "Preset deleted.");
+    } catch (error) {
+      onNotify("error", errorMessage(error, "Could not delete the preset."));
+    } finally {
+      setBusy(false);
+    }
   };
 
   if (selectedTemplate) {
@@ -1426,18 +1564,32 @@ function TranscodePage({
           <div className="template-title-row">
             <span className="template-large-icon"><Workflow size={24} /></span>
             <div><span className="eyebrow">TRANSCODING TEMPLATE</span><h2>{selectedTemplate.name}</h2><p>{selectedTemplate.presets.length} encoding presets configured</p></div>
+            <div className="row-actions">
+              <IconButton label="Rename template" onClick={() => !busy && setRenamingTemplate(selectedTemplate)}><Settings2 size={16} /></IconButton>
+              <IconButton label="Delete template" danger onClick={() => !busy && setPendingDeleteTemplate(selectedTemplate)}><Trash2 size={16} /></IconButton>
+            </div>
           </div>
           <div className="template-tabs"><button className="active" type="button">Encoding Presets</button></div>
         </section>
         <section className="preset-workspace">
           <div className="preset-workspace-heading">
             <div><span className="eyebrow">OUTPUT PROFILES</span><h2>Encoding Presets</h2><p>Create one preset for every outgoing stream rendition.</p></div>
-            <button className="primary-button" onClick={() => setShowPresetModal(true)}><Plus size={17} /> Add Preset</button>
+            <button className="primary-button" disabled={busy} onClick={() => setShowPresetModal(true)}><Plus size={17} /> Add Preset</button>
           </div>
           <div className="preset-grid">
             {selectedTemplate.presets.map((preset) => (
-              <article className="preset-card" key={preset.id}>
-                <div className="preset-card-head"><span><Video size={18} /></span><div><strong>{preset.name}</strong><small>{preset.outgoingStreamName}</small></div><b>{preset.videoCodec}</b></div>
+              <article className={`preset-card${preset.enabled ? "" : " preset-disabled"}`} key={preset.id}>
+                <div className="preset-card-head">
+                  <span><Video size={18} /></span>
+                  <div><strong>{preset.name}</strong><small>{preset.outgoingStreamName}</small></div>
+                  <b>{preset.videoCodec}</b>
+                  <div className="row-actions">
+                    <IconButton label={preset.enabled ? "Disable preset" : "Enable preset"} onClick={() => !busy && togglePreset(preset)}><SlidersHorizontal size={15} /></IconButton>
+                    <IconButton label="Edit preset" onClick={() => { if (!busy) { setEditingPreset(preset); setShowPresetModal(true); } }}><Settings2 size={15} /></IconButton>
+                    <IconButton label="Delete preset" danger onClick={() => !busy && setPendingDeletePreset(preset)}><Trash2 size={15} /></IconButton>
+                  </div>
+                </div>
+                <span className={preset.enabled ? "enabled-text" : "disabled-text"}>{preset.enabled ? "Enabled" : "Disabled"}</span>
                 {preset.description && <p>{preset.description}</p>}
                 <div className="preset-card-stats">
                   <div><span>Video bitrate</span><strong>{preset.videoBitrate ? `${(preset.videoBitrate / 1000).toLocaleString()} kbps` : "Automatic"}</strong></div>
@@ -1455,7 +1607,40 @@ function TranscodePage({
             )}
           </div>
         </section>
-        {showPresetModal && <NewPresetModal onClose={() => setShowPresetModal(false)} onAdd={addPreset} />}
+        {showPresetModal && (
+          <NewPresetModal
+            editing={editingPreset}
+            onClose={() => { setShowPresetModal(false); setEditingPreset(null); }}
+            onAdd={savePreset}
+          />
+        )}
+        {renamingTemplate && (
+          <NewTemplateModal editing={renamingTemplate} onClose={() => setRenamingTemplate(null)} onAdd={renameTemplate} />
+        )}
+        {pendingDeleteTemplate && (
+          <Modal
+            title={`Delete ${pendingDeleteTemplate.name}?`}
+            description="This removes the template and all of its encoding presets from the server."
+            onClose={() => setPendingDeleteTemplate(null)}
+          >
+            <div className="modal-actions">
+              <button type="button" className="secondary-button" disabled={busy} onClick={() => setPendingDeleteTemplate(null)}>Cancel</button>
+              <button type="button" className="danger-button" disabled={busy} onClick={deleteTemplate}><Trash2 size={17} /> Delete template</button>
+            </div>
+          </Modal>
+        )}
+        {pendingDeletePreset && (
+          <Modal
+            title={`Delete ${pendingDeletePreset.name}?`}
+            description="This removes the preset from this template."
+            onClose={() => setPendingDeletePreset(null)}
+          >
+            <div className="modal-actions">
+              <button type="button" className="secondary-button" disabled={busy} onClick={() => setPendingDeletePreset(null)}>Cancel</button>
+              <button type="button" className="danger-button" disabled={busy} onClick={deletePreset}><Trash2 size={17} /> Delete preset</button>
+            </div>
+          </Modal>
+        )}
       </div>
     );
   }
@@ -1464,25 +1649,45 @@ function TranscodePage({
     <div className="transcode-template-page">
       <div className="section-intro">
         <div><span className="eyebrow">TRANSCODING</span><h2>Templates</h2><p>Create reusable encoding presets for your outgoing streams.</p></div>
-        <button className="primary-button" onClick={() => setShowTemplateModal(true)}><Plus size={17} /> Add New Template</button>
+        <button className="primary-button" disabled={busy} onClick={() => setShowTemplateModal(true)}><Plus size={17} /> Add New Template</button>
       </div>
       <section className="template-grid">
         {templates.map((template, index) => (
-          <button className="template-card" type="button" key={template.id} onClick={() => setSelectedTemplateId(template.id)}>
+          <div className="template-card" key={template.id} onClick={() => setSelectedTemplateId(template.id)} role="button" tabIndex={0}
+            onKeyDown={(event) => { if (event.key === "Enter") setSelectedTemplateId(template.id); }}>
             <div className={`template-icon tone-${index % 4}`}><Workflow size={22} /></div>
             <span className="template-open"><ChevronRight size={17} /></span>
+            <div className="template-card-actions row-actions" onClick={(event) => event.stopPropagation()}>
+              <IconButton label="Rename template" onClick={() => !busy && setRenamingTemplate(template)}><Settings2 size={15} /></IconButton>
+              <IconButton label="Delete template" danger onClick={() => !busy && setPendingDeleteTemplate(template)}><Trash2 size={15} /></IconButton>
+            </div>
             <span className="template-label">Template {String(index + 1).padStart(2, "0")}</span>
             <h3>{template.name}</h3>
             <p>{template.presets.length ? `${template.presets.length} encoding presets` : "No presets configured yet"}</p>
             <div className="template-card-foot"><span><Cpu size={14} /> Encoding template</span><b>{template.presets.length}</b></div>
-          </button>
+          </div>
         ))}
         {!templates.length && (
-          <div className="empty-state full template-empty"><Workflow size={31} /><strong>No transcoding templates</strong><span>Create a template, then add one or more encoding presets.</span><button className="primary-button" onClick={() => setShowTemplateModal(true)}><Plus size={17} /> Add New Template</button></div>
+          <div className="empty-state full template-empty"><Workflow size={31} /><strong>No transcoding templates</strong><span>Create a template, then add one or more encoding presets.</span><button className="primary-button" disabled={busy} onClick={() => setShowTemplateModal(true)}><Plus size={17} /> Add New Template</button></div>
         )}
       </section>
       {showTemplateModal && <NewTemplateModal onClose={() => setShowTemplateModal(false)} onAdd={addTemplate} />}
-      <div className="storage-note"><Database size={16} /><span>Template drafts stay in this browser. Assigning one from an Application stores its active rendition rules on the server.</span></div>
+      {renamingTemplate && (
+        <NewTemplateModal editing={renamingTemplate} onClose={() => setRenamingTemplate(null)} onAdd={renameTemplate} />
+      )}
+      {pendingDeleteTemplate && (
+        <Modal
+          title={`Delete ${pendingDeleteTemplate.name}?`}
+          description="This removes the template and all of its encoding presets from the server."
+          onClose={() => setPendingDeleteTemplate(null)}
+        >
+          <div className="modal-actions">
+            <button type="button" className="secondary-button" disabled={busy} onClick={() => setPendingDeleteTemplate(null)}>Cancel</button>
+            <button type="button" className="danger-button" disabled={busy} onClick={deleteTemplate}><Trash2 size={17} /> Delete template</button>
+          </div>
+        </Modal>
+      )}
+      <div className="storage-note"><Database size={16} /><span>Templates are stored on the server (SQLite) and shared across every admin session.</span></div>
     </div>
   );
 }
@@ -1493,6 +1698,7 @@ function App() {
   const [snapshot, setSnapshot] = useState<Snapshot>(EMPTY_SNAPSHOT);
   const [page, setPage] = useState<Page>("home");
   const [selectedApplication, setSelectedApplication] = useState<Application | null>(null);
+  const [pendingDeleteApplication, setPendingDeleteApplication] = useState<Application | null>(null);
   const [applicationTab, setApplicationTab] = useState<ApplicationTab>("playback");
   const [loading, setLoading] = useState(false);
   const [notice, setNotice] = useState<Notice>(null);
@@ -1500,13 +1706,20 @@ function App() {
   const [createType, setCreateType] = useState<"application" | null>(null);
   const [actionStream, setActionStream] = useState<Stream | null>(null);
   const [pendingDelete, setPendingDelete] = useState<Stream | null>(null);
-  const [templates, setTemplates] = useState<TranscodingTemplate[]>(loadTranscodingTemplates);
+  const [templates, setTemplates] = useState<TranscodingTemplate[]>([]);
   const [bandwidth, setBandwidthState] = useState(() => Number(localStorage.getItem("streamforge-bandwidth")) || 10000);
   const [history, setHistory] = useState<number[]>(demo ? [5200, 5400, 5310, 5710, 5890, 6030, 6210, 6150, 6420, 6615] : []);
 
+  const refreshTemplates = useCallback(async () => {
+    const records = await client.listTemplates();
+    setTemplates(templatesFromRecords(records));
+  }, [client]);
+
   useEffect(() => {
-    localStorage.setItem(transcodingStorageKey, JSON.stringify(templates));
-  }, [templates]);
+    refreshTemplates().catch((error) => {
+      setNotice({ type: "error", message: error instanceof Error ? error.message : "Could not load transcoding templates." });
+    });
+  }, [refreshTemplates]);
 
   const setBandwidth = (value: number) => {
     setBandwidthState(value);
@@ -1627,6 +1840,7 @@ function App() {
                   activeTab={applicationTab}
                   setActiveTab={setApplicationTab}
                   onNotify={notify}
+                  onDeleteRequest={setPendingDeleteApplication}
                   onBack={() => {
                     setSelectedApplication(null);
                     setApplicationTab("playback");
@@ -1642,7 +1856,9 @@ function App() {
                   }}
                 />
           )}
-          {page === "transcode" && <TranscodePage templates={templates} setTemplates={setTemplates} />}
+          {page === "transcode" && (
+            <TranscodePage templates={templates} client={client} onNotify={notify} refreshTemplates={refreshTemplates} />
+          )}
           {page === "server" && (
             <div className="workspace-stack">
               <SystemPage snapshot={snapshot} />
@@ -1696,6 +1912,28 @@ function App() {
               setPendingDelete(null);
               perform(() => client.deleteStream(stream), "Stream deleted.");
             }}><Trash2 size={17} /> Delete stream</button>
+          </div>
+        </Modal>
+      )}
+      {pendingDeleteApplication && (
+        <Modal
+          title={`Delete ${pendingDeleteApplication.name}?`}
+          description={`${snapshot.streams.filter((stream) => stream.application === pendingDeleteApplication.name).length} stream(s) in this application`}
+          onClose={() => setPendingDeleteApplication(null)}
+        >
+          <div className="delete-warning">
+            <Trash2 size={21} />
+            <div><strong>This cannot be undone.</strong><span>Every stream and playback link under this application will be deleted along with it.</span></div>
+          </div>
+          <div className="modal-actions">
+            <button className="secondary-button" onClick={() => setPendingDeleteApplication(null)}>Cancel</button>
+            <button className="danger-button" onClick={() => {
+              const application = pendingDeleteApplication;
+              setPendingDeleteApplication(null);
+              setSelectedApplication(null);
+              setApplicationTab("playback");
+              perform(() => client.deleteApplication(application.name), "Application and its streams deleted.");
+            }}><Trash2 size={17} /> Delete application</button>
           </div>
         </Modal>
       )}

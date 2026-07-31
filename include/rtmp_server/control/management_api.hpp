@@ -119,6 +119,7 @@ private:
     [[nodiscard]] HttpResponse handle_metrics();
     [[nodiscard]] HttpResponse handle_list_applications(const HttpRequest& request);
     [[nodiscard]] HttpResponse handle_create_application(const HttpRequest& request);
+    [[nodiscard]] HttpResponse handle_delete_application(std::string_view name);
     [[nodiscard]] HttpResponse handle_list_streams(const HttpRequest& request);
     [[nodiscard]] HttpResponse handle_create_stream(const HttpRequest& request);
     [[nodiscard]] HttpResponse handle_get_stream(std::string_view application, std::string_view name);
@@ -142,6 +143,9 @@ private:
                                                                   const HttpRequest& request);
     [[nodiscard]] HttpResponse handle_delete_transcoding_assignment(std::string_view application,
                                                                      std::string_view source_stream);
+    [[nodiscard]] HttpResponse handle_list_templates();
+    [[nodiscard]] HttpResponse handle_put_template(std::string_view id, const HttpRequest& request);
+    [[nodiscard]] HttpResponse handle_delete_template(std::string_view id);
 
     void audit(std::string_view action, std::string_view application, std::string_view name, bool success);
 

@@ -296,6 +296,12 @@ HttpResponse ManagementApi::route(const HttpRequest& request, const std::string&
     if (parts.size() >= 2 && parts[0] == "v1" && parts[1] == "applications") {
         if (parts.size() == 2 && request.method == "GET") return handle_list_applications(request);
         if (parts.size() == 2 && request.method == "POST") return handle_create_application(request);
+        if (parts.size() == 3 && request.method == "DELETE") return handle_delete_application(parts[2]);
+    }
+    if (parts.size() >= 2 && parts[0] == "v1" && parts[1] == "templates") {
+        if (parts.size() == 2 && request.method == "GET") return handle_list_templates();
+        if (parts.size() == 3 && request.method == "PUT") return handle_put_template(parts[2], request);
+        if (parts.size() == 3 && request.method == "DELETE") return handle_delete_template(parts[2]);
     }
     if (parts.size() >= 2 && parts[0] == "v1" && parts[1] == "streams") {
         if (parts.size() == 2 && request.method == "GET") return handle_list_streams(request);
@@ -371,6 +377,69 @@ HttpResponse ManagementApi::handle_delete_transcoding_assignment(std::string_vie
     }
     auto result = transcoding_assignment_remover_(application, source_stream);
     if (!result) {
+        return HttpResponse::json(http_status_for(result.error().code()),
+                                  error_body("request_failed", result.error().message(), ""));
+    }
+    return HttpResponse::json(200, R"({"deleted":true})");
+}
+
+namespace {
+std::string template_json(const persistence::TemplateRow& row) {
+    std::ostringstream os;
+    // presets_json is stored (and was received) as an already-valid JSON
+    // array — embedded verbatim rather than re-escaped as a string, same as
+    // every other opaque-JSON-blob field this API round-trips untouched.
+    os << R"({"id":")" << json_escape(row.id) << R"(","name":")" << json_escape(row.name)
+       << R"(","presets":)" << row.presets_json << "}";
+    return os.str();
+}
+} // namespace
+
+HttpResponse ManagementApi::handle_list_templates() {
+    if (store_ == nullptr) return HttpResponse::json(503, R"({"error":"store_unavailable"})");
+    auto result = store_->load_templates();
+    if (!result.ok()) {
+        return HttpResponse::json(http_status_for(result.error().code()),
+                                  error_body("request_failed", result.error().message(), ""));
+    }
+    std::ostringstream os;
+    os << R"({"items":[)";
+    const auto& rows = result.value();
+    for (std::size_t i = 0; i < rows.size(); ++i) {
+        if (i > 0) os << ",";
+        os << template_json(rows[i]);
+    }
+    os << R"(],"total":)" << rows.size() << "}";
+    return HttpResponse::json(200, os.str());
+}
+
+HttpResponse ManagementApi::handle_put_template(std::string_view id, const HttpRequest& request) {
+    if (store_ == nullptr) return HttpResponse::json(503, R"({"error":"store_unavailable"})");
+    const auto header = request.headers.find("x-template-name");
+    // presets is a JSON array (possibly empty: "[]") of encoding presets —
+    // opaque to this layer, same treatment as transcoding_assignments.rules.
+    if (id.empty() || header == request.headers.end() || header->second.empty() ||
+        header->second.size() > 128 || request.body.empty() || request.body.front() != '[') {
+        return HttpResponse::json(400, R"({"error":"invalid_template"})");
+    }
+    persistence::TemplateRow row;
+    row.id = std::string(id);
+    row.name = header->second;
+    row.presets_json = request.body;
+    auto result = store_->upsert_template(row);
+    audit("upsert_template", "", id, result.ok());
+    if (!result.ok()) {
+        return HttpResponse::json(http_status_for(result.error().code()),
+                                  error_body("request_failed", result.error().message(), ""));
+    }
+    return HttpResponse::json(200, template_json(row));
+}
+
+HttpResponse ManagementApi::handle_delete_template(std::string_view id) {
+    if (store_ == nullptr) return HttpResponse::json(503, R"({"error":"store_unavailable"})");
+    auto result = store_->delete_template(id);
+    audit("delete_template", "", id, result.ok());
+    if (!result.ok()) {
         return HttpResponse::json(http_status_for(result.error().code()),
                                   error_body("request_failed", result.error().message(), ""));
     }
@@ -509,6 +578,39 @@ HttpResponse ManagementApi::handle_create_application(const HttpRequest& request
                                    error_body("request_failed", result.error().message(), ""));
     }
     return HttpResponse::json(201, application_json(management::Application{it->second, true}));
+}
+
+HttpResponse ManagementApi::handle_delete_application(std::string_view name) {
+    if (!manager_.find_application(name)) {
+        return HttpResponse::json(404, error_body("not_found", "no such application", ""));
+    }
+
+    // delete_application() refuses to remove an application that still has
+    // streams, so every link under it must be torn down first — same
+    // disable-then-disconnect-then-delete sequence handle_delete_stream uses,
+    // just applied to each stream in the application.
+    for (const auto& stream : manager_.list_streams(name)) {
+        static_cast<void>(manager_.set_enabled(name, stream.name, false));
+        if (registry_ != nullptr) {
+            static_cast<void>(manager_.disconnect_viewers(name, stream.name, *registry_));
+            static_cast<void>(manager_.disconnect_publisher(name, stream.name, *registry_));
+        }
+        auto deleted = manager_.delete_stream(name, stream.name);
+        audit("delete_stream", name, stream.name, deleted.ok());
+        if (!deleted.ok()) {
+            return HttpResponse::json(http_status_for(deleted.error().code()),
+                                      error_body("request_failed", deleted.error().message(), ""));
+        }
+        if (stream_deleted_handler_) stream_deleted_handler_(name, stream.name);
+    }
+
+    auto result = manager_.delete_application(name);
+    audit("delete_application", name, "", result.ok());
+    if (!result.ok()) {
+        return HttpResponse::json(http_status_for(result.error().code()),
+                                  error_body("request_failed", result.error().message(), ""));
+    }
+    return HttpResponse::json(200, R"({"deleted":true})");
 }
 
 HttpResponse ManagementApi::handle_list_streams(const HttpRequest& request) {

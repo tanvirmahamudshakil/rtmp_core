@@ -448,7 +448,7 @@ void CommandSession::handle_play(const Amf0Command& command, std::uint32_t messa
         auto subscriber_id = SubscriberId::next();
         auto relay = std::make_unique<PlaybackRelay>(*this, message_stream_id, playback_queue_limits_, subscriber_id);
         playback_relays_[message_stream_id] = std::move(relay);
-        live_fanout_->subscribe(slot.stream_id, subscriber_id, playback_relays_[message_stream_id].get());
+        live_fanout_->subscribe(slot.stream_id, subscriber_id, playback_relays_[message_stream_id].get(), client_ip_);
     }
     if (viewer_attached_handler_) viewer_attached_handler_(app_name_, stream_key);
 }

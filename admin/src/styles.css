@@ -363,11 +363,13 @@ button:focus-visible, input:focus-visible, select:focus-visible {
 .template-open {
   position: absolute;
   top: 23px;
-  right: 20px;
+  right: 90px;
   color: #98a2b3;
   transition: color .18s ease, transform .18s ease;
 }
 .template-card:hover .template-open { color: var(--accent); transform: translateX(2px); }
+.template-card-actions { position: absolute; top: 14px; right: 14px; }
+.preset-card.preset-disabled { opacity: .6; }
 .template-label {
   display: block;
   margin: 20px 0 6px;

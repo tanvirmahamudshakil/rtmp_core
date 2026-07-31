@@ -35,6 +35,15 @@ struct TranscodingAssignmentRow {
     std::string rules;
 };
 
+// A transcoding template as authored in the admin panel: a name plus its list
+// of encoding presets. The preset list is opaque JSON to the store, same as
+// TranscodingAssignmentRow::rules — the control layer encodes/decodes it.
+struct TemplateRow {
+    std::string id;
+    std::string name;
+    std::string presets_json;
+};
+
 // Storage-engine-independent persistence contract for the management
 // domain (Phase 9, docs/rtmp_promot.md "Persistence"). Deliberately narrow —
 // just enough for StreamManager to survive a restart — not a general ORM.
@@ -66,6 +75,14 @@ public:
     [[nodiscard]] virtual core::Result<std::vector<TranscodingAssignmentRow>>
     load_transcoding_assignments() {
         return std::vector<TranscodingAssignmentRow>{};
+    }
+
+    // Optional for storage implementations used by older unit tests. The
+    // production SQLite store overrides all three methods.
+    virtual core::Result<void> upsert_template(const TemplateRow&) { return core::Result<void>{}; }
+    virtual core::Result<void> delete_template(std::string_view) { return core::Result<void>{}; }
+    [[nodiscard]] virtual core::Result<std::vector<TemplateRow>> load_templates() {
+        return std::vector<TemplateRow>{};
     }
 };
 

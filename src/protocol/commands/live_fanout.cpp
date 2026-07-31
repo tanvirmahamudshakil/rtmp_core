@@ -266,7 +266,8 @@ void LiveFanout::on_metadata(StreamId stream_id, const SharedMediaFrame& frame, 
                       /*is_keyframe=*/false);
 }
 
-void LiveFanout::subscribe(StreamId stream_id, SubscriberId subscriber_id, PlaybackSink* sink) {
+void LiveFanout::subscribe(StreamId stream_id, SubscriberId subscriber_id, PlaybackSink* sink,
+                            std::string_view client_ip) {
     auto state = state_for(stream_id);
     std::vector<SharedMediaFrame> startup_metadata_and_headers;
     std::vector<SharedMediaFrame> startup_gop;
@@ -276,7 +277,8 @@ void LiveFanout::subscribe(StreamId stream_id, SubscriberId subscriber_id, Playb
         std::lock_guard<std::mutex> lock(state->mutex);
         state->subscribers.emplace(
             subscriber_id.raw(),
-            Subscriber{sink, ViewerQueue(queue_limits_, max_frames_waiting_for_keyframe_), 0});
+            Subscriber{sink, ViewerQueue(queue_limits_, max_frames_waiting_for_keyframe_), 0,
+                       std::string(client_ip)});
 
         if (state->metadata) startup_metadata_and_headers.push_back(*state->metadata);
         if (state->video_sequence_header) {
@@ -429,6 +431,27 @@ std::size_t LiveFanout::subscriber_count(StreamId stream_id) const {
     // structure, not StreamState's own fields.
     std::lock_guard<std::mutex> stream_lock(state->mutex);
     return state->subscribers.size();
+}
+
+std::size_t LiveFanout::unique_viewer_count(StreamId stream_id) const {
+    std::shared_ptr<StreamState> state;
+    {
+        std::lock_guard<std::mutex> lock(streams_mutex_);
+        auto it = streams_.find(stream_id.raw());
+        if (it == streams_.end()) return 0;
+        state = it->second;
+    }
+    std::lock_guard<std::mutex> stream_lock(state->mutex);
+    std::unordered_set<std::string> seen_ips;
+    std::size_t count = 0;
+    for (const auto& [id, subscriber] : state->subscribers) {
+        if (subscriber.client_ip.empty()) {
+            ++count; // no IP recorded — can't dedup, count it on its own
+        } else if (seen_ips.insert(subscriber.client_ip).second) {
+            ++count; // first time this IP has been seen for this stream
+        }
+    }
+    return count;
 }
 
 } // namespace rtmp_server::protocol::commands

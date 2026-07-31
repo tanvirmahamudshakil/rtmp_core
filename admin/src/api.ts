@@ -50,6 +50,15 @@ export type SourceTranscodeJob = {
   enabled: boolean;
 };
 
+// A transcoding template as persisted server-side (SQLite): a name plus its
+// list of encoding presets. `presets` is opaque to this client — App.tsx owns
+// the EncodingPreset shape — it is only threaded through untouched.
+export type TemplateRecord = {
+  id: string;
+  name: string;
+  presets: unknown[];
+};
+
 export type Snapshot = {
   applications: Application[];
   streams: Stream[];
@@ -69,7 +78,7 @@ export class ApiError extends Error {
   }
 }
 
-const demoApps: Application[] = [
+let demoApps: Application[] = [
   { name: "live", enabled: true },
   { name: "events", enabled: true },
   { name: "backup", enabled: false }
@@ -84,6 +93,7 @@ let demoStreams: Stream[] = [
   { application: "events", name: "studio-feed", enabled: true, recording_enabled: false, rtmp_url: demoRtmpUrl("events", "studio-feed"), hls_path: "/hls/events/studio-feed/index.m3u8", is_live: false, viewer_count: 0 },
   { application: "backup", name: "disaster-recovery", enabled: false, recording_enabled: false, rtmp_url: demoRtmpUrl("backup", "disaster-recovery"), hls_path: "/hls/backup/disaster-recovery/index.m3u8", is_live: false, viewer_count: 0 }
 ];
+let demoTemplates: TemplateRecord[] = [];
 let demoAssignments: TranscodingAssignment[] = [];
 let demoSourceJobs: SourceTranscodeJob[] = [];
 
@@ -102,6 +112,7 @@ const demoMetrics: Record<string, number> = {
   slow_viewer_evictions: 2,
   process_memory_bytes: 1288490188,
   worker_cpu_usage: 6720,
+  cpu_cores_available: 8,
   gop_cache_bytes: 38482944
 };
 
@@ -202,6 +213,61 @@ export class ControlClient {
       method: "POST",
       body: JSON.stringify({ name })
     });
+  }
+
+  async deleteApplication(application: string): Promise<void> {
+    if (this.demo) {
+      demoApps = demoApps.filter((item) => item.name !== application);
+      demoStreams = demoStreams.filter((item) => item.application !== application);
+      return;
+    }
+    await this.request<{ deleted: boolean }>(`/v1/applications/${encodeURIComponent(application)}`, {
+      method: "DELETE"
+    });
+  }
+
+  async listTemplates(): Promise<TemplateRecord[]> {
+    if (this.demo) {
+      return demoTemplates.map((item) => ({ ...item, presets: [...item.presets] }));
+    }
+    const response = await this.request<{ items: TemplateRecord[] }>("/v1/templates");
+    return response.items;
+  }
+
+  async putTemplate(id: string, name: string, presets: unknown[]): Promise<TemplateRecord> {
+    if (this.demo) {
+      const record: TemplateRecord = { id, name, presets };
+      demoTemplates = [...demoTemplates.filter((item) => item.id !== id), record];
+      return record;
+    }
+    const response = await fetch(`${this.baseUrl}/v1/templates/${encodeURIComponent(id)}`, {
+      method: "PUT",
+      headers: {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+        "X-Template-Name": name
+      },
+      body: JSON.stringify(presets)
+    });
+    if (!response.ok) {
+      let message = `Request failed (${response.status})`;
+      try {
+        const body = (await response.json()) as { message?: string };
+        if (body.message) message = body.message;
+      } catch {
+        // Keep status-based fallback.
+      }
+      throw new ApiError(message, response.status, response.headers.get("X-Request-Id") ?? undefined);
+    }
+    return response.json() as Promise<TemplateRecord>;
+  }
+
+  async deleteTemplate(id: string): Promise<void> {
+    if (this.demo) {
+      demoTemplates = demoTemplates.filter((item) => item.id !== id);
+      return;
+    }
+    await this.request<{ deleted: boolean }>(`/v1/templates/${encodeURIComponent(id)}`, { method: "DELETE" });
   }
 
   async createStream(application: string, name: string, recording: boolean): Promise<StreamSetup> {
