@@ -12,6 +12,10 @@ export type Stream = {
   hls_path: string;
   is_live?: boolean;
   viewer_count?: number;
+  // Cumulative bytes delivered to viewers of this stream, as of this
+  // snapshot. Monotonic while live; the caller derives a per-link bitrate
+  // from the delta between two snapshots (see bandwidthFromSamples in App.tsx).
+  egress_bytes_total?: number;
 };
 
 export type StreamSetup = Stream;
@@ -160,6 +164,11 @@ export class ControlClient {
 
   async snapshot(): Promise<Snapshot> {
     if (this.demo) {
+      demoStreams = demoStreams.map((stream) =>
+        stream.is_live
+          ? { ...stream, egress_bytes_total: (stream.egress_bytes_total ?? 0) + (stream.viewer_count ?? 0) * 250000 }
+          : stream
+      );
       return {
         applications: [...demoApps],
         streams: demoStreams.map((stream) => ({ ...stream })),
@@ -180,7 +189,7 @@ export class ControlClient {
     const withStatus = await Promise.all(
       streams.map(async (stream) => {
         try {
-          const status = await this.request<{ is_live: boolean; viewer_count: number }>(
+          const status = await this.request<{ is_live: boolean; viewer_count: number; egress_bytes_total?: number }>(
             `/v1/streams/${encodeURIComponent(`${stream.application}:${stream.name}`)}/status`
           );
           return { ...stream, ...status };

@@ -59,6 +59,11 @@ struct LiveState {
     std::string name;
     bool is_live = false;
     std::size_t viewer_count = 0;
+    // Cumulative egress bytes delivered to viewers of this stream. The admin
+    // panel polls this repeatedly and derives a per-link bitrate from the
+    // delta over its own poll interval, the same way it already derives
+    // trend history from repeated snapshots.
+    std::uint64_t egress_bytes_total = 0;
 };
 
 // Fired with the connection_id of the publisher/viewer session a management

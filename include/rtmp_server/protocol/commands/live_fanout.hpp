@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -170,6 +171,15 @@ public:
     // behaviour rather than an undercount.
     [[nodiscard]] std::size_t unique_viewer_count(StreamId stream_id) const;
 
+    // Cumulative bytes handed to viewer sinks for this stream since it first
+    // appeared in streams_ (same bytes counted into the global
+    // egress_bytes_total metric, just also kept per-stream). 0 for a stream
+    // with no StreamState yet (never published/subscribed to). Callers poll
+    // this and derive a bitrate from the delta over their own poll interval
+    // — same pattern the admin panel already uses for viewer history, and it
+    // avoids adding a clock dependency to LiveFanout just for this.
+    [[nodiscard]] std::uint64_t egress_bytes_total(StreamId stream_id) const;
+
     // Phase 7 observability. Optional and non-owning; the embedder (server
     // main, or a test) owns the registry and must outlive this LiveFanout.
     // When null, every metric call site below compiles to a null check —
@@ -213,6 +223,9 @@ private:
         std::optional<SharedMediaFrame> audio_sequence_header;
         GopCache gop_cache;
         std::unordered_map<std::uint64_t, Subscriber> subscribers; // key = SubscriberId::raw()
+        // Relaxed: only ever added to (run_deliveries) and read (egress_bytes_total),
+        // never a synchronization point for anything else.
+        std::atomic<std::uint64_t> egress_bytes_total{0};
     };
 
     // One pending, already-decided callback to run outside any lock.

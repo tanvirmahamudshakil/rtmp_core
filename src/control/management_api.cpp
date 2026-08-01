@@ -733,7 +733,8 @@ HttpResponse ManagementApi::handle_status(std::string_view application, std::str
             std::ostringstream os;
             os << R"({"application":")" << json_escape(state.application) << R"(","name":")"
                << json_escape(state.name) << R"(","is_live":)" << (state.is_live ? "true" : "false")
-               << R"(,"viewer_count":)" << state.viewer_count << "}";
+               << R"(,"viewer_count":)" << state.viewer_count << R"(,"egress_bytes_total":)"
+               << state.egress_bytes_total << "}";
             return HttpResponse::json(200, os.str());
         }
     }

@@ -37,7 +37,7 @@ import {
   X,
   Zap
 } from "lucide-react";
-import { FormEvent, ReactNode, useCallback, useEffect, useState } from "react";
+import { FormEvent, ReactNode, useCallback, useEffect, useRef, useState } from "react";
 import { Application, ControlClient, Snapshot, SourceTranscodeJob, Stream, TemplateRecord, TranscodingAssignment, TranscodingOutput } from "./api";
 
 type Page = "home" | "applications" | "transcode" | "server";
@@ -455,12 +455,14 @@ function Overview({
   snapshot,
   history,
   bandwidth,
+  streamBandwidth,
   onNavigate,
   onStreamAction
 }: {
   snapshot: Snapshot;
   history: number[];
   bandwidth: number;
+  streamBandwidth: Record<string, number>;
   onNavigate: (page: Page) => void;
   onStreamAction: (stream: Stream, action: string) => void;
 }) {
@@ -541,7 +543,7 @@ function Overview({
           <div><span className="eyebrow">LIVE NOW</span><h2>Top streams</h2></div>
           <button className="subtle-button" onClick={() => onNavigate("applications")}>View all streams <ChevronRight size={16} /></button>
         </div>
-        <StreamTable streams={(liveStreams.length ? liveStreams : snapshot.streams).slice(0, 5)} onAction={onStreamAction} compactMode />
+        <StreamTable streams={(liveStreams.length ? liveStreams : snapshot.streams).slice(0, 5)} onAction={onStreamAction} bandwidthByStream={streamBandwidth} compactMode />
       </section>
     </>
   );
@@ -550,10 +552,12 @@ function Overview({
 function StreamTable({
   streams,
   onAction,
+  bandwidthByStream = {},
   compactMode = false
 }: {
   streams: Stream[];
   onAction: (stream: Stream, action: string) => void;
+  bandwidthByStream?: Record<string, number>;
   compactMode?: boolean;
 }) {
   if (!streams.length) {
@@ -562,15 +566,18 @@ function StreamTable({
   return (
     <div className="table-wrap">
       <table>
-        <thead><tr><th>Stream</th><th>Status</th><th>Viewers</th><th>Recording</th><th>Delivery</th><th><span className="sr-only">Actions</span></th></tr></thead>
+        <thead><tr><th>Stream</th><th>Status</th><th>Viewers</th><th>Bandwidth</th><th>Recording</th><th>Delivery</th><th><span className="sr-only">Actions</span></th></tr></thead>
         <tbody>
-          {streams.map((stream) => (
+          {streams.map((stream) => {
+            const linkBandwidth = bandwidthByStream[`${stream.application}:${stream.name}`];
+            return (
             <tr key={`${stream.application}:${stream.name}`}>
               <td>
                 <div className="stream-identity"><span className="stream-avatar"><Video size={17} /></span><div><strong>{stream.name}</strong><small>{stream.application} / {stream.name}</small></div></div>
               </td>
               <td><StatusPill live={stream.is_live} /></td>
               <td><strong className="viewer-count">{stream.viewer_count === undefined ? "—" : compact(stream.viewer_count)}</strong></td>
+              <td>{stream.is_live && linkBandwidth !== undefined ? bitrate(linkBandwidth) : "—"}</td>
               <td><span className={`recording-state ${stream.recording_enabled ? "on" : ""}`}><span />{stream.recording_enabled ? "Requested" : "Off"}</span></td>
               <td><span className={stream.enabled ? "enabled-text" : "disabled-text"}>{stream.enabled ? "Enabled" : "Disabled"}</span></td>
               <td>
@@ -582,7 +589,8 @@ function StreamTable({
                 </div>
               </td>
             </tr>
-          ))}
+            );
+          })}
         </tbody>
       </table>
     </div>
@@ -1709,6 +1717,12 @@ function App() {
   const [templates, setTemplates] = useState<TranscodingTemplate[]>([]);
   const [bandwidth, setBandwidthState] = useState(() => Number(localStorage.getItem("streamforge-bandwidth")) || 10000);
   const [history, setHistory] = useState<number[]>(demo ? [5200, 5400, 5310, 5710, 5890, 6030, 6210, 6150, 6420, 6615] : []);
+  // Per-stream egress bitrate, derived on the client from the delta of
+  // egress_bytes_total between two polls — the backend only exposes the
+  // cumulative counter (see admin/src/api.ts Stream.egress_bytes_total), same
+  // pattern the global "Bandwidth out" tile already gets from Prometheus.
+  const [streamBandwidth, setStreamBandwidth] = useState<Record<string, number>>({});
+  const bandwidthSamplesRef = useRef(new Map<string, { bytes: number; time: number }>());
 
   const refreshTemplates = useCallback(async () => {
     const records = await client.listTemplates();
@@ -1732,6 +1746,24 @@ function App() {
       const next = await activeClient.snapshot();
       setSnapshot(next);
       setHistory((current) => [...current, metric(next, "active_viewers")].slice(-24));
+
+      const now = Date.now();
+      const samples = bandwidthSamplesRef.current;
+      const nextBandwidth: Record<string, number> = {};
+      for (const stream of next.streams) {
+        const key = `${stream.application}:${stream.name}`;
+        const bytes = stream.egress_bytes_total;
+        if (bytes === undefined) continue;
+        const previous = samples.get(key);
+        // Only trust a delta between two samples of a still-live stream: a
+        // restart resets the counter, and negative/zero elapsed time can't
+        // give a meaningful rate.
+        if (previous && bytes >= previous.bytes && now > previous.time) {
+          nextBandwidth[key] = ((bytes - previous.bytes) * 8) / ((now - previous.time) / 1000);
+        }
+        samples.set(key, { bytes, time: now });
+      }
+      setStreamBandwidth(nextBandwidth);
     } catch (error) {
       if (!quiet) {
         setNotice({ type: "error", message: error instanceof Error ? error.message : "Could not refresh server data." });
@@ -1829,7 +1861,7 @@ function App() {
           </div>
         </header>
         <div className="content">
-          {page === "home" && <Overview snapshot={snapshot} history={history} bandwidth={bandwidth} onNavigate={navigate} onStreamAction={streamAction} />}
+          {page === "home" && <Overview snapshot={snapshot} history={history} bandwidth={bandwidth} streamBandwidth={streamBandwidth} onNavigate={navigate} onStreamAction={streamAction} />}
           {page === "applications" && (
             selectedApplication
               ? <ApplicationDetailPage

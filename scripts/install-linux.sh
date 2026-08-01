@@ -306,9 +306,45 @@ log "Installing or refreshing compiler, runtime, web server and network tooling"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
 apt-get install -y --no-install-recommends "${APT_REINSTALL_ARGS[@]}" \
-  build-essential clang cmake ninja-build pkg-config git ca-certificates curl \
+  build-essential cmake ninja-build pkg-config git ca-certificates curl gnupg \
   liburing-dev liburing2 libssl-dev libsqlite3-dev libsqlite3-0 sqlite3 \
-  ffmpeg nodejs npm iproute2 ethtool kmod
+  ffmpeg iproute2 ethtool kmod
+
+# The distribution's default "clang" meta-package tracks whatever major
+# version that release shipped with — fine on 24.04 (clang-18) but not
+# guaranteed on every future point release. Pick the newest clang actually
+# available in the configured repositories instead of hardcoding one, and
+# verify it is new enough for the C++23 features this codebase uses (see
+# cmake/CompilerWarnings.cmake / CMakeLists.txt for the standard flag).
+CLANG_MIN_MAJOR=16
+CLANG_PACKAGE=""
+CLANG_MAJOR=""
+apt-cache search --names-only '^clang-[0-9]+$' 2>/dev/null | while read -r name _; do
+  echo "${name}"
+done > /tmp/streamforge-clang-candidates.$$  || true
+if apt-cache show clang >/dev/null 2>&1; then
+  CLANG_PACKAGE="clang"
+fi
+while read -r candidate; do
+  major="${candidate#clang-}"
+  [[ "${major}" =~ ^[0-9]+$ ]] || continue
+  if [[ -z "${CLANG_MAJOR}" ]] || (( major > CLANG_MAJOR )); then
+    CLANG_MAJOR="${major}"
+    CLANG_PACKAGE="${candidate}"
+  fi
+done < /tmp/streamforge-clang-candidates.$$
+rm -f /tmp/streamforge-clang-candidates.$$
+[[ -n "${CLANG_PACKAGE}" ]] || die "No clang package is available from this distribution's configured repositories."
+apt-get install -y --no-install-recommends "${APT_REINSTALL_ARGS[@]}" "${CLANG_PACKAGE}"
+CLANG_BIN="$(command -v "${CLANG_PACKAGE}" || command -v clang)"
+[[ -n "${CLANG_BIN}" ]] || die "clang was installed but is not on PATH."
+CLANGXX_BIN="${CLANG_BIN/clang/clang++}"
+command -v "${CLANGXX_BIN}" >/dev/null 2>&1 || CLANGXX_BIN="$(command -v clang++)"
+DETECTED_CLANG_MAJOR="$("${CLANG_BIN}" --version | sed -n 's/.*version \([0-9]\+\).*/\1/p' | head -n 1)"
+[[ "${DETECTED_CLANG_MAJOR}" =~ ^[0-9]+$ ]] || die "Could not determine the installed clang version."
+(( DETECTED_CLANG_MAJOR >= CLANG_MIN_MAJOR )) ||
+  die "clang ${DETECTED_CLANG_MAJOR} is too old for C++23 (need >= ${CLANG_MIN_MAJOR}); this distribution only offers ${CLANG_PACKAGE}."
+log "Using ${CLANG_BIN} (clang ${DETECTED_CLANG_MAJOR})"
 
 # In-process FFmpeg-free transcoding pipeline + source-transcode jobs
 # (docs/native-transcoding.md): openh264 (H.264 decode/encode), x265 (HEVC),
@@ -320,17 +356,58 @@ if [[ "${NATIVE_TRANSCODE}" == "1" ]]; then
   apt-get install -y --no-install-recommends "${APT_REINSTALL_ARGS[@]}" \
     libx265-dev libopenh264-dev libfdk-aac-dev libcurl4-openssl-dev libyuv-dev
 fi
-if ! apt-cache show caddy >/dev/null 2>&1 && [[ "${ID}" == "ubuntu" ]]; then
-  apt-get install -y --no-install-recommends "${APT_REINSTALL_ARGS[@]}" software-properties-common
-  add-apt-repository -y universe
+
+if ! apt-cache show caddy >/dev/null 2>&1; then
+  if [[ "${ID}" == "ubuntu" ]]; then
+    # Some Ubuntu point releases carry caddy in universe but haven't enabled
+    # it by default; add it first since it's the cheapest fix.
+    apt-get install -y --no-install-recommends "${APT_REINSTALL_ARGS[@]}" software-properties-common
+    add-apt-repository -y universe
+    apt-get update
+  fi
+fi
+if ! apt-cache show caddy >/dev/null 2>&1; then
+  # Neither Ubuntu's universe nor Debian's own repositories are guaranteed to
+  # carry caddy on every release. Fall back to caddy's own apt repository,
+  # which auto-selects the right feed for whatever codename this host
+  # reports — no distro/version hardcoded here.
+  log "caddy not found in distribution repositories; adding the upstream caddy apt repository"
+  apt-get install -y --no-install-recommends "${APT_REINSTALL_ARGS[@]}" debian-keyring debian-archive-keyring apt-transport-https
+  curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' |
+    gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+  curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' \
+    > /etc/apt/sources.list.d/caddy-stable.list
   apt-get update
 fi
 apt-get install -y --no-install-recommends "${APT_REINSTALL_ARGS[@]}" caddy ||
-  die "Caddy is unavailable from this distribution's configured repositories."
+  die "Caddy is unavailable from this distribution's configured repositories and the upstream caddy repository."
 
 CMAKE_VERSION="$(cmake --version | awk 'NR == 1 { print $3 }')"
 dpkg --compare-versions "${CMAKE_VERSION}" ge 3.25 ||
   die "CMake 3.25+ is required; this distribution provides ${CMAKE_VERSION}."
+
+# The distro-packaged nodejs varies a lot by release (some ship 18.x, some
+# 20.x); the admin panel's Vite 6 / React 19 toolchain needs a reasonably
+# current runtime. Prefer the distro package when it's new enough, otherwise
+# use NodeSource's setup script, which itself auto-detects the codename.
+NODE_MIN_MAJOR=18
+NODE_OK=0
+if apt-get install -y --no-install-recommends "${APT_REINSTALL_ARGS[@]}" nodejs npm 2>/dev/null &&
+   command -v node >/dev/null 2>&1; then
+  INSTALLED_NODE_MAJOR="$(node --version | sed -n 's/^v\([0-9]\+\).*/\1/p')"
+  if [[ "${INSTALLED_NODE_MAJOR}" =~ ^[0-9]+$ ]] && (( INSTALLED_NODE_MAJOR >= NODE_MIN_MAJOR )); then
+    NODE_OK=1
+  fi
+fi
+if [[ "${NODE_OK}" != "1" ]]; then
+  log "Distribution nodejs is missing or older than ${NODE_MIN_MAJOR}.x; installing from NodeSource"
+  curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+  apt-get install -y --no-install-recommends "${APT_REINSTALL_ARGS[@]}" nodejs
+  command -v node >/dev/null 2>&1 || die "Node.js installation failed."
+  INSTALLED_NODE_MAJOR="$(node --version | sed -n 's/^v\([0-9]\+\).*/\1/p')"
+  [[ "${INSTALLED_NODE_MAJOR}" =~ ^[0-9]+$ ]] && (( INSTALLED_NODE_MAJOR >= NODE_MIN_MAJOR )) ||
+    die "NodeSource installation did not provide Node.js >= ${NODE_MIN_MAJOR}."
+fi
 
 CPU_COUNT="$(nproc)"
 DEFAULT_WORKERS="${CPU_COUNT}"
@@ -400,8 +477,8 @@ if (( NOFILE > 1048576 )); then NOFILE=1048576; fi
   die "Calculated ${MAX_CONNECTIONS} sockets exceed this single-node file-descriptor ceiling; use multiple origin nodes."
 
 log "Building hardened C++ server with ${WORKERS} media workers"
-export CC=clang
-export CXX=clang++
+export CC="${CLANG_BIN}"
+export CXX="${CLANGXX_BIN}"
 # Enable the in-process native transcoding pipeline in the build when its
 # libraries were installed above, so source-transcode jobs are available.
 NATIVE_TRANSCODE_CMAKE_ARGS=()

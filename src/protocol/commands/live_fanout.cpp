@@ -198,9 +198,21 @@ void LiveFanout::run_deliveries(StreamId stream_id, const std::shared_ptr<Stream
         sink->on_slow_client_evicted();
     }
 
-    if (metrics_ != nullptr && egress_bytes > 0) {
-        metrics_->increment(observability::MetricId::EgressBytesTotal, egress_bytes);
+    if (egress_bytes > 0) {
+        state->egress_bytes_total.fetch_add(egress_bytes, std::memory_order_relaxed);
+        if (metrics_ != nullptr) metrics_->increment(observability::MetricId::EgressBytesTotal, egress_bytes);
     }
+}
+
+std::uint64_t LiveFanout::egress_bytes_total(StreamId stream_id) const {
+    std::shared_ptr<StreamState> state;
+    {
+        std::lock_guard<std::mutex> lock(streams_mutex_);
+        auto it = streams_.find(stream_id.raw());
+        if (it == streams_.end()) return 0;
+        state = it->second;
+    }
+    return state->egress_bytes_total.load(std::memory_order_relaxed);
 }
 
 void LiveFanout::on_video(StreamId stream_id, const SharedMediaFrame& frame, bool is_replayed) {
