@@ -456,6 +456,8 @@ function Overview({
   history,
   bandwidth,
   streamBandwidth,
+  sourceJobs,
+  sourceBandwidth,
   onNavigate,
   onStreamAction
 }: {
@@ -463,6 +465,8 @@ function Overview({
   history: number[];
   bandwidth: number;
   streamBandwidth: Record<string, number>;
+  sourceJobs: SourceTranscodeJob[];
+  sourceBandwidth: Record<string, number>;
   onNavigate: (page: Page) => void;
   onStreamAction: (stream: Stream, action: string) => void;
 }) {
@@ -470,7 +474,7 @@ function Overview({
   const publishers = metric(snapshot, "active_publishers");
   const egress = metric(snapshot, "egress_bitrate");
   const utilization = Math.min((egress / (bandwidth * 1e6)) * 100, 999);
-  const liveStreams = snapshot.streams.filter((stream) => stream.is_live);
+  const links = buildLinkRows(snapshot.streams, sourceJobs, streamBandwidth, sourceBandwidth);
   return (
     <>
       <section className="metric-grid">
@@ -543,54 +547,122 @@ function Overview({
           <div><span className="eyebrow">LIVE NOW</span><h2>Top streams</h2></div>
           <button className="subtle-button" onClick={() => onNavigate("applications")}>View all streams <ChevronRight size={16} /></button>
         </div>
-        <StreamTable streams={(liveStreams.length ? liveStreams : snapshot.streams).slice(0, 5)} onAction={onStreamAction} bandwidthByStream={streamBandwidth} compactMode />
+        <LinksTable rows={links} onAction={onStreamAction} />
       </section>
     </>
   );
 }
 
-function StreamTable({
-  streams,
-  onAction,
-  bandwidthByStream = {},
-  compactMode = false
-}: {
-  streams: Stream[];
-  onAction: (stream: Stream, action: string) => void;
-  bandwidthByStream?: Record<string, number>;
-  compactMode?: boolean;
-}) {
-  if (!streams.length) {
-    return <div className="empty-state"><Radio size={28} /><strong>No streams available</strong><span>Streams matching this view will appear here automatically.</span></div>;
+// One row per deliverable link: a plain published stream or a source-transcode
+// job's adaptive master. Merged into one list because operators mostly care
+// about "what's live and what's it costing", not which admin tab it lives
+// under (source-transcode jobs are the primary workload here — see the
+// Transcode-from-URL feature).
+type LinkRow = {
+  key: string;
+  kind: "stream" | "source";
+  name: string;
+  application: string;
+  live: boolean;
+  statusLabel: string;
+  // Live viewer estimate. For a source-transcode link this is distinct
+  // client IPs seen fetching its HLS renditions in the last ~20s (see
+  // SourceTranscodeJob.viewer_count in api.ts for the caveats); for a plain
+  // stream it's the RTMP fan-out's unique-IP subscriber count.
+  viewers: number | undefined;
+  // Live bitrate right now, refreshed every poll from the delta of a
+  // cumulative byte counter (streamBandwidth / sourceBandwidth in App()).
+  liveBitrateBps: number | undefined;
+  // Total bytes delivered since the link went live (cumulative, not a rate)
+  // — how much bandwidth this link has actually cost so far.
+  totalBytes: number | undefined;
+  renditionCount: number | undefined;
+  copyUrl: string;
+  copyLabel: string;
+  stream?: Stream;
+};
+
+function buildLinkRows(
+  streams: Stream[],
+  sourceJobs: SourceTranscodeJob[],
+  bandwidthByStream: Record<string, number>,
+  bandwidthByJob: Record<string, number>
+): LinkRow[] {
+  const streamRows: LinkRow[] = streams.map((stream) => ({
+    key: `stream:${stream.application}:${stream.name}`,
+    kind: "stream",
+    name: stream.name,
+    application: stream.application,
+    live: !!stream.is_live,
+    statusLabel: stream.is_live ? "Live" : "Idle",
+    viewers: stream.viewer_count,
+    liveBitrateBps: stream.is_live ? bandwidthByStream[`${stream.application}:${stream.name}`] : undefined,
+    totalBytes: stream.egress_bytes_total,
+    renditionCount: undefined,
+    copyUrl: absoluteUrl(stream.hls_path),
+    copyLabel: "Copy HLS playback URL",
+    stream
+  }));
+  const sourceRows: LinkRow[] = sourceJobs.map((job) => ({
+    key: `source:${job.application}:${job.name}`,
+    kind: "source",
+    name: job.name,
+    application: job.application,
+    live: job.status === "running",
+    statusLabel: job.enabled ? job.status : "Paused",
+    viewers: job.status === "running" ? job.viewer_count : undefined,
+    liveBitrateBps: job.status === "running" ? bandwidthByJob[`job:${job.application}:${job.name}`] : undefined,
+    totalBytes: job.bytes_total,
+    renditionCount: job.outputs.length,
+    copyUrl: absoluteUrl(job.master_hls_path),
+    copyLabel: "Copy adaptive master URL"
+  }));
+  return [...streamRows, ...sourceRows].sort((a, b) => {
+    if (a.live !== b.live) return a.live ? -1 : 1;
+    return (b.viewers ?? b.liveBitrateBps ?? 0) - (a.viewers ?? a.liveBitrateBps ?? 0);
+  });
+}
+
+function LinksTable({ rows, onAction }: { rows: LinkRow[]; onAction: (stream: Stream, action: string) => void }) {
+  if (!rows.length) {
+    return <div className="empty-state"><Radio size={28} /><strong>No links yet</strong><span>Streams and source-transcode links will appear here automatically.</span></div>;
   }
   return (
     <div className="table-wrap">
       <table>
-        <thead><tr><th>Stream</th><th>Status</th><th>Viewers</th><th>Bandwidth</th><th>Recording</th><th>Delivery</th><th><span className="sr-only">Actions</span></th></tr></thead>
+        <thead>
+          <tr>
+            <th>Link</th><th>Status</th><th>Viewers</th><th>Bitrate</th><th>Bandwidth</th><th><span className="sr-only">Actions</span></th>
+          </tr>
+        </thead>
         <tbody>
-          {streams.map((stream) => {
-            const linkBandwidth = bandwidthByStream[`${stream.application}:${stream.name}`];
-            return (
-            <tr key={`${stream.application}:${stream.name}`}>
+          {rows.slice(0, 8).map((row) => (
+            <tr key={row.key}>
               <td>
-                <div className="stream-identity"><span className="stream-avatar"><Video size={17} /></span><div><strong>{stream.name}</strong><small>{stream.application} / {stream.name}</small></div></div>
+                <div className="stream-identity">
+                  <span className="stream-avatar">{row.kind === "source" ? <Workflow size={17} /> : <Video size={17} />}</span>
+                  <div>
+                    <strong>{row.name}</strong>
+                    <small>{row.application} / {row.name}{row.kind === "source" ? " · source transcode" : ""}</small>
+                  </div>
+                </div>
               </td>
-              <td><StatusPill live={stream.is_live} /></td>
-              <td><strong className="viewer-count">{stream.viewer_count === undefined ? "—" : compact(stream.viewer_count)}</strong></td>
-              <td>{stream.is_live && linkBandwidth !== undefined ? bitrate(linkBandwidth) : "—"}</td>
-              <td><span className={`recording-state ${stream.recording_enabled ? "on" : ""}`}><span />{stream.recording_enabled ? "Requested" : "Off"}</span></td>
-              <td><span className={stream.enabled ? "enabled-text" : "disabled-text"}>{stream.enabled ? "Enabled" : "Disabled"}</span></td>
+              <td><StatusPill live={row.live} label={row.live ? "Live" : row.statusLabel} /></td>
+              <td><strong className="viewer-count">{row.viewers === undefined ? "—" : compact(row.viewers)}</strong></td>
+              <td>
+                {row.liveBitrateBps !== undefined
+                  ? `${bitrate(row.liveBitrateBps)}${row.renditionCount ? ` · ${row.renditionCount} renditions` : ""}`
+                  : "—"}
+              </td>
+              <td>{row.totalBytes !== undefined ? bytes(row.totalBytes) : "—"}</td>
               <td>
                 <div className="row-actions">
-                  <IconButton label="Copy universal RTMP URL" onClick={() => copyText(stream.rtmp_url)}><Copy size={16} /></IconButton>
-                  <IconButton label="Copy smooth HLS playback URL" onClick={() => copyText(absoluteUrl(stream.hls_path))}><ArrowDownToLine size={16} /></IconButton>
-                  {!compactMode && <IconButton label={stream.enabled ? "Disable stream" : "Enable stream"} onClick={() => onAction(stream, "toggle")}><SlidersHorizontal size={16} /></IconButton>}
-                  <IconButton label="More stream actions" onClick={() => onAction(stream, "more")}><MoreHorizontal size={17} /></IconButton>
+                  <IconButton label={row.copyLabel} onClick={() => copyText(row.copyUrl)}><Copy size={16} /></IconButton>
+                  {row.stream && <IconButton label="More stream actions" onClick={() => onAction(row.stream!, "more")}><MoreHorizontal size={17} /></IconButton>}
                 </div>
               </td>
             </tr>
-            );
-          })}
+          ))}
         </tbody>
       </table>
     </div>
@@ -1723,6 +1795,14 @@ function App() {
   // pattern the global "Bandwidth out" tile already gets from Prometheus.
   const [streamBandwidth, setStreamBandwidth] = useState<Record<string, number>>({});
   const bandwidthSamplesRef = useRef(new Map<string, { bytes: number; time: number }>());
+  // Source-transcode jobs across every application, fetched for the homepage
+  // "Top links" table. Per-application tabs still fetch these on demand
+  // (ApplicationDetailPage.loadSourceJobs); this is a separate copy kept in
+  // sync on the same 5s poll as the rest of the home dashboard.
+  const [sourceJobs, setSourceJobs] = useState<SourceTranscodeJob[]>([]);
+  // Live bitrate per source-transcode job, derived the same way as
+  // streamBandwidth (delta of a cumulative byte counter between polls).
+  const [sourceBandwidth, setSourceBandwidth] = useState<Record<string, number>>({});
 
   const refreshTemplates = useCallback(async () => {
     const records = await client.listTemplates();
@@ -1740,7 +1820,13 @@ function App() {
     localStorage.setItem("streamforge-bandwidth", String(value));
   };
 
+  // Guards against two polls overlapping if a request is slow (a stalled
+  // connection shouldn't pile up parallel fetches once it finally resolves).
+  const refreshInFlightRef = useRef(false);
+
   const refresh = useCallback(async (activeClient = client, quiet = false) => {
+    if (refreshInFlightRef.current) return;
+    refreshInFlightRef.current = true;
     if (!quiet) setLoading(true);
     try {
       const next = await activeClient.snapshot();
@@ -1764,19 +1850,64 @@ function App() {
         samples.set(key, { bytes, time: now });
       }
       setStreamBandwidth(nextBandwidth);
+
+      try {
+        const jobs = (
+          await Promise.all(next.applications.map((app) => activeClient.listSourceTranscodes(app.name)))
+        ).flat();
+        setSourceJobs(jobs);
+
+        // Same cumulative-bytes-delta derivation as streams above, just under
+        // a "job:" key prefix so a job can't collide with a plain stream of
+        // the same name in the shared samples map.
+        const nextSourceBandwidth: Record<string, number> = {};
+        for (const job of jobs) {
+          if (job.bytes_total === undefined) continue;
+          const key = `job:${job.application}:${job.name}`;
+          const previous = samples.get(key);
+          if (previous && job.bytes_total >= previous.bytes && now > previous.time) {
+            nextSourceBandwidth[key] = ((job.bytes_total - previous.bytes) * 8) / ((now - previous.time) / 1000);
+          }
+          samples.set(key, { bytes: job.bytes_total, time: now });
+        }
+        setSourceBandwidth(nextSourceBandwidth);
+      } catch {
+        // Homepage source-job row list degrades gracefully; the per-application
+        // Source Transcode tab surfaces the real error when it fetches directly.
+      }
     } catch (error) {
       if (!quiet) {
         setNotice({ type: "error", message: error instanceof Error ? error.message : "Could not refresh server data." });
       }
     } finally {
+      refreshInFlightRef.current = false;
       if (!quiet) setLoading(false);
     }
   }, [client]);
 
+  // Poll every 5s, but only while the tab is actually visible and online.
+  // A background/minimized tab still burns the user's data and the server's
+  // request budget for a dashboard nobody is looking at, and some browsers
+  // throttle/queue timers in hidden tabs anyway, which can make requests
+  // pile up. Refresh immediately on return instead, so the numbers are never
+  // stale when the operator tabs back in.
   useEffect(() => {
     refresh(client);
-    const interval = window.setInterval(() => refresh(client, true), 5000);
-    return () => window.clearInterval(interval);
+    const interval = window.setInterval(() => {
+      if (document.hidden || !navigator.onLine) return;
+      refresh(client, true);
+    }, 5000);
+    const onVisibilityOrOnline = () => {
+      if (document.hidden || !navigator.onLine) return;
+      refresh(client, true);
+    };
+    document.addEventListener("visibilitychange", onVisibilityOrOnline);
+    window.addEventListener("online", onVisibilityOrOnline);
+    return () => {
+      window.clearInterval(interval);
+      document.removeEventListener("visibilitychange", onVisibilityOrOnline);
+      window.removeEventListener("online", onVisibilityOrOnline);
+    };
   }, [client, refresh]);
 
   useEffect(() => {
@@ -1861,7 +1992,7 @@ function App() {
           </div>
         </header>
         <div className="content">
-          {page === "home" && <Overview snapshot={snapshot} history={history} bandwidth={bandwidth} streamBandwidth={streamBandwidth} onNavigate={navigate} onStreamAction={streamAction} />}
+          {page === "home" && <Overview snapshot={snapshot} history={history} bandwidth={bandwidth} streamBandwidth={streamBandwidth} sourceJobs={sourceJobs} sourceBandwidth={sourceBandwidth} onNavigate={navigate} onStreamAction={streamAction} />}
           {page === "applications" && (
             selectedApplication
               ? <ApplicationDetailPage

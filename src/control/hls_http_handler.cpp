@@ -138,6 +138,87 @@ HlsHttpHandler::Stats HlsHttpHandler::stats() const {
     return stats_;
 }
 
+void HlsHttpHandler::record_delivery(const std::string& application, const std::string& stream, std::uint64_t bytes,
+                                     const std::string& client_ip) {
+    std::lock_guard lock(mutex_);
+    const auto it = streams_.find(application + "/" + stream);
+    if (it == streams_.end()) return;
+    it->second.bytes_total += bytes;
+    auto& ips = it->second.recent_viewer_ips;
+    ips[client_ip] = std::chrono::steady_clock::now();
+    if (ips.size() > kMaxTrackedViewerIps) {
+        const auto cutoff = std::chrono::steady_clock::now() - kViewerWindow;
+        for (auto iter = ips.begin(); iter != ips.end();) {
+            if (iter->second < cutoff) {
+                iter = ips.erase(iter);
+            } else {
+                ++iter;
+            }
+        }
+    }
+}
+
+HlsHttpHandler::LinkStats HlsHttpHandler::link_stats(const std::string& application, const std::string& stream) {
+    std::lock_guard lock(mutex_);
+    const auto it = streams_.find(application + "/" + stream);
+    if (it == streams_.end()) return {};
+    LinkStats result;
+    result.bytes_total = it->second.bytes_total;
+    const auto cutoff = std::chrono::steady_clock::now() - kViewerWindow;
+    auto& ips = it->second.recent_viewer_ips;
+    for (auto iter = ips.begin(); iter != ips.end();) {
+        if (iter->second < cutoff) {
+            iter = ips.erase(iter);
+        } else {
+            ++result.viewer_count;
+            ++iter;
+        }
+    }
+    return result;
+}
+
+namespace {
+// Reverses the fixed "../" + output_stream + "/index.m3u8" shape every
+// renditions-ready callback builds (apps/rtmp_server/main.cpp,
+// source_job_manager.cpp) back into the rendition's own stream key. Returns
+// empty on anything that doesn't match, which simply drops that rendition
+// from the aggregate rather than miscounting it.
+std::string rendition_stream_from_uri(const std::string& uri) {
+    constexpr std::string_view kPrefix = "../";
+    constexpr std::string_view kSuffix = "/index.m3u8";
+    if (uri.size() <= kPrefix.size() + kSuffix.size()) return {};
+    if (uri.compare(0, kPrefix.size(), kPrefix) != 0) return {};
+    if (uri.compare(uri.size() - kSuffix.size(), kSuffix.size(), kSuffix) != 0) return {};
+    return uri.substr(kPrefix.size(), uri.size() - kPrefix.size() - kSuffix.size());
+}
+} // namespace
+
+HlsHttpHandler::LinkStats HlsHttpHandler::aggregate_link_stats(const std::string& application,
+                                                               const std::string& master_stream) {
+    std::vector<std::string> rendition_streams;
+    {
+        std::lock_guard lock(mutex_);
+        const auto it = streams_.find(application + "/" + master_stream);
+        if (it == streams_.end()) return {};
+        for (const auto& rendition : it->second.renditions) {
+            auto name = rendition_stream_from_uri(rendition.uri);
+            if (!name.empty()) rendition_streams.push_back(std::move(name));
+        }
+    }
+    if (rendition_streams.empty()) return link_stats(application, master_stream);
+
+    LinkStats aggregate;
+    for (const auto& stream : rendition_streams) {
+        // Summed, not deduplicated, across renditions: a viewer switching
+        // ABR quality mid-session can be double-counted for up to
+        // kViewerWindow (see the LinkStats doc comment above).
+        const auto per_rendition = link_stats(application, stream);
+        aggregate.bytes_total += per_rendition.bytes_total;
+        aggregate.viewer_count += per_rendition.viewer_count;
+    }
+    return aggregate;
+}
+
 bool HlsHttpHandler::authorized(const HttpRequest& request, const std::string& application,
                                 const std::string& stream) const {
     if (!options_.require_playback_token) return true;
@@ -343,6 +424,7 @@ HttpResponse HlsHttpHandler::handle(const HttpRequest& request) {
     }
 
     HttpResponse response;
+    bool countable = false;
     if (resource == "master.m3u8") {
         {
             std::lock_guard lock(mutex_);
@@ -355,16 +437,26 @@ HttpResponse HlsHttpHandler::handle(const HttpRequest& request) {
             stats_.playlist_requests += 1;
         }
         response = serve_media_playlist(request, entry, application, stream);
+        countable = true;
     } else if (ends_with(resource, ".ts")) {
         {
             std::lock_guard lock(mutex_);
             stats_.segment_requests += 1;
         }
         response = serve_segment(request, entry, resource);
+        countable = true;
     } else {
         std::lock_guard lock(mutex_);
         stats_.not_found += 1;
         return plain(404, "not found");
+    }
+
+    // Media-playlist and segment requests are the recurring "still watching"
+    // signal (a player refetches one or the other every segment duration);
+    // master.m3u8 is fetched once at session start and would undercount a
+    // long-running viewer, so it deliberately isn't counted here.
+    if (countable && (response.status == 200 || response.status == 206)) {
+        record_delivery(application, stream, response.payload_size(), request.client_ip);
     }
 
     // HEAD must carry identical headers but no body (RFC 9110). Content-Length

@@ -480,7 +480,7 @@ int main(int argc, char** argv) {
     rtmp_server::transcoding::native::SourceJobManager source_job_manager(std::move(source_hooks),
                                                                           "/hls");
 
-    const auto source_job_json = [](const rtmp_server::transcoding::native::SourceJobSnapshot& job) {
+    const auto source_job_json = [&hls_handler](const rtmp_server::transcoding::native::SourceJobSnapshot& job) {
         auto esc = [](std::string_view v) {
             std::string out;
             for (char c : v) {
@@ -489,13 +489,20 @@ int main(int argc, char** argv) {
             }
             return out;
         };
+        // Source-transcode renditions never register with LiveFanout/StreamManager
+        // (no RTMP subscriber exists for a pull-based job's own output), so this
+        // is the only place live bandwidth/viewer numbers for the job exist —
+        // derived from actual HLS playlist/segment request traffic, summed
+        // across every rendition (see HlsHttpHandler::aggregate_link_stats).
+        const auto link_stats = hls_handler.aggregate_link_stats(job.application, job.name);
         std::ostringstream os;
         os << R"({"id":")" << esc(job.application + ":" + job.name) << R"(","application":")"
            << esc(job.application) << R"(","name":")" << esc(job.name) << R"(","source_url":")"
            << esc(job.source_url) << R"(","template_name":")" << esc(job.template_name)
            << R"(","master_hls_path":")" << esc(job.master_hls_path) << R"(","status":")"
            << esc(job.status) << R"(","detail":")" << esc(job.detail) << R"(","enabled":)"
-           << (job.enabled ? "true" : "false") << R"(,"outputs":[)";
+           << (job.enabled ? "true" : "false") << R"(,"bytes_total":)" << link_stats.bytes_total
+           << R"(,"viewer_count":)" << link_stats.viewer_count << R"(,"outputs":[)";
         for (std::size_t i = 0; i < job.renditions.size(); ++i) {
             const auto& r = job.renditions[i];
             if (i) os << ',';

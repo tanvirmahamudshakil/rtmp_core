@@ -52,6 +52,16 @@ export type SourceTranscodeJob = {
   status: "starting" | "running" | "error" | "stopped" | "disabled";
   detail?: string;
   enabled: boolean;
+  // Live delivery stats derived server-side from actual HLS playlist/segment
+  // request traffic, summed across every rendition (see
+  // HlsHttpHandler::aggregate_link_stats in the backend) — the only signal
+  // available for a source-transcode job, since its renditions never
+  // register with the RTMP viewer-tracking path. bytes_total is cumulative;
+  // the caller derives a bitrate from the delta between two polls, same as
+  // Stream.egress_bytes_total. viewer_count is already a live estimate
+  // (distinct client IPs seen in the last ~20s), not cumulative.
+  bytes_total?: number;
+  viewer_count?: number;
 };
 
 // A transcoding template as persisted server-side (SQLite): a name plus its

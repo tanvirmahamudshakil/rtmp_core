@@ -1,5 +1,7 @@
 #pragma once
 
+#include <chrono>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -105,11 +107,58 @@ public:
     };
     [[nodiscard]] Stats stats() const;
 
+    // Live per-link delivery stats derived from actual HLS playlist/segment
+    // requests — the only signal available for a source-transcode job's
+    // rendition outputs, which never pass through LiveFanout (no RTMP
+    // subscriber exists for a pure HLS puller/consumer). See docs/hls.md.
+    struct LinkStats {
+        std::uint64_t bytes_total = 0;
+        // Distinct client IPs that fetched a media playlist or segment for
+        // this exact stream key within the last kViewerWindow. This is a
+        // liveness estimate, not an exact concurrent-viewer count: a viewer
+        // idle longer than the window drops off, and a viewer behind a
+        // shared/rotating IP may be undercounted or overcounted.
+        std::size_t viewer_count = 0;
+    };
+    // Stats for exactly one registered stream key (one rendition, or a plain
+    // stream's own HLS delivery).
+    [[nodiscard]] LinkStats link_stats(const std::string& application, const std::string& stream);
+    // Stats for a master/job name, summed across every rendition it
+    // advertises (parsed from each Rendition::uri, always built as
+    // "../" + output_stream + "/index.m3u8" by every renditions-ready
+    // callback — see apps/rtmp_server/main.cpp and
+    // src/transcoding/native/source_job_manager.cpp). A viewer switching
+    // rendition mid-session can be transiently double-counted for up to
+    // kViewerWindow; falls back to the entry's own stats when it advertises
+    // no renditions (a plain, non-ABR stream).
+    [[nodiscard]] LinkStats aggregate_link_stats(const std::string& application, const std::string& master_stream);
+
 private:
+    // A client is still considered "watching" if it fetched a media playlist
+    // or segment within this window. Set well above a typical segment
+    // duration (2-8s here, see SegmenterConfig) so normal playlist refresh
+    // cadence never drops a still-connected viewer, but short enough that a
+    // closed player disappears from the count promptly.
+    static constexpr std::chrono::seconds kViewerWindow{20};
+    // Hard cap on tracked IPs per stream key, swept opportunistically once
+    // exceeded. Bounds memory even if a stream is hit by a huge number of
+    // distinct, non-returning IPs (e.g. an unauthenticated segment scrape).
+    static constexpr std::size_t kMaxTrackedViewerIps = 20000;
+
     struct StreamEntry {
         std::shared_ptr<hls::SegmentStore> store;
         std::vector<hls::Rendition> renditions;
+        // Both guarded by mutex_, same lock already taken per-request for
+        // stats_ below — piggybacking avoids adding new contention.
+        std::uint64_t bytes_total = 0;
+        std::unordered_map<std::string, std::chrono::steady_clock::time_point> recent_viewer_ips;
     };
+
+    // Records one successful delivery for `application/stream` — called for
+    // every 2xx/206 media-playlist or segment response. No-op if the stream
+    // was unregistered between building the response and this call.
+    void record_delivery(const std::string& application, const std::string& stream, std::uint64_t bytes,
+                         const std::string& client_ip);
 
     [[nodiscard]] bool authorized(const HttpRequest& request, const std::string& application,
                                   const std::string& stream) const;

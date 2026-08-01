@@ -441,3 +441,105 @@ TEST(HlsHttpTest, ManyConcurrentViewersFetchPlaylistsAndSegmentsSafely) {
     EXPECT_EQ(bad_responses.load(), 0u);
     EXPECT_GT(ok_responses.load(), 0u);
 }
+
+// --- Live delivery stats (per-stream bandwidth/viewer tracking) -----------
+
+TEST(HlsHttpTest, LinkStatsAccumulateBytesAndDedupeViewersByIp) {
+    HlsHttpHandler handler{HlsHttpOptions{}};
+    handler.register_stream("live", "demo", populated_store());
+
+    auto request_a = get("/hls/live/demo/index.m3u8");
+    request_a.client_ip = "10.0.0.1";
+    auto first = handler.handle(request_a);
+    ASSERT_EQ(first.status, 200);
+    const auto first_bytes = first.payload_size();
+
+    auto request_a_again = request_a; // same client, a second poll
+    auto second = handler.handle(request_a_again);
+    ASSERT_EQ(second.status, 200);
+
+    auto request_b = get("/hls/live/demo/index.m3u8");
+    request_b.client_ip = "10.0.0.2";
+    auto third = handler.handle(request_b);
+    ASSERT_EQ(third.status, 200);
+
+    const auto stats = handler.link_stats("live", "demo");
+    EXPECT_EQ(stats.bytes_total, first_bytes + second.payload_size() + third.payload_size());
+    EXPECT_EQ(stats.viewer_count, 2u); // 10.0.0.1 deduped across its two requests, plus 10.0.0.2
+}
+
+TEST(HlsHttpTest, SegmentDeliveryAlsoCountsTowardsLinkStats) {
+    HlsHttpHandler handler{HlsHttpOptions{}};
+    handler.register_stream("live", "demo", populated_store());
+
+    auto segment = handler.handle(get("/hls/live/demo/segment-0.ts"));
+    ASSERT_EQ(segment.status, 200);
+
+    const auto stats = handler.link_stats("live", "demo");
+    EXPECT_EQ(stats.bytes_total, segment.payload_size());
+    EXPECT_EQ(stats.viewer_count, 1u);
+}
+
+TEST(HlsHttpTest, MasterPlaylistRequestsDoNotCountTowardsLinkStats) {
+    HlsHttpHandler handler{HlsHttpOptions{}};
+    handler.register_stream("live", "demo", populated_store());
+    hls::Rendition rendition;
+    rendition.uri = "index.m3u8";
+    handler.set_renditions("live", "demo", {rendition});
+
+    ASSERT_EQ(handler.handle(get("/hls/live/demo/master.m3u8")).status, 200);
+
+    // A master is fetched once per session, not on a recurring cadence like a
+    // media playlist/segment, so counting it would misrepresent liveness.
+    const auto stats = handler.link_stats("live", "demo");
+    EXPECT_EQ(stats.bytes_total, 0u);
+    EXPECT_EQ(stats.viewer_count, 0u);
+}
+
+TEST(HlsHttpTest, AggregateLinkStatsSumsAcrossEveryAdvertisedRendition) {
+    HlsHttpHandler handler{HlsHttpOptions{}};
+    handler.register_stream("live", "job-720p", populated_store());
+    handler.register_stream("live", "job-480p", populated_store());
+
+    // Matches the fixed "../" + output_stream + "/index.m3u8" shape every
+    // renditions-ready callback builds (see source_job_manager.cpp / main.cpp).
+    hls::Rendition high;
+    high.uri = "../job-720p/index.m3u8";
+    hls::Rendition low;
+    low.uri = "../job-480p/index.m3u8";
+    handler.set_renditions("live", "job", {high, low});
+
+    auto request_720p = get("/hls/live/job-720p/index.m3u8");
+    request_720p.client_ip = "10.0.0.1";
+    auto response_720p = handler.handle(request_720p);
+    ASSERT_EQ(response_720p.status, 200);
+
+    auto request_480p = get("/hls/live/job-480p/index.m3u8");
+    request_480p.client_ip = "10.0.0.2";
+    auto response_480p = handler.handle(request_480p);
+    ASSERT_EQ(response_480p.status, 200);
+
+    const auto aggregate = handler.aggregate_link_stats("live", "job");
+    EXPECT_EQ(aggregate.bytes_total, response_720p.payload_size() + response_480p.payload_size());
+    EXPECT_EQ(aggregate.viewer_count, 2u);
+
+    // The job's own pseudo-stream key never registered a store/segments, so
+    // querying it directly (not through the aggregate) sees nothing.
+    EXPECT_EQ(handler.link_stats("live", "job").bytes_total, 0u);
+}
+
+TEST(HlsHttpTest, AggregateLinkStatsFallsBackToOwnStatsWithoutParseableRenditions) {
+    HlsHttpHandler handler{HlsHttpOptions{}};
+    handler.register_stream("live", "demo", populated_store());
+    // A plain passthrough stream's own rendition points at itself, not at
+    // "../other-stream/index.m3u8" — no separate rendition stream to sum.
+    hls::Rendition rendition;
+    rendition.uri = "index.m3u8";
+    handler.set_renditions("live", "demo", {rendition});
+
+    ASSERT_EQ(handler.handle(get("/hls/live/demo/index.m3u8")).status, 200);
+
+    const auto aggregate = handler.aggregate_link_stats("live", "demo");
+    EXPECT_GT(aggregate.bytes_total, 0u);
+    EXPECT_EQ(aggregate.viewer_count, 1u);
+}
