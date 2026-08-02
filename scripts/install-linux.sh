@@ -348,14 +348,15 @@ DETECTED_CLANG_MAJOR="$("${CLANG_BIN}" --version | sed -n 's/.*version \([0-9]\+
 log "Using ${CLANG_BIN} (clang ${DETECTED_CLANG_MAJOR})"
 
 # In-process FFmpeg-free transcoding pipeline + source-transcode jobs
-# (docs/native-transcoding.md): openh264 (H.264 decode/encode), x265 (HEVC),
-# libfdk-aac (AAC), libyuv (scale), libcurl (HLS source pull). Installed by
-# default so every feature works out of the box; set RTMP_ENABLE_NATIVE_TRANSCODE=0
-# to build the leaner FFmpeg-supervisor-only origin instead.
+# (docs/native-transcoding.md): openh264 (H.264 decode), x265 (HEVC encode),
+# x264 (H.264 encode), libfdk-aac (AAC), libyuv (scale), libcurl (HLS source
+# pull). Installed by default so every feature works out of the box; set
+# RTMP_ENABLE_NATIVE_TRANSCODE=0 to build the leaner FFmpeg-supervisor-only
+# origin instead.
 NATIVE_TRANSCODE="${RTMP_ENABLE_NATIVE_TRANSCODE:-1}"
 if [[ "${NATIVE_TRANSCODE}" == "1" ]]; then
   apt-get install -y --no-install-recommends "${APT_REINSTALL_ARGS[@]}" \
-    libx265-dev libopenh264-dev libfdk-aac-dev libcurl4-openssl-dev libyuv-dev
+    libx265-dev libx264-dev libopenh264-dev libfdk-aac-dev libcurl4-openssl-dev libyuv-dev
 fi
 
 if ! apt-cache show caddy >/dev/null 2>&1; then

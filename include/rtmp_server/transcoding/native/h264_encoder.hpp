@@ -11,14 +11,17 @@
 namespace rtmp_server::transcoding::native {
 
 // Low-latency H.264 encoder configuration. Defaults target real-time delivery:
-// openh264's CAMERA_VIDEO_REAL_TIME usage, low complexity, no B-frames (openh264
-// has none, so there is zero reorder delay) and single-slice output, so a frame
-// goes in and an access unit comes out with sub-frame latency.
+// libx264's "veryfast"/"zerolatency" preset/tune, zero B-frames (zero reorder
+// delay) and slice-based (not frame-based) multithreading, so a frame goes in
+// and an access unit comes out with sub-frame latency — no lookahead buffering.
 struct H264EncoderConfig {
     std::uint32_t width = 1280;
     std::uint32_t height = 720;
     std::uint32_t fps = 30;
-    std::uint32_t bitrate = 2'500'000; // bits/sec
+    // Bits/sec. Acts as the VBV ceiling (maxrate/bufsize), not a fixed target —
+    // see `crf` below for why this yields the same quality at a lower actual
+    // bitrate than strict CBR.
+    std::uint32_t bitrate = 2'500'000;
     std::uint32_t gop = 60;            // intra period in frames (segment alignment)
     std::uint32_t threads = 1;         // encoder worker threads (per rendition)
     // Allow the encoder to skip frames to hold the target bitrate under load —
@@ -26,6 +29,12 @@ struct H264EncoderConfig {
     bool allow_frame_skip = true;
     // 0 = baseline (widest device support), 1 = main, 2 = high.
     int profile = 2;
+    // Constant Rate Factor: the quality anchor (lower = better quality/more
+    // bits). x264 spends only as many bits as the scene needs, up to the `bitrate`
+    // VBV cap above, instead of always spending the full target like strict CBR
+    // did under the previous openh264 backend. 23 is a visually-transparent-ish
+    // default for live at 720p-1080p.
+    double crf = 23.0;
 };
 
 // Builds a low-latency H264EncoderConfig from a transcoding preset at the given
@@ -34,10 +43,11 @@ struct H264EncoderConfig {
                                                   std::uint32_t fps, std::uint32_t bitrate,
                                                   std::uint32_t gop, std::uint32_t threads);
 
-// Wraps an openh264 encoder emitting Annex B access units. openh264 encodes as
-// well as decodes, so choosing H.264 output keeps the whole pipeline
-// FFmpeg-free and lets the existing H.264/AAC segmenter package the result
-// unchanged.
+// Wraps a libx264 encoder emitting Annex B access units. Decode still runs on
+// openh264 (see H264Decoder); only the encode side is libx264 so this keeps
+// the whole pipeline FFmpeg-process-free while gaining CABAC and x264's
+// rate-distortion optimisation, which openh264 (CAVLC-only) cannot match at
+// the same bitrate.
 class H264Encoder {
 public:
     H264Encoder();

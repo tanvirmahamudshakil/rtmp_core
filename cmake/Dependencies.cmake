@@ -48,17 +48,19 @@ if(NOT RTMP_SERVER_CORE_ONLY AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
 endif()
 
 # Optional native CPU H.264 -> HEVC transcoding pipeline (openh264 decode,
-# libyuv scale, x265 encode). Off by default so a stock build needs none of
-# these libraries; the pure geometry/parameter logic still compiles and is
-# tested regardless. Enable with -DRTMP_ENABLE_NATIVE_TRANSCODE=ON after
-# installing the dev packages (see docs/native-transcoding.md).
+# libyuv scale, x265 encode) plus the H.264 source-transcode encode path
+# (openh264 decode, libx264 encode). Off by default so a stock build needs
+# none of these libraries; the pure geometry/parameter logic still compiles
+# and is tested regardless. Enable with -DRTMP_ENABLE_NATIVE_TRANSCODE=ON
+# after installing the dev packages (see docs/native-transcoding.md).
 option(RTMP_ENABLE_NATIVE_TRANSCODE
-    "Build the in-process x265 HEVC transcoding pipeline (needs x265, openh264, libyuv)" OFF)
+    "Build the in-process native transcoding pipelines (needs x265, x264, openh264, libyuv)" OFF)
 
 set(RTMP_NATIVE_TRANSCODE_AVAILABLE OFF)
 if(RTMP_ENABLE_NATIVE_TRANSCODE)
     find_package(PkgConfig REQUIRED)
     pkg_check_modules(X265 IMPORTED_TARGET x265)
+    pkg_check_modules(X264 IMPORTED_TARGET x264)
     pkg_check_modules(OPENH264 IMPORTED_TARGET openh264)
     pkg_check_modules(FDKAAC IMPORTED_TARGET fdk-aac)
     pkg_check_modules(LIBCURL IMPORTED_TARGET libcurl)
@@ -79,13 +81,13 @@ if(RTMP_ENABLE_NATIVE_TRANSCODE)
         set(RTMP_LIBYUV_TARGET PkgConfig::LIBYUV)
     endif()
 
-    if(X265_FOUND AND OPENH264_FOUND AND FDKAAC_FOUND AND LIBCURL_FOUND AND RTMP_LIBYUV_TARGET)
+    if(X265_FOUND AND X264_FOUND AND OPENH264_FOUND AND FDKAAC_FOUND AND LIBCURL_FOUND AND RTMP_LIBYUV_TARGET)
         set(RTMP_NATIVE_TRANSCODE_AVAILABLE ON)
     else()
         message(FATAL_ERROR
             "RTMP_ENABLE_NATIVE_TRANSCODE=ON but dependencies are missing "
-            "(x265=${X265_FOUND} openh264=${OPENH264_FOUND} fdk-aac=${FDKAAC_FOUND} "
+            "(x265=${X265_FOUND} x264=${X264_FOUND} openh264=${OPENH264_FOUND} fdk-aac=${FDKAAC_FOUND} "
             "libcurl=${LIBCURL_FOUND} libyuv=${LIBYUV_FOUND}). Install them, e.g. on Ubuntu: "
-            "sudo apt-get install libx265-dev libopenh264-dev libfdk-aac-dev libcurl4-openssl-dev libyuv-dev")
+            "sudo apt-get install libx265-dev libx264-dev libopenh264-dev libfdk-aac-dev libcurl4-openssl-dev libyuv-dev")
     endif()
 endif()
