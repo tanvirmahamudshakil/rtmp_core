@@ -14,14 +14,14 @@ submission_batch_size: 64
 # below); set explicitly to pin the worker count instead.
 worker_ring_count: 0
 max_worker_ring_count: 64
-worker_cpu_pinning_enabled: false
+worker_cpu_pinning_enabled: true
 
 enable_multishot_accept: true
 enable_multishot_recv: true
 enable_registered_buffers: true
 enable_provided_buffer_ring: true
 enable_send_zero_copy: true
-enable_sqpoll: false
+enable_sqpoll: true
 sqpoll_idle_ms: 1000
 
 registered_buffer_count: 1024
@@ -29,10 +29,10 @@ registered_buffer_size: 65536
 provided_buffer_count: 4096
 provided_buffer_size: 65536
 
-maximum_connections: 10000
-maximum_connections_per_ip: 50
+maximum_connections: 2000000
+maximum_connections_per_ip: 2000000
 maximum_publishers: 1000
-maximum_viewers_per_stream: 5000
+maximum_viewers_per_stream: 2000000
 
 input_chunk_size: 128
 output_chunk_size: 4096
