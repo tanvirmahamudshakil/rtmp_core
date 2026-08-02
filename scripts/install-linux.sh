@@ -157,6 +157,8 @@ remove_managed_path() {
     /usr/local/sbin/rtmp-network-tune | \
     /root/streamforge-credentials.txt | \
     /etc/caddy/Caddyfile | \
+    /etc/varnish/streamforge.vcl | \
+    /etc/systemd/system/varnish.service.d | \
     /usr/local/bin/rtmp-server*)
       ;;
     *)
@@ -231,6 +233,13 @@ clean_previous_install() {
     stop_and_disable_unit caddy.service
   fi
 
+  local varnish_config_is_streamforge=0
+  if [[ -r /etc/varnish/streamforge.vcl ]] &&
+     grep -q 'Managed by StreamForge install-linux.sh' /etc/varnish/streamforge.vcl; then
+    varnish_config_is_streamforge=1
+    stop_and_disable_unit varnish.service
+  fi
+
   if [[ "${old_interface}" =~ ^[A-Za-z0-9_.:-]+$ ]] &&
      command -v ip >/dev/null 2>&1 &&
      command -v tc >/dev/null 2>&1 &&
@@ -267,6 +276,11 @@ clean_previous_install() {
     remove_managed_path /etc/caddy/Caddyfile
   fi
 
+  if [[ "${varnish_config_is_streamforge}" == "1" ]]; then
+    remove_managed_path /etc/varnish/streamforge.vcl
+    remove_managed_path /etc/systemd/system/varnish.service.d
+  fi
+
   while IFS= read -r -d '' target; do
     remove_managed_path "${target}"
   done < <(
@@ -281,7 +295,7 @@ clean_previous_install() {
   fi
 
   systemctl daemon-reload
-  systemctl reset-failed rtmp-server.service rtmp-network-tune.service >/dev/null 2>&1 || true
+  systemctl reset-failed rtmp-server.service rtmp-network-tune.service varnish.service >/dev/null 2>&1 || true
   log "Previous StreamForge installation cleanup complete"
 }
 
@@ -309,7 +323,7 @@ apt-get update
 apt-get install -y --no-install-recommends "${APT_REINSTALL_ARGS[@]}" \
   build-essential cmake ninja-build pkg-config git ca-certificates curl gnupg \
   liburing-dev liburing2 libssl-dev libsqlite3-dev libsqlite3-0 sqlite3 \
-  ffmpeg iproute2 ethtool kmod
+  ffmpeg iproute2 ethtool kmod varnish
 
 # The distribution's default "clang" meta-package tracks whatever major
 # version that release shipped with — fine on 24.04 (clang-18) but not
@@ -811,6 +825,65 @@ else
   fi
 fi
 
+log "Configuring Varnish HLS segment cache"
+# Varnish sits between Caddy and the origin (127.0.0.1:8080) for /hls/*
+# traffic only, caching immutable .ts segments in RAM so repeat viewer
+# requests never reach the origin process. Playlists (.m3u8) change every
+# few seconds, so they are always passed straight through, never cached.
+# Bound to loopback only: never exposed directly to the internet.
+MEM_TOTAL_KB="$(awk '/^MemTotal:/ { print $2 }' /proc/meminfo)"
+[[ "${MEM_TOTAL_KB}" =~ ^[0-9]+$ ]] || die "Could not determine total system memory."
+VARNISH_CACHE_MB=$(( MEM_TOTAL_KB / 1024 / 4 ))
+if (( VARNISH_CACHE_MB < 256 )); then VARNISH_CACHE_MB=256; fi
+if (( VARNISH_CACHE_MB > 4096 )); then VARNISH_CACHE_MB=4096; fi
+
+cat > /etc/varnish/streamforge.vcl <<'EOF'
+# Managed by StreamForge install-linux.sh
+vcl 4.1;
+
+backend default {
+    .host = "127.0.0.1";
+    .port = "8080";
+}
+
+sub vcl_recv {
+    if (req.method != "GET" && req.method != "HEAD") {
+        return (pass);
+    }
+    # Playlists are near-live and must never be served stale.
+    if (req.url ~ "\.m3u8(\?.*)?$") {
+        return (pass);
+    }
+    return (hash);
+}
+
+sub vcl_backend_response {
+    if (bereq.url ~ "\.ts(\?.*)?$") {
+        set beresp.ttl = 1h;
+        set beresp.grace = 1h;
+    } else {
+        set beresp.ttl = 0s;
+        set beresp.uncacheable = true;
+    }
+    return (deliver);
+}
+
+sub vcl_deliver {
+    unset resp.http.X-Varnish;
+    unset resp.http.Via;
+    unset resp.http.Server;
+}
+EOF
+chown root:root /etc/varnish/streamforge.vcl
+chmod 0644 /etc/varnish/streamforge.vcl
+
+install -d -m 0755 /etc/systemd/system/varnish.service.d
+cat > /etc/systemd/system/varnish.service.d/streamforge.conf <<EOF
+[Service]
+ExecStart=
+ExecStart=/usr/sbin/varnishd -a 127.0.0.1:6081 -T localhost:6082 -f /etc/varnish/streamforge.vcl -S /etc/varnish/secret -s malloc,${VARNISH_CACHE_MB}m
+EOF
+
 log "Configuring Caddy admin endpoint"
 if [[ -n "${DOMAIN}" ]]; then
   CADDY_SITE="${DOMAIN}"
@@ -830,7 +903,7 @@ ${CADDY_SITE} {
 
     @hls path /hls/*
     handle @hls {
-        reverse_proxy 127.0.0.1:8080
+        reverse_proxy 127.0.0.1:6081
     }
 
     handle {
@@ -865,10 +938,38 @@ systemctl daemon-reload
 if [[ "${ENABLE_FAIR_QUEUE}" == "1" ]]; then
   systemctl restart rtmp-network-tune.service
 fi
-systemctl enable --now caddy.service >/dev/null
-systemctl restart caddy.service
 systemctl enable rtmp-server.service >/dev/null
 systemctl restart rtmp-server.service
+
+log "Waiting for the origin readiness check before starting the cache layer"
+ORIGIN_READY=0
+for _ in $(seq 1 30); do
+  if curl -fsS http://127.0.0.1:8080/health/ready >/dev/null; then
+    ORIGIN_READY=1
+    break
+  fi
+  sleep 1
+done
+if [[ "${ORIGIN_READY}" != "1" ]]; then
+  journalctl -u rtmp-server.service -n 80 --no-pager >&2 || true
+  die "The origin did not become ready. Review the journal output above."
+fi
+
+systemctl enable --now varnish.service >/dev/null
+systemctl restart varnish.service
+VARNISH_READY=0
+for _ in $(seq 1 15); do
+  if curl -fsS -o /dev/null http://127.0.0.1:6081/hls/ 2>/dev/null || \
+     systemctl is-active --quiet varnish.service; then
+    VARNISH_READY=1
+    break
+  fi
+  sleep 1
+done
+[[ "${VARNISH_READY}" == "1" ]] || die "Varnish did not start; check 'journalctl -u varnish.service'."
+
+systemctl enable --now caddy.service >/dev/null
+systemctl restart caddy.service
 
 log "Waiting for the management readiness check"
 READY=0
@@ -883,6 +984,8 @@ if [[ "${READY}" != "1" ]]; then
   journalctl -u rtmp-server.service -n 80 --no-pager >&2 || true
   die "The service did not become ready. Review the journal output above."
 fi
+systemctl is-active --quiet caddy.service ||
+  { journalctl -u caddy.service -n 40 --no-pager >&2 || true; die "caddy.service is not active."; }
 
 ADMIN_URL="http://${PRIMARY_IP}"
 if [[ -n "${DOMAIN}" ]]; then ADMIN_URL="https://${DOMAIN}"; fi
@@ -896,6 +999,7 @@ printf '  Install mode:     %s\n' "$(if [[ "${FRESH_INSTALL}" == "1" ]]; then pr
 printf '  Network device:   %s\n' "${PRIMARY_INTERFACE}"
 printf '  Link bandwidth:   %s Mbps — %s\n' "${BANDWIDTH_MBIT}" "${BANDWIDTH_SOURCE}"
 printf '  Media workers:    %s\n' "${WORKERS}"
+printf '  HLS segment cache: Varnish, %s MB RAM, 127.0.0.1:6081 (.ts cached 1h, .m3u8 never cached)\n' "${VARNISH_CACHE_MB}"
 if [[ "${BITRATE_MODE}" == "auto" ]]; then
   printf '  Bitrate source:   OBS/transcoder traffic, measured after publishing starts\n'
   printf '  Safety ceiling:   %s viewers (resources sized at %s Mbps; media is not altered)\n' \
