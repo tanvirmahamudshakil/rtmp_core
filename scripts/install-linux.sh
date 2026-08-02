@@ -857,10 +857,25 @@ sub vcl_recv {
     return (hash);
 }
 
+sub vcl_backend_fetch {
+    # Always fetch the whole segment from the origin, never a client's partial
+    # range: caching a 206 as if it were the full object would let one
+    # viewer's arbitrary seek range get served to every other viewer.
+    # Varnish serves byte ranges to clients itself from the full cached copy.
+    unset bereq.http.Range;
+}
+
 sub vcl_backend_response {
     if (bereq.url ~ "\.ts(\?.*)?$") {
-        set beresp.ttl = 1h;
-        set beresp.grace = 1h;
+        if (beresp.status == 200) {
+            set beresp.ttl = 1h;
+            set beresp.grace = 1h;
+        } else {
+            # Anything but a clean 200 (404, 5xx) must not be cached and
+            # poison every viewer behind it.
+            set beresp.ttl = 0s;
+            set beresp.uncacheable = true;
+        }
     } else {
         set beresp.ttl = 0s;
         set beresp.uncacheable = true;
