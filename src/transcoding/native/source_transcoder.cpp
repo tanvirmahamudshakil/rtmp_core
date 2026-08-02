@@ -1,6 +1,7 @@
 #include "rtmp_server/transcoding/native/source_transcoder.hpp"
 
 #include <algorithm>
+#include <numeric>
 #include <thread>
 
 #include "rtmp_server/core/error.hpp"
@@ -41,12 +42,37 @@ core::Result<void> SourceTranscoder::start() {
         rendition->spec = spec;
         renditions_.push_back(std::move(rendition));
     }
-    // One thread per extra rendition is enough to spread the fan-out; beyond
-    // hardware_concurrency() more workers would only add contention, and a
-    // single rendition needs no pool at all (parallel_for runs it inline).
+    // Budget the available cores across renditions. Every rendition gets one
+    // encoder thread; spare cores go to the largest frames first. A 1080p
+    // rendition otherwise becomes a single-thread barrier that makes every
+    // smaller output wait and lets a live input build unbounded latency.
     const auto hardware = std::thread::hardware_concurrency();
+    const std::size_t core_budget = static_cast<std::size_t>(hardware > 0 ? hardware : 1);
+    if (core_budget > renditions_.size()) {
+        std::vector<std::size_t> order(renditions_.size());
+        std::iota(order.begin(), order.end(), 0);
+        std::stable_sort(order.begin(), order.end(), [&](std::size_t left, std::size_t right) {
+            const auto& a = renditions_[left]->spec;
+            const auto& b = renditions_[right]->spec;
+            return static_cast<std::uint64_t>(a.width) * a.height >
+                   static_cast<std::uint64_t>(b.width) * b.height;
+        });
+        std::size_t spare = core_budget - renditions_.size();
+        std::size_t cursor = 0;
+        while (spare-- > 0) {
+            auto& threads = renditions_[order[cursor]]->video_threads;
+            // Four slices is the practical OpenH264 ceiling for the small
+            // resolutions in an ABR ladder; asking for more makes OpenH264
+            // silently rewrite the slice count and adds scheduling overhead.
+            if (threads < 4) ++threads;
+            cursor = (cursor + 1) % order.size();
+        }
+    }
+
+    // Fan separate renditions out in parallel. Internal encoder threads use
+    // only the spare part of the same core budget calculated above.
     const std::size_t pool_size =
-        std::min(renditions_.size(), static_cast<std::size_t>(hardware > 0 ? hardware : 1));
+        std::min(renditions_.size(), core_budget);
     if (pool_size > 1) render_pool_ = std::make_unique<core::ThreadPool>(pool_size);
     started_ = true;
     return {};
@@ -57,11 +83,13 @@ core::Result<void> SourceTranscoder::ensure_video(Rendition& rendition, std::uin
     if (rendition.video_open) return {};
     const ScalePlan plan = plan_for(rendition.spec, src_w, src_h);
     auto config = build_h264_config(plan.out_w, plan.out_h, fps_,
-                                    rendition.spec.video_bitrate, rendition.spec.gop, 1);
-    // A live rendition must retain a stable output cadence. OpenH264's
-    // bitrate-control frame skipping caused visible freezes and irregular HLS
-    // segment timestamps at low bitrates; allow quality to vary instead.
-    config.allow_frame_skip = false;
+                                    rendition.spec.video_bitrate, rendition.spec.gop,
+                                    rendition.video_threads);
+    // The source-rate gate now gives OpenH264 exactly the configured cadence
+    // with monotonic PTS. Frame skipping can therefore remain enabled: under
+    // bitrate/CPU pressure a timestamped dropped picture is preferable to
+    // delaying every following HLS segment.
+    config.allow_frame_skip = true;
     if (auto r = rendition.video_encoder.open(config); !r) return r.error();
     rendition.video_open = true;
     return {};

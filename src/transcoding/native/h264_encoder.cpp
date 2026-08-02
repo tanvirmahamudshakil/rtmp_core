@@ -89,8 +89,17 @@ core::Result<void> H264Encoder::open(const H264EncoderConfig& config) {
     layer.iSpatialBitrate = static_cast<int>(config.bitrate);
     layer.iMaxSpatialBitrate = static_cast<int>(config.bitrate);
     layer.uiProfileIdc = profile_for(config.profile);
-    // Single slice per frame: lowest latency, simplest Annex B output.
-    layer.sSliceArgument.uiSliceMode = SM_SINGLE_SLICE;
+    if (config.threads > 1) {
+        // OpenH264 only parallelises one spatial layer when it can distribute
+        // slices. A single slice silently leaves iMultipleThreadIdc > 1
+        // underused, which made 1080p the serial bottleneck for an otherwise
+        // parallel rendition ladder.
+        layer.sSliceArgument.uiSliceMode = SM_FIXEDSLCNUM_SLICE;
+        layer.sSliceArgument.uiSliceNum = config.threads;
+        param.bUseLoadBalancing = true;
+    } else {
+        layer.sSliceArgument.uiSliceMode = SM_SINGLE_SLICE;
+    }
 
     if (impl_->encoder->InitializeExt(&param) != 0) {
         return encode_error("failed to initialize openh264 encoder");

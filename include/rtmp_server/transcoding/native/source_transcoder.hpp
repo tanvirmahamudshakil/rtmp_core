@@ -81,6 +81,7 @@ private:
         YuvFrame scaled;
         bool video_open = false;
         bool audio_open = false;
+        std::uint32_t video_threads = 1;
         std::int64_t audio_base_pts_90k = 0;
         bool audio_base_set = false;
         std::uint64_t audio_samples = 0;
