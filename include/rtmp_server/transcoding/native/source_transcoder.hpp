@@ -100,6 +100,9 @@ private:
     AudioOutput audio_output_;
     bool started_ = false;
     bool audio_configured_ = false;
+    bool video_clock_set_ = false;
+    std::int64_t last_input_video_pts_90k_ = 0;
+    std::int64_t next_output_video_pts_90k_ = 0;
 
     // Scale+encode is CPU-bound per rendition; fanning renditions across a
     // pool (rather than looping them serially on this call's thread) is what

@@ -123,6 +123,36 @@ const builtVideoCodecs = new Set<VideoCodec>(["H.264", "H.265", "Passthrough", "
 const builtImplementations = new Set<EncodingImplementation>(["Default"]);
 const builtAudioCodecs = new Set<AudioCodec>(["AAC", "Passthrough", "Disabled"]);
 const newLocalId = () => globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+const fullAdaptiveLadderPresets = (): EncodingPreset[] => [
+  ["2160p", 3840, 2160, 12000000, 256000, "high", "4K output"],
+  ["1440p", 2560, 1440, 6000000, 192000, "high", "QHD output"],
+  ["1080p", 1920, 1080, 3000000, 160000, "high", "Full HD output"],
+  ["720p", 1280, 720, 1000000, 128000, "high", "HD output"],
+  ["540p", 960, 540, 750000, 96000, "main", "qHD output"],
+  ["480p", 854, 480, 500000, 96000, "main", "Mobile output"],
+  ["360p", 640, 360, 490000, 64000, "main", "Low-bandwidth output"],
+  ["240p", 426, 240, 250000, 48000, "baseline", "Very low-bandwidth output"],
+  ["144p", 256, 144, 120000, 32000, "baseline", "Minimum-bandwidth output"]
+].map(([name, frameWidth, frameHeight, videoBitrate, audioBitrate, profile, description]) => ({
+  id: newLocalId(),
+  name: String(name),
+  outgoingStreamName: String(name),
+  description: String(description),
+  videoCodec: "H.264",
+  videoBitrate: Number(videoBitrate),
+  implementation: "Default",
+  profile: profile as VideoProfile,
+  keyFrameMode: "interval",
+  keyFrameInterval: 60,
+  frameWidth: Number(frameWidth),
+  frameHeight: Number(frameHeight),
+  fitMode: "letterbox",
+  audioCodec: "AAC",
+  audioBitrate: Number(audioBitrate),
+  gpuMode: "first",
+  gpuId: null,
+  enabled: true
+}));
 const validFrameDimension = (value: unknown): value is number =>
   typeof value === "number" && Number.isInteger(value) && value >= 16 && value <= 8192 && value % 2 === 0;
 // Normalizes a preset coming back from the server (or an older admin build)
@@ -1605,6 +1635,33 @@ function TranscodePage({
       setBusy(false);
     }
   };
+  const addFullLadder = async () => {
+    if (!selectedTemplate) return;
+    const existingResolutions = new Set(
+      selectedTemplate.presets.map((preset) => `${preset.frameWidth}x${preset.frameHeight}`)
+    );
+    const additions = fullAdaptiveLadderPresets().filter(
+      (preset) => !existingResolutions.has(`${preset.frameWidth}x${preset.frameHeight}`)
+    );
+    if (additions.length === 0) {
+      onNotify("success", "The full 144p–2160p ladder is already configured.");
+      return;
+    }
+    setBusy(true);
+    try {
+      await client.putTemplate(
+        selectedTemplate.id,
+        selectedTemplate.name,
+        [...selectedTemplate.presets, ...additions]
+      );
+      await refreshTemplates();
+      onNotify("success", `${additions.length} missing ladder preset${additions.length === 1 ? "" : "s"} added.`);
+    } catch (error) {
+      onNotify("error", errorMessage(error, "Could not add the full adaptive ladder."));
+    } finally {
+      setBusy(false);
+    }
+  };
   const togglePreset = async (preset: EncodingPreset) => {
     if (!selectedTemplate) return;
     const nextPresets = selectedTemplate.presets.map((item) =>
@@ -1654,7 +1711,10 @@ function TranscodePage({
         <section className="preset-workspace">
           <div className="preset-workspace-heading">
             <div><span className="eyebrow">OUTPUT PROFILES</span><h2>Encoding Presets</h2><p>Create one preset for every outgoing stream rendition.</p></div>
-            <button className="primary-button" disabled={busy} onClick={() => setShowPresetModal(true)}><Plus size={17} /> Add Preset</button>
+            <div className="row-actions">
+              <button className="secondary-button" disabled={busy} onClick={addFullLadder}><Workflow size={17} /> Add Full Ladder</button>
+              <button className="primary-button" disabled={busy} onClick={() => setShowPresetModal(true)}><Plus size={17} /> Add Preset</button>
+            </div>
           </div>
           <div className="preset-grid">
             {selectedTemplate.presets.map((preset) => (

@@ -26,7 +26,7 @@ struct SupervisorOptions {
     std::uint16_t rtmp_port = 1935;
     std::string ffmpeg_path = "/usr/bin/ffmpeg";
     std::size_t max_active_jobs = 16;
-    std::size_t max_outputs_per_job = 8;
+    std::size_t max_outputs_per_job = 16;
     std::chrono::seconds stop_timeout{5};
     std::chrono::seconds restart_delay{2};
     std::uint32_t max_restart_attempts = 5;

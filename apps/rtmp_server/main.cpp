@@ -7,6 +7,7 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 #include "rtmp_server/authentication/rtmp_authenticator.hpp"
@@ -279,8 +280,8 @@ int main(int argc, char** argv) {
                 for (const auto& preset : presets) {
                     rtmp_server::hls::Rendition rendition;
                     rendition.uri = "../" + preset.outgoing_stream_name + "/index.m3u8";
-                    rendition.bandwidth = preset.video_bitrate + preset.audio_bitrate;
-                    rendition.average_bandwidth = rendition.bandwidth;
+                    rendition.average_bandwidth = preset.video_bitrate + preset.audio_bitrate;
+                    rendition.bandwidth = (rendition.average_bandwidth * 125 + 99) / 100;
                     rendition.codecs = "avc1.64001f,mp4a.40.2";
                     rendition.width = preset.width.value_or(0);
                     rendition.height = preset.height.value_or(0);
@@ -621,10 +622,15 @@ int main(int argc, char** argv) {
         return management_api.handle(request);
     });
     // Caddy drains these loopback responses and performs the public
-    // asynchronous client I/O. A larger bounded worker/queue budget keeps
-    // bursty segment boundaries from head-of-line blocking management calls.
+    // asynchronous client I/O. HLS players request a newly published segment
+    // in synchronized bursts, so size the blocking loopback pool from the
+    // machine rather than imposing the old fixed 16-request bottleneck.
+    const auto hardware_threads = std::max(1U, std::thread::hardware_concurrency());
+    const auto hls_http_workers =
+        std::clamp<std::size_t>(static_cast<std::size_t>(hardware_threads) * 16, 64, 256);
     rtmp_server::control::HttpServer api_server(
-        {config.api_bind_address, config.api_port, 1024, 16, 8192, 16 * 1024, 128 * 1024});
+        {config.api_bind_address, config.api_port, 65'535, hls_http_workers, 65'536,
+         16 * 1024, 128 * 1024});
     api_server.set_handler([&hls_handler](const rtmp_server::control::HttpRequest& request) {
         return hls_handler.handle(request);
     });

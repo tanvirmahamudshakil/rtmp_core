@@ -394,6 +394,44 @@ TEST(NativeSourceTranscoder, FansOneSourceOutToMultipleRenditions) {
     EXPECT_TRUE(saw_exact_letterbox_size);
 }
 
+TEST(NativeSourceTranscoder, ReducesSixtyFpsInputToConfiguredThirtyFpsWithMonotonicTimestamps) {
+    auto source_config = build_h264_config(320, 240, 60, 2'000'000, 60, 1);
+    source_config.allow_frame_skip = false;
+    H264Encoder source_encoder;
+    ASSERT_TRUE(source_encoder.open(source_config).ok());
+
+    std::vector<EncodedAccessUnit> source_aus;
+    for (int i = 0; i < 60; ++i) {
+        const YuvFrame frame = make_gradient_frame(320, 240, i * 1500, i);
+        ASSERT_TRUE(source_encoder.encode(frame, source_aus).ok());
+    }
+    ASSERT_GE(source_aus.size(), 58U);
+
+    std::vector<RenditionSpec> renditions = {
+        {"30fps", "out_30", 320, 240, 1'000'000, 30, 96'000},
+    };
+    SourceTranscoder transcoder(renditions, 30);
+    ASSERT_TRUE(transcoder.start().ok());
+
+    std::vector<std::int64_t> output_pts;
+    transcoder.set_video_output(
+        [&](std::size_t rendition, const EncodedAccessUnit& au) {
+            EXPECT_EQ(rendition, 0U);
+            output_pts.push_back(au.pts_90k);
+            EXPECT_EQ(au.dts_90k, au.pts_90k);
+        });
+
+    for (const auto& au : source_aus) {
+        ASSERT_TRUE(transcoder.on_video(au.annexb, au.pts_90k, au.dts_90k, au.keyframe).ok());
+    }
+
+    EXPECT_GE(output_pts.size(), 28U);
+    EXPECT_LE(output_pts.size(), 31U);
+    for (std::size_t i = 1; i < output_pts.size(); ++i) {
+        EXPECT_GE(output_pts[i] - output_pts[i - 1], 3000);
+    }
+}
+
 TEST(NativeSourceTranscoder, ReEncodesAudioPerRendition) {
     // Make an ADTS source with the AAC encoder, then re-encode per rendition.
     AacParamSet source_params;

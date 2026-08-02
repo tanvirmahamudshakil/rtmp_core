@@ -59,10 +59,10 @@ viewer budget = bandwidth × utilization ÷ (per-viewer bitrate × protocol over
 ```
 
 The default high-density target uses 90% link utilization and 5% overhead;
-both are configurable. The network tune uses CAKE at 95% of the declared
-uplink through 10 Gbps; above that it switches to lower-overhead Linux `fq`
-per-flow pacing so the queue discipline does not become the throughput
-bottleneck.
+both are configurable. Egress shaping is disabled by default, so a mistaken
+capacity value cannot silently cap a faster provider link. Operators may opt
+in with `RTMP_ENABLE_FAIR_QUEUE=1`; that uses CAKE at 95% of the declared
+uplink through 10 Gbps and lower-overhead Linux `fq` above it.
 
 The detected/declared bandwidth and auto-bitrate mode are written to the
 installer-owned `runtime-config.json`, so the admin dashboard loads the server

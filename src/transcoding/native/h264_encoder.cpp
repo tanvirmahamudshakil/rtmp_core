@@ -102,6 +102,9 @@ core::Result<void> H264Encoder::open(const H264EncoderConfig& config) {
     height_ = config.height;
     fps_ = config.fps;
     submitted_frames_ = 0;
+    pacing_clock_set_ = false;
+    last_media_pts_90k_ = 0;
+    pacing_timestamp_ms_ = 0;
     return {};
 }
 
@@ -122,13 +125,27 @@ core::Result<void> H264Encoder::encode(const YuvFrame& frame,
     pic.pData[0] = const_cast<std::uint8_t*>(frame.y.data());
     pic.pData[1] = const_cast<std::uint8_t*>(frame.u.data());
     pic.pData[2] = const_cast<std::uint8_t*>(frame.v.data());
-    // openh264's source-picture timestamp is a millisecond pacing clock used
-    // by rate control; it is not the output media PTS. Drive it from the
-    // configured frame cadence so a discontinuity/reconnect in the MPEG 90 kHz
-    // media timeline cannot look like a multi-minute input gap and provoke a
-    // burst of skipped frames. The original PTS is retained on the emitted AU
-    // below.
-    pic.uiTimeStamp = static_cast<long long>(submitted_frames_ * 1000ULL / fps_);
+    // OpenH264 uses this timestamp for bitrate pacing. Follow the actual media
+    // cadence: assuming every submitted source is exactly `fps_` made a 60 fps
+    // input encoded by a 30 fps job run at roughly twice the configured
+    // bitrate. Keep the pacing clock monotonic across source discontinuities
+    // instead of passing a large or backwards media timestamp directly.
+    const auto nominal_step_ms = std::max<std::int64_t>(1, 1000 / fps_);
+    if (!pacing_clock_set_) {
+        pacing_clock_set_ = true;
+        last_media_pts_90k_ = frame.pts_90k;
+        pacing_timestamp_ms_ = 0;
+    } else {
+        const auto delta_90k = frame.pts_90k - last_media_pts_90k_;
+        constexpr std::int64_t kMaximumContinuousGap90k = 10 * 90'000;
+        const auto step_ms =
+            delta_90k > 0 && delta_90k <= kMaximumContinuousGap90k
+                ? std::max<std::int64_t>(1, delta_90k / 90)
+                : nominal_step_ms;
+        pacing_timestamp_ms_ += static_cast<std::uint64_t>(step_ms);
+        last_media_pts_90k_ = frame.pts_90k;
+    }
+    pic.uiTimeStamp = static_cast<long long>(pacing_timestamp_ms_);
     ++submitted_frames_;
 
     SFrameBSInfo info{};

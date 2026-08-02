@@ -62,6 +62,9 @@ private:
     std::uint32_t height_ = 0;
     std::uint32_t fps_ = 1;
     std::uint64_t submitted_frames_ = 0;
+    bool pacing_clock_set_ = false;
+    std::int64_t last_media_pts_90k_ = 0;
+    std::uint64_t pacing_timestamp_ms_ = 0;
 };
 
 } // namespace rtmp_server::transcoding::native

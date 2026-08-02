@@ -56,8 +56,12 @@ core::Result<void> SourceTranscoder::ensure_video(Rendition& rendition, std::uin
                                                   std::uint32_t src_h) {
     if (rendition.video_open) return {};
     const ScalePlan plan = plan_for(rendition.spec, src_w, src_h);
-    const auto config = build_h264_config(plan.out_w, plan.out_h, fps_,
-                                          rendition.spec.video_bitrate, rendition.spec.gop, 1);
+    auto config = build_h264_config(plan.out_w, plan.out_h, fps_,
+                                    rendition.spec.video_bitrate, rendition.spec.gop, 1);
+    // A live rendition must retain a stable output cadence. OpenH264's
+    // bitrate-control frame skipping caused visible freezes and irregular HLS
+    // segment timestamps at low bitrates; allow quality to vary instead.
+    config.allow_frame_skip = false;
     if (auto r = rendition.video_encoder.open(config); !r) return r.error();
     rendition.video_open = true;
     return {};
@@ -72,6 +76,29 @@ core::Result<void> SourceTranscoder::on_video(std::span<const std::byte> annexb,
     if (auto r = video_decoder_.decode(annexb, pts_90k, decoded_, produced); !r) return r.error();
     if (!produced) return {};
     (void)dts_90k; // openh264 realtime output has DTS == PTS
+
+    // Source jobs have an explicit output frame rate. Decode every source
+    // frame (reference pictures are still required), but do not feed a 50/60
+    // fps source into a 30 fps encoder. Without this gate the encoder's target
+    // bitrate was consumed once per configured-frame interval while frames
+    // arrived twice as fast, doubling real egress.
+    const auto minimum_interval_90k =
+        std::max<std::int64_t>(1, 90'000 / static_cast<std::int64_t>(fps_));
+    if (video_clock_set_) {
+        const auto input_delta = decoded_.pts_90k - last_input_video_pts_90k_;
+        constexpr std::int64_t kBackwardDiscontinuity90k = 5 * 90'000;
+        if (input_delta <= 0 && input_delta > -kBackwardDiscontinuity90k) return {};
+        if (input_delta > 0 && input_delta < minimum_interval_90k) return {};
+        next_output_video_pts_90k_ += minimum_interval_90k;
+    } else {
+        video_clock_set_ = true;
+        next_output_video_pts_90k_ = decoded_.pts_90k;
+    }
+    last_input_video_pts_90k_ = decoded_.pts_90k;
+    // Output H.264 has no B-frames. Give every accepted frame an exact,
+    // monotonic output cadence so MPEG-TS DTS can never move backwards even
+    // when an upstream HLS source reconnects or resets its timestamp base.
+    decoded_.pts_90k = next_output_video_pts_90k_;
 
     // Each rendition writes only to its own Rendition (scaler/encoder/scaled
     // buffer) and its own video_output_ index, so running them concurrently

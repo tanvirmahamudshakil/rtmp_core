@@ -1,5 +1,7 @@
 #include "rtmp_server/transcoding/native/source_job_manager.hpp"
 
+#include <limits>
+
 #include "rtmp_server/core/error.hpp"
 
 namespace rtmp_server::transcoding::native {
@@ -23,6 +25,17 @@ std::string status_text(PullerStatus status) {
 
 std::string key_of(const std::string& application, const std::string& name) {
     return application + "/" + name;
+}
+
+std::uint64_t peak_hls_bandwidth(std::uint64_t average) {
+    // BANDWIDTH is peak aggregate bitrate, not just the encoder target.
+    // Reserve room for MPEG-TS/PES headers, keyframe bursts and rate-control
+    // variation so ABR clients do not select a rendition they cannot sustain.
+    constexpr std::uint64_t kPeakPercent = 125;
+    if (average > std::numeric_limits<std::uint64_t>::max() / kPeakPercent) {
+        return std::numeric_limits<std::uint64_t>::max();
+    }
+    return (average * kPeakPercent + 99) / 100;
 }
 
 } // namespace
@@ -62,7 +75,8 @@ void SourceJobManager::start_locked(Job& job) {
 
         hls::Rendition rendition;
         rendition.uri = "../" + spec.output_stream + "/index.m3u8";
-        rendition.bandwidth = spec.video_bitrate + spec.audio_bitrate;
+        rendition.average_bandwidth = spec.video_bitrate + spec.audio_bitrate;
+        rendition.bandwidth = peak_hls_bandwidth(rendition.average_bandwidth);
         rendition.width = spec.width;
         rendition.height = spec.height;
         master_renditions.push_back(std::move(rendition));

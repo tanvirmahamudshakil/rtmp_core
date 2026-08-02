@@ -104,7 +104,7 @@ struct ServerConfig {
     std::string transcoding_preset_file = "./config/transcoding.conf";
     std::string transcoding_ffmpeg_path = "/usr/bin/ffmpeg";
     std::uint32_t transcoding_max_active_jobs = 16;
-    std::uint32_t transcoding_max_outputs_per_job = 8;
+    std::uint32_t transcoding_max_outputs_per_job = 16;
     std::uint32_t transcoding_max_restart_attempts = 5;
 
     std::string token_signing_secret;

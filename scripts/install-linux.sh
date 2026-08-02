@@ -22,7 +22,8 @@
 #   RTMP_PROTOCOL_OVERHEAD_PERCENT
 #                                RTMP/TCP/IP overhead budget (default 5).
 #   RTMP_ADMIN_TOKEN             Existing admin token; generated if absent.
-#   RTMP_ENABLE_FAIR_QUEUE       1 (default) enables CAKE up to 10 Gbps and
+#   RTMP_ENABLE_FAIR_QUEUE       0 (default) leaves egress unshaped. Set 1 to
+#                                opt into CAKE at 95% up to 10 Gbps, or
 #                                high-throughput fq above it.
 #   RTMP_CONFIGURE_FIREWALL      1 (default) adds rules only if UFW is active.
 #   RTMP_CONFIGURE_DNS            1 (default) adds public resolvers (Cloudflare,
@@ -86,7 +87,7 @@ RESOURCE_SIZING_MBIT="${RTMP_RESOURCE_SIZING_MBIT:-0.50}"
 LINK_UTILIZATION_PERCENT="${RTMP_LINK_UTILIZATION_PERCENT:-90}"
 PROTOCOL_OVERHEAD_PERCENT="${RTMP_PROTOCOL_OVERHEAD_PERCENT:-5}"
 MAX_CONNECTIONS_PER_IP="${RTMP_MAX_CONNECTIONS_PER_IP:-1000}"
-ENABLE_FAIR_QUEUE="${RTMP_ENABLE_FAIR_QUEUE:-1}"
+ENABLE_FAIR_QUEUE="${RTMP_ENABLE_FAIR_QUEUE:-0}"
 CONFIGURE_FIREWALL="${RTMP_CONFIGURE_FIREWALL:-1}"
 CONFIGURE_DNS="${RTMP_CONFIGURE_DNS:-1}"
 FORCE_ROTATE="${RTMP_FORCE_ROTATE_SECRETS:-0}"
@@ -600,7 +601,7 @@ RTMP_SERVER_TRANSCODING_ENABLED=$(if [[ "${ENABLE_TRANSCODING}" == "1" ]]; then 
 RTMP_SERVER_TRANSCODING_PRESET_FILE=/etc/rtmp-server/transcoding.conf
 RTMP_SERVER_TRANSCODING_FFMPEG_PATH=/usr/bin/ffmpeg
 RTMP_SERVER_TRANSCODING_MAX_ACTIVE_JOBS=16
-RTMP_SERVER_TRANSCODING_MAX_OUTPUTS_PER_JOB=8
+RTMP_SERVER_TRANSCODING_MAX_OUTPUTS_PER_JOB=16
 RTMP_SERVER_TRANSCODING_MAX_RESTART_ATTEMPTS=5
 RTMP_SERVER_RECORDING_ENABLED=false
 RTMP_SERVER_RECORDING_DIRECTORY=/var/lib/rtmp-server/recordings
@@ -909,7 +910,7 @@ if [[ "${ENABLE_FAIR_QUEUE}" == "1" ]]; then
     printf '  Fair queue:       high-throughput fq pacing (CAKE bypassed above 10 Gbps)\n'
   fi
 else
-  printf '  Fair queue:       disabled by RTMP_ENABLE_FAIR_QUEUE=0\n'
+  printf '  Fair queue:       disabled (unshaped egress; opt in with RTMP_ENABLE_FAIR_QUEUE=1)\n'
 fi
 if [[ "${CONFIGURE_DNS}" == "1" ]]; then
   printf '  Fallback DNS:     1.1.1.1, 8.8.8.8, 9.9.9.9 (via systemd-resolved)\n'

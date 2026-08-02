@@ -61,6 +61,12 @@ core::Result<void> H264Decoder::decode(std::span<const std::byte> annexb, std::i
 
     std::uint8_t* planes[3] = {nullptr, nullptr, nullptr};
     SBufferInfo info{};
+    // OpenH264 may delay output while reordering a source that contains
+    // B-frames. Associate the input access unit's PTS with the decoded
+    // picture through the decoder instead of stamping whichever input PTS
+    // happened to produce output. The latter creates non-monotonic DTS/PTS
+    // in the transcoded MPEG-TS stream.
+    info.uiInBsTimeStamp = static_cast<unsigned long long>(pts_90k);
     const auto* data = reinterpret_cast<const unsigned char*>(annexb.data());
     const DECODING_STATE state =
         impl_->decoder->DecodeFrameNoDelay(data, static_cast<int>(annexb.size()), planes, &info);
@@ -77,7 +83,7 @@ core::Result<void> H264Decoder::decode(std::span<const std::byte> annexb, std::i
     if (width < 2 || height < 2) return decode_error("openh264 produced an invalid frame size");
 
     out.allocate(width, height);
-    out.pts_90k = pts_90k;
+    out.pts_90k = static_cast<std::int64_t>(info.uiOutYuvTimeStamp);
     const std::uint32_t chroma_w = (width + 1) / 2;
     const std::uint32_t chroma_h = (height + 1) / 2;
     copy_plane(out.y.data(), out.y_stride, planes[0], sys.iStride[0], width, height);

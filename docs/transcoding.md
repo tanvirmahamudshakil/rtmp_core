@@ -49,9 +49,21 @@ collision-free per-source rendition, for example `football/*` with
 For the `football/live2` source:
 
 ```text
-football/live2|720p|live2_720p|default|h264|2500000|high|60|1280|720|letterbox|aac|128000|first|HD output
-football/live2|480p|live2_480p|default|h264|900000|main|60|854|480|letterbox|aac|96000|first|Mobile output
+football/live2|2160p|live2_2160p|default|h264|12000000|high|60|3840|2160|letterbox|aac|256000|first|4K output
+football/live2|1440p|live2_1440p|default|h264|6000000|high|60|2560|1440|letterbox|aac|192000|first|QHD output
+football/live2|1080p|live2_1080p|default|h264|3000000|high|60|1920|1080|letterbox|aac|160000|first|Full HD output
+football/live2|720p|live2_720p|default|h264|1000000|high|60|1280|720|letterbox|aac|128000|first|HD output
+football/live2|540p|live2_540p|default|h264|750000|main|60|960|540|letterbox|aac|96000|first|qHD output
+football/live2|480p|live2_480p|default|h264|500000|main|60|854|480|letterbox|aac|96000|first|Mobile output
+football/live2|360p|live2_360p|default|h264|490000|main|60|640|360|letterbox|aac|64000|first|Low-bandwidth output
+football/live2|240p|live2_240p|default|h264|250000|baseline|60|426|240|letterbox|aac|48000|first|Very low-bandwidth output
+football/live2|144p|live2_144p|default|h264|120000|baseline|60|256|144|letterbox|aac|32000|first|Minimum-bandwidth output
 ```
+
+Only enable renditions at or below the source resolution. Upscaling consumes
+encoder capacity without creating additional image detail. The admin UI's
+**Add Full Ladder** action adds only missing fixed-resolution presets and keeps
+existing presets unchanged.
 
 After changing the file, restart the service. Rules are loaded and fully
 validated before the RTMP listener starts.
@@ -60,15 +72,29 @@ When `rtmp://HOST:1935/football/live2` starts publishing, the supervisor
 automatically creates and publishes these rendition streams:
 
 ```text
+rtmp://HOST:1935/football/live2_2160p
+rtmp://HOST:1935/football/live2_1440p
+rtmp://HOST:1935/football/live2_1080p
 rtmp://HOST:1935/football/live2_720p
+rtmp://HOST:1935/football/live2_540p
 rtmp://HOST:1935/football/live2_480p
+rtmp://HOST:1935/football/live2_360p
+rtmp://HOST:1935/football/live2_240p
+rtmp://HOST:1935/football/live2_144p
 ```
 
 Their HLS media playlists are:
 
 ```text
+http://HOST/hls/football/live2_2160p/index.m3u8
+http://HOST/hls/football/live2_1440p/index.m3u8
+http://HOST/hls/football/live2_1080p/index.m3u8
 http://HOST/hls/football/live2_720p/index.m3u8
+http://HOST/hls/football/live2_540p/index.m3u8
 http://HOST/hls/football/live2_480p/index.m3u8
+http://HOST/hls/football/live2_360p/index.m3u8
+http://HOST/hls/football/live2_240p/index.m3u8
+http://HOST/hls/football/live2_144p/index.m3u8
 ```
 
 The adaptive master playlist is:

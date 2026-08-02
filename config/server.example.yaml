@@ -65,7 +65,7 @@ transcoding_enabled: false
 transcoding_preset_file: "./config/transcoding.conf"
 transcoding_ffmpeg_path: "/usr/bin/ffmpeg"
 transcoding_max_active_jobs: 16
-transcoding_max_outputs_per_job: 8
+transcoding_max_outputs_per_job: 16
 transcoding_max_restart_attempts: 5
 
 # CHANGE THESE before production use. Never commit real secrets.
