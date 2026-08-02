@@ -256,6 +256,33 @@ TEST(NativeH264Encoder, EncodesFramesRealtimeAndEmitsKeyframe) {
     }
 }
 
+TEST(NativeH264Encoder, MultiSliceOutputRemainsDecodable) {
+    auto config = build_h264_config(640, 360, 30, 1'000'000, 15, 2);
+    config.allow_frame_skip = false;
+    H264Encoder encoder;
+    ASSERT_TRUE(encoder.open(config).ok());
+
+    H264Decoder decoder;
+    ASSERT_TRUE(decoder.initialize().ok());
+    YuvFrame decoded;
+    bool decoded_picture = false;
+    std::vector<EncodedAccessUnit> out;
+    for (int i = 0; i < 12; ++i) {
+        const YuvFrame frame = make_gradient_frame(640, 360, i * 3000, i);
+        ASSERT_TRUE(encoder.encode(frame, out).ok());
+        for (const auto& access_unit : out) {
+            bool produced = false;
+            ASSERT_TRUE(
+                decoder.decode(access_unit.annexb, access_unit.pts_90k, decoded, produced).ok());
+            decoded_picture = decoded_picture || produced;
+        }
+        out.clear();
+    }
+    EXPECT_TRUE(decoded_picture);
+    EXPECT_EQ(decoded.width, 640U);
+    EXPECT_EQ(decoded.height, 360U);
+}
+
 PcmBlock make_sine_block(std::uint32_t sample_rate, std::uint32_t channels, std::uint32_t frames,
                          double phase_start) {
     PcmBlock block;
