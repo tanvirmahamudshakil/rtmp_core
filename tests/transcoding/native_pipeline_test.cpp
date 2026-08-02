@@ -402,7 +402,11 @@ TEST(NativeSourceTranscoder, ReducesSixtyFpsInputToConfiguredThirtyFpsWithMonoto
 
     std::vector<EncodedAccessUnit> source_aus;
     for (int i = 0; i < 60; ++i) {
-        const YuvFrame frame = make_gradient_frame(320, 240, i * 1500, i);
+        // Reproduce millisecond-rounded 60 fps timestamps seen in raw MPEG-TS
+        // sources: adjacent deltas vary around 1500 ticks and two deltas can
+        // sum to 2970 rather than exactly 3000.
+        const auto pts_90k = static_cast<std::int64_t>(i * 1000 / 60) * 90;
+        const YuvFrame frame = make_gradient_frame(320, 240, pts_90k, i);
         ASSERT_TRUE(source_encoder.encode(frame, source_aus).ok());
     }
     ASSERT_GE(source_aus.size(), 58U);

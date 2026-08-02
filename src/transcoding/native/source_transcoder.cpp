@@ -82,19 +82,36 @@ core::Result<void> SourceTranscoder::on_video(std::span<const std::byte> annexb,
     // fps source into a 30 fps encoder. Without this gate the encoder's target
     // bitrate was consumed once per configured-frame interval while frames
     // arrived twice as fast, doubling real egress.
-    const auto minimum_interval_90k =
+    const auto output_interval_90k =
         std::max<std::int64_t>(1, 90'000 / static_cast<std::int64_t>(fps_));
     if (video_clock_set_) {
         const auto input_delta = decoded_.pts_90k - last_input_video_pts_90k_;
         constexpr std::int64_t kBackwardDiscontinuity90k = 5 * 90'000;
         if (input_delta <= 0 && input_delta > -kBackwardDiscontinuity90k) return {};
-        if (input_delta > 0 && input_delta < minimum_interval_90k) return {};
-        next_output_video_pts_90k_ += minimum_interval_90k;
+        last_input_video_pts_90k_ = decoded_.pts_90k;
+
+        if (input_delta <= 0 || input_delta > kBackwardDiscontinuity90k) {
+            // Start a new sampling phase after a real timestamp discontinuity,
+            // while keeping the generated output clock monotonic.
+            frame_selection_accumulator_ = 0;
+        } else {
+            // Accumulate elapsed source time instead of comparing one rounded
+            // delta with output_interval_90k. MPEG-TS sources often express
+            // 60 fps as alternating millisecond-rounded deltas (for example
+            // 1440/1530 ticks); a strict 3000-tick comparison selected every
+            // third frame and turned 60 fps into 20 fps. This phase
+            // accumulator preserves the requested average for any input FPS.
+            frame_selection_accumulator_ +=
+                input_delta * static_cast<std::int64_t>(fps_);
+            if (frame_selection_accumulator_ < static_cast<std::int64_t>(kClockHz)) return {};
+            frame_selection_accumulator_ %= static_cast<std::int64_t>(kClockHz);
+        }
+        next_output_video_pts_90k_ += output_interval_90k;
     } else {
         video_clock_set_ = true;
         next_output_video_pts_90k_ = decoded_.pts_90k;
+        last_input_video_pts_90k_ = decoded_.pts_90k;
     }
-    last_input_video_pts_90k_ = decoded_.pts_90k;
     // Output H.264 has no B-frames. Give every accepted frame an exact,
     // monotonic output cadence so MPEG-TS DTS can never move backwards even
     // when an upstream HLS source reconnects or resets its timestamp base.
