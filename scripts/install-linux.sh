@@ -896,7 +896,7 @@ install -d -m 0755 /etc/systemd/system/varnish.service.d
 cat > /etc/systemd/system/varnish.service.d/streamforge.conf <<EOF
 [Service]
 ExecStart=
-ExecStart=/usr/sbin/varnishd -a 127.0.0.1:6081 -T localhost:6082 -f /etc/varnish/streamforge.vcl -S /etc/varnish/secret -s malloc,${VARNISH_CACHE_MB}m
+ExecStart=/usr/sbin/varnishd -j unix,user=vcache -F -a 127.0.0.1:6081 -T localhost:6082 -f /etc/varnish/streamforge.vcl -S /etc/varnish/secret -s malloc,${VARNISH_CACHE_MB}m
 EOF
 
 log "Configuring Caddy admin endpoint"
