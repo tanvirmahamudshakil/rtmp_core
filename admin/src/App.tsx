@@ -500,18 +500,25 @@ function Overview({
   onNavigate: (page: Page) => void;
   onStreamAction: (stream: Stream, action: string) => void;
 }) {
-  const viewers = metric(snapshot, "active_viewers");
-  const publishers = metric(snapshot, "active_publishers");
-  const egress = metric(snapshot, "egress_bitrate");
+  const sourceViewers = sourceJobs
+    .filter((job) => job.status === "running")
+    .reduce((sum, job) => sum + (job.viewer_count ?? 0), 0);
+  const sourceEgress = Object.values(sourceBandwidth).reduce((sum, value) => sum + value, 0);
+  const viewers = metric(snapshot, "active_viewers") + sourceViewers;
+  const liveLinks = metric(snapshot, "active_publishers") +
+    sourceJobs.filter((job) => job.status === "running").length;
+  const configuredLinks = snapshot.streams.length + sourceJobs.length;
+  const activeConnections = metric(snapshot, "active_connections") + sourceViewers;
+  const egress = metric(snapshot, "egress_bitrate") + sourceEgress;
   const utilization = Math.min((egress / (bandwidth * 1e6)) * 100, 999);
   const links = buildLinkRows(snapshot.streams, sourceJobs, streamBandwidth, sourceBandwidth);
   return (
     <>
       <section className="metric-grid">
         <MetricCard icon={<Users size={20} />} label="Viewers now" value={compact(viewers)}
-          helper={`${compact(metric(snapshot, "active_connections"))} active connections`} tone="amber" history={history} />
-        <MetricCard icon={<RadioTower size={20} />} label="Live streams" value={compact(publishers)}
-          helper={`${snapshot.streams.length} streams configured`} tone="teal" />
+          helper={`${compact(activeConnections)} active HLS/RTMP clients`} tone="amber" history={history} />
+        <MetricCard icon={<RadioTower size={20} />} label="Live links" value={compact(liveLinks)}
+          helper={`${configuredLinks} playback links configured`} tone="teal" />
         <MetricCard icon={<ArrowUpRight size={20} />} label="Bandwidth out" value={bitrate(egress)}
           helper={`${utilization.toFixed(1)}% of available uplink`} tone="blue" />
         <MetricCard icon={<Cpu size={20} />} label="Server load"
@@ -1891,7 +1898,6 @@ function App() {
     try {
       const next = await activeClient.snapshot();
       setSnapshot(next);
-      setHistory((current) => [...current, metric(next, "active_viewers")].slice(-24));
 
       const now = Date.now();
       const samples = bandwidthSamplesRef.current;
@@ -1931,9 +1937,14 @@ function App() {
           samples.set(key, { bytes: job.bytes_total, time: now });
         }
         setSourceBandwidth(nextSourceBandwidth);
+        const sourceViewers = jobs
+          .filter((job) => job.status === "running")
+          .reduce((sum, job) => sum + (job.viewer_count ?? 0), 0);
+        setHistory((current) => [...current, metric(next, "active_viewers") + sourceViewers].slice(-24));
       } catch {
         // Homepage source-job row list degrades gracefully; the per-application
         // Source Transcode tab surfaces the real error when it fetches directly.
+        setHistory((current) => [...current, metric(next, "active_viewers")].slice(-24));
       }
     } catch (error) {
       if (!quiet) {
