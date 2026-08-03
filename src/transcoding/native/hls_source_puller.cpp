@@ -171,14 +171,25 @@ void HlsSourcePuller::run() {
                 [&](std::span<const std::byte> chunk) -> bool {
                     if (!running_.load()) return false;
                     received_any = true;
+                    set_detail("running");
                     static_cast<void>(demux.feed(chunk));
                     return true;
                 });
             if (!running_.load()) break;
 
-            set_detail(result ? "source connection closed; reconnecting"
+            if (received_any) {
+                // Some IPTV/CDN panels close otherwise-healthy raw TS responses
+                // every few seconds. Treat that as a normal chunk boundary and
+                // reconnect immediately; a fixed sleep here becomes visible
+                // playback lag on every reconnect.
+                consecutive_errors = 0;
+                set_detail("running");
+                continue;
+            }
+
+            set_detail(result ? "source connection closed without media; reconnecting"
                               : result.error().message());
-            consecutive_errors = received_any ? 0 : consecutive_errors + 1;
+            consecutive_errors += 1;
             if (consecutive_errors >= 5) {
                 status_.store(PullerStatus::Error);
                 break;
