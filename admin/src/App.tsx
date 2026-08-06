@@ -788,6 +788,8 @@ function ApplicationDetailPage({
   const [sourceUrl, setSourceUrl] = useState("");
   const [outputName, setOutputName] = useState("");
   const [sourceTemplateId, setSourceTemplateId] = useState("");
+  const [sourceAutoRestart, setSourceAutoRestart] = useState(true);
+  const [sourceRestartDelay, setSourceRestartDelay] = useState("5");
   const [sourceBusy, setSourceBusy] = useState(false);
   const [pendingDeleteJob, setPendingDeleteJob] = useState<SourceTranscodeJob | null>(null);
   const renditionStreamNames = new Set(assignments.flatMap((assignment) => assignment.outputs.map((output) => output.stream)));
@@ -910,7 +912,17 @@ function ApplicationDetailPage({
     setSourceBusy(true);
     try {
       const { rules, outputs } = buildSourceRules(application.name, name, template);
-      const job = await client.createSourceTranscode(application.name, name, source, template.name, rules, outputs);
+      const restartDelaySeconds = Math.max(1, Number.parseInt(sourceRestartDelay, 10) || 5);
+      const job = await client.createSourceTranscode(
+        application.name,
+        name,
+        source,
+        template.name,
+        rules,
+        outputs,
+        sourceAutoRestart,
+        restartDelaySeconds
+      );
       setSourceJobs((current) => [...current.filter((item) => item.id !== job.id), job]);
       onNotify("success", `Transcoding ${source} into ${outputs.length} rendition${outputs.length === 1 ? "" : "s"}.`);
       setSourceUrl("");
@@ -1022,6 +1034,25 @@ function ApplicationDetailPage({
                 ))}
               </select>
             </label>
+            <label className="assignment-select">
+              <input
+                type="checkbox"
+                checked={sourceAutoRestart}
+                onChange={(event) => setSourceAutoRestart(event.target.checked)}
+              />
+              {" "}Auto-restart on error
+            </label>
+            {sourceAutoRestart && (
+              <label className="assignment-select">Restart after (seconds)
+                <input
+                  type="number"
+                  min={1}
+                  placeholder="5"
+                  value={sourceRestartDelay}
+                  onChange={(event) => setSourceRestartDelay(event.target.value)}
+                />
+              </label>
+            )}
             <div className="assignment-actions">
               <button className="primary-button" disabled={sourceBusy} onClick={startSourceTranscode}>
                 {sourceBusy ? <RefreshCw className="spin" size={16} /> : <Plus size={16} />}

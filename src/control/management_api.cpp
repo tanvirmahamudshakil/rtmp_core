@@ -469,8 +469,24 @@ HttpResponse ManagementApi::handle_create_source_job(const HttpRequest& request)
         name->second.empty() || source->second.empty() || request.body.empty()) {
         return HttpResponse::json(400, R"({"error":"invalid_source_job"})");
     }
+    // Auto-restart is opt-out (defaults on) so an existing client that omits
+    // the header still gets a self-healing source job; the delay defaults to
+    // 5s if unset or unparsable.
+    bool auto_restart = true;
+    if (const auto it = request.headers.find("x-auto-restart"); it != end) {
+        auto_restart = it->second != "false" && it->second != "0";
+    }
+    std::uint32_t restart_delay_seconds = 5;
+    if (const auto it = request.headers.find("x-restart-delay-seconds"); it != end && !it->second.empty()) {
+        std::uint32_t parsed = 0;
+        const auto* begin = it->second.data();
+        const auto* value_end = begin + it->second.size();
+        if (auto [ptr, ec] = std::from_chars(begin, value_end, parsed); ec == std::errc{} && parsed > 0) {
+            restart_delay_seconds = parsed;
+        }
+    }
     auto result = source_job_creator_(app->second, name->second, source->second, tmpl->second,
-                                      request.body);
+                                      request.body, auto_restart, restart_delay_seconds);
     if (!result) {
         return HttpResponse::json(http_status_for(result.error().code()),
                                   error_body("request_failed", result.error().message(), ""));

@@ -41,9 +41,53 @@ std::uint64_t peak_hls_bandwidth(std::uint64_t average) {
 } // namespace
 
 SourceJobManager::SourceJobManager(Hooks hooks, std::string hls_route_prefix)
-    : hooks_(std::move(hooks)), route_prefix_(std::move(hls_route_prefix)) {}
+    : hooks_(std::move(hooks)), route_prefix_(std::move(hls_route_prefix)) {
+    monitor_running_.store(true);
+    monitor_thread_ = std::thread([this] { monitor_loop(); });
+}
 
-SourceJobManager::~SourceJobManager() { stop_all(); }
+SourceJobManager::~SourceJobManager() {
+    stop_all();
+    if (monitor_running_.exchange(false)) {
+        monitor_wake_cv_.notify_all();
+    }
+    if (monitor_thread_.joinable()) monitor_thread_.join();
+}
+
+void SourceJobManager::monitor_loop() {
+    // Polls every job's puller once a second; a dead one whose config opts
+    // into auto_restart gets torn down and rebuilt once it's been in Error
+    // for at least restart_delay_seconds, so a flaky source recovers without
+    // an operator having to toggle it off and on again.
+    while (monitor_running_.load()) {
+        {
+            std::unique_lock lock(monitor_wake_mutex_);
+            monitor_wake_cv_.wait_for(lock, std::chrono::seconds(1),
+                                      [this] { return !monitor_running_.load(); });
+        }
+        if (!monitor_running_.load()) break;
+
+        std::lock_guard lock(mutex_);
+        const auto now = std::chrono::steady_clock::now();
+        for (auto& [key, job] : jobs_) {
+            if (!job.enabled || !job.puller || job.puller->status() != PullerStatus::Error) {
+                job.error_since = {};
+                continue;
+            }
+            if (job.error_since == std::chrono::steady_clock::time_point{}) {
+                job.error_since = now;
+                continue;
+            }
+            if (!job.config.auto_restart) continue;
+            const auto delay = std::chrono::seconds(job.config.restart_delay_seconds);
+            if (now - job.error_since >= delay) {
+                teardown_locked(job);
+                start_locked(job); // resets error_since via the fresh puller's status
+                job.error_since = {};
+            }
+        }
+    }
+}
 
 std::string SourceJobManager::master_path(const std::string& application,
                                           const std::string& name) const {
@@ -102,6 +146,8 @@ SourceJobSnapshot SourceJobManager::snapshot_locked(const Job& job) const {
     snapshot.template_name = job.config.template_name;
     snapshot.master_hls_path = master_path(job.config.application, job.config.name);
     snapshot.enabled = job.enabled;
+    snapshot.auto_restart = job.config.auto_restart;
+    snapshot.restart_delay_seconds = job.config.restart_delay_seconds;
     snapshot.status = job.enabled ? (job.puller ? status_text(job.puller->status()) : "stopped")
                                   : "disabled";
     snapshot.detail = job.puller ? job.puller->detail() : "";

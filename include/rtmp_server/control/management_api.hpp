@@ -71,7 +71,8 @@ public:
         std::function<core::Result<std::string>(std::string_view application)>;
     using SourceJobCreator = std::function<core::Result<std::string>(
         std::string_view application, std::string_view name, std::string_view source_url,
-        std::string_view template_name, std::string_view rules)>;
+        std::string_view template_name, std::string_view rules, bool auto_restart,
+        std::uint32_t restart_delay_seconds)>;
     using SourceJobRemover =
         std::function<core::Result<void>(std::string_view application, std::string_view name)>;
     using SourceJobEnabledSetter = std::function<core::Result<std::string>(

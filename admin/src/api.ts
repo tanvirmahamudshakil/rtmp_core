@@ -52,6 +52,11 @@ export type SourceTranscodeJob = {
   status: "starting" | "running" | "error" | "stopped" | "disabled";
   detail?: string;
   enabled: boolean;
+  // When the puller errors out (source unreachable, dropped mid-stream), the
+  // server retries automatically after restart_delay_seconds if auto_restart
+  // is set — configured at creation time.
+  auto_restart: boolean;
+  restart_delay_seconds: number;
   // Live delivery stats derived server-side from actual HLS playlist/segment
   // request traffic, summed across every rendition (see
   // HlsHttpHandler::aggregate_link_stats in the backend) — the only signal
@@ -427,7 +432,9 @@ export class ControlClient {
     sourceUrl: string,
     templateName: string,
     rules: string,
-    outputs: TranscodingOutput[]
+    outputs: TranscodingOutput[],
+    autoRestart: boolean = true,
+    restartDelaySeconds: number = 5
   ): Promise<SourceTranscodeJob> {
     if (this.demo) {
       const job: SourceTranscodeJob = {
@@ -439,7 +446,9 @@ export class ControlClient {
         master_hls_path: `/hls/${application}/${name}/master.m3u8`,
         outputs,
         status: "running",
-        enabled: true
+        enabled: true,
+        auto_restart: autoRestart,
+        restart_delay_seconds: restartDelaySeconds
       };
       demoSourceJobs = [...demoSourceJobs.filter((item) => item.id !== job.id), job];
       return job;
@@ -452,7 +461,9 @@ export class ControlClient {
         "X-Application": application,
         "X-Output-Name": name,
         "X-Source-Url": sourceUrl,
-        "X-Template-Name": templateName
+        "X-Template-Name": templateName,
+        "X-Auto-Restart": autoRestart ? "true" : "false",
+        "X-Restart-Delay-Seconds": String(restartDelaySeconds)
       },
       body: rules
     });

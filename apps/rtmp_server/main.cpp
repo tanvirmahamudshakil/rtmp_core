@@ -502,7 +502,9 @@ int main(int argc, char** argv) {
            << esc(job.source_url) << R"(","template_name":")" << esc(job.template_name)
            << R"(","master_hls_path":")" << esc(job.master_hls_path) << R"(","status":")"
            << esc(job.status) << R"(","detail":")" << esc(job.detail) << R"(","enabled":)"
-           << (job.enabled ? "true" : "false") << R"(,"bytes_total":)" << link_stats.bytes_total
+           << (job.enabled ? "true" : "false") << R"(,"auto_restart":)"
+           << (job.auto_restart ? "true" : "false") << R"(,"restart_delay_seconds":)"
+           << job.restart_delay_seconds << R"(,"bytes_total":)" << link_stats.bytes_total
            << R"(,"viewer_count":)" << link_stats.viewer_count << R"(,"outputs":[)";
         for (std::size_t i = 0; i < job.renditions.size(); ++i) {
             const auto& r = job.renditions[i];
@@ -530,8 +532,8 @@ int main(int argc, char** argv) {
         },
         [&source_job_manager, &config, source_job_json](
             std::string_view application, std::string_view name, std::string_view source_url,
-            std::string_view template_name,
-            std::string_view rules) -> rtmp_server::core::Result<std::string> {
+            std::string_view template_name, std::string_view rules, bool auto_restart,
+            std::uint32_t restart_delay_seconds) -> rtmp_server::core::Result<std::string> {
             auto parsed = rtmp_server::transcoding::PresetCatalogue::parse(rules);
             if (!parsed) return parsed.error();
             rtmp_server::transcoding::native::SourceJobConfig cfg;
@@ -539,6 +541,8 @@ int main(int argc, char** argv) {
             cfg.name = std::string(name);
             cfg.source_url = std::string(source_url);
             cfg.template_name = std::string(template_name);
+            cfg.auto_restart = auto_restart;
+            cfg.restart_delay_seconds = restart_delay_seconds;
             for (const auto& rule : parsed.value().rules()) {
                 for (const auto& preset : rule.presets) {
                     using rtmp_server::transcoding::AudioCodec;

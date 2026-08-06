@@ -1,9 +1,13 @@
 #pragma once
 
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -23,6 +27,11 @@ struct SourceJobConfig {
     std::string template_name; // for display / persistence
     std::uint32_t fps = 30;
     std::vector<RenditionSpec> renditions; // each with an output_stream key
+    // If the puller dies (source unreachable, dropped mid-stream, etc.) the
+    // manager's monitor loop restarts it automatically after this many
+    // seconds, so a flaky upstream doesn't require manual re-enabling.
+    bool auto_restart = true;
+    std::uint32_t restart_delay_seconds = 5;
 };
 
 struct SourceJobSnapshot {
@@ -34,6 +43,8 @@ struct SourceJobSnapshot {
     std::string status;
     std::string detail;
     bool enabled = true;
+    bool auto_restart = true;
+    std::uint32_t restart_delay_seconds = 5;
     std::vector<RenditionSpec> renditions;
 };
 
@@ -77,6 +88,9 @@ private:
         std::unique_ptr<HlsSourcePuller> puller;
         std::vector<std::string> output_streams; // registered stream keys
         bool enabled = true;
+        // Set when the monitor loop first observes this job's puller in
+        // PullerStatus::Error; cleared once it's healthy again or restarted.
+        std::chrono::steady_clock::time_point error_since{};
     };
 
     [[nodiscard]] std::string master_path(const std::string& application,
@@ -84,11 +98,17 @@ private:
     void teardown_locked(Job& job);
     void start_locked(Job& job);
     [[nodiscard]] SourceJobSnapshot snapshot_locked(const Job& job) const;
+    void monitor_loop();
 
     Hooks hooks_;
     std::string route_prefix_;
     mutable std::mutex mutex_;
     std::unordered_map<std::string, Job> jobs_; // key: "application/name"
+
+    std::thread monitor_thread_;
+    std::atomic<bool> monitor_running_{false};
+    std::mutex monitor_wake_mutex_;
+    std::condition_variable monitor_wake_cv_;
 };
 
 } // namespace rtmp_server::transcoding::native
