@@ -196,6 +196,19 @@ core::Result<SourceJobSnapshot> SourceJobManager::set_enabled(const std::string&
     return snapshot_locked(job);
 }
 
+core::Result<SourceJobSnapshot> SourceJobManager::restart(const std::string& application,
+                                                          const std::string& name) {
+    std::lock_guard lock(mutex_);
+    auto it = jobs_.find(key_of(application, name));
+    if (it == jobs_.end()) return job_error("no such source job");
+    Job& job = it->second;
+    if (!job.enabled) return job_error("job is disabled; enable it first");
+    teardown_locked(job);
+    start_locked(job);
+    job.error_since = {};
+    return snapshot_locked(job);
+}
+
 bool SourceJobManager::remove(const std::string& application, const std::string& name) {
     std::lock_guard lock(mutex_);
     auto it = jobs_.find(key_of(application, name));

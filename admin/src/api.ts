@@ -492,6 +492,17 @@ export class ControlClient {
     });
   }
 
+  async restartSourceTranscode(job: SourceTranscodeJob): Promise<SourceTranscodeJob> {
+    if (this.demo) {
+      demoSourceJobs = demoSourceJobs.map((item) => (item.id === job.id ? { ...item, status: "running" } : item));
+      return { ...job, status: "running" };
+    }
+    return this.request<SourceTranscodeJob>(
+      `/v1/transcoding/source-jobs/${encodeURIComponent(job.id)}/restart`,
+      { method: "POST" }
+    );
+  }
+
   async removeSourceTranscode(job: SourceTranscodeJob): Promise<void> {
     if (this.demo) {
       demoSourceJobs = demoSourceJobs.filter((item) => item.id !== job.id);

@@ -597,6 +597,13 @@ int main(int argc, char** argv) {
                                                             std::string(name), enabled);
             if (!snapshot) return snapshot.error();
             return source_job_json(snapshot.value());
+        },
+        [&source_job_manager, source_job_json](
+            std::string_view application,
+            std::string_view name) -> rtmp_server::core::Result<std::string> {
+            auto snapshot = source_job_manager.restart(std::string(application), std::string(name));
+            if (!snapshot) return snapshot.error();
+            return source_job_json(snapshot.value());
         });
 #endif
 

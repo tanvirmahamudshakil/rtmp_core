@@ -290,6 +290,10 @@ HttpResponse ManagementApi::route(const HttpRequest& request, const std::string&
             auto [application, name] = split_stream_id(parts[3]);
             return handle_patch_source_job(application, name, request);
         }
+        if (parts.size() == 5 && request.method == "POST" && parts[4] == "restart") {
+            auto [application, name] = split_stream_id(parts[3]);
+            return handle_restart_source_job(application, name);
+        }
     }
     // Expected shapes: ["v1","applications"], ["v1","streams"],
     // ["v1","streams", "<id>"], ["v1","streams","<id>","<action>"].
@@ -516,6 +520,17 @@ HttpResponse ManagementApi::handle_patch_source_job(std::string_view application
     const bool enable = it->second == "true";
     auto result = source_job_enabled_setter_(application, name, enable);
     audit(enable ? "enable_source_job" : "disable_source_job", application, name, result.ok());
+    if (!result) {
+        return HttpResponse::json(http_status_for(result.error().code()),
+                                  error_body("request_failed", result.error().message(), ""));
+    }
+    return HttpResponse::json(200, std::move(result).value());
+}
+
+HttpResponse ManagementApi::handle_restart_source_job(std::string_view application, std::string_view name) {
+    if (!source_job_restarter_) return HttpResponse::json(503, R"({"error":"transcoding_unavailable"})");
+    auto result = source_job_restarter_(application, name);
+    audit("restart_source_job", application, name, result.ok());
     if (!result) {
         return HttpResponse::json(http_status_for(result.error().code()),
                                   error_body("request_failed", result.error().message(), ""));

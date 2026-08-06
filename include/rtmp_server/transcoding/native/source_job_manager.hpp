@@ -79,6 +79,12 @@ public:
     // pipeline from the stored config, mirroring StreamManager::set_enabled.
     [[nodiscard]] core::Result<SourceJobSnapshot> set_enabled(const std::string& application,
                                                               const std::string& name, bool enabled);
+    // Manual restart: tears down and rebuilds the pull/transcode pipeline from
+    // its stored config, same as an auto-restart cycle but triggered on
+    // demand (e.g. an operator hitting "Restart" in the admin UI). No-op on a
+    // disabled job — enable it first.
+    [[nodiscard]] core::Result<SourceJobSnapshot> restart(const std::string& application,
+                                                          const std::string& name);
     [[nodiscard]] std::vector<SourceJobSnapshot> list(const std::string& application) const;
     void stop_all();
 

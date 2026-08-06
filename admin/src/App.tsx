@@ -947,6 +947,19 @@ function ApplicationDetailPage({
     }
   };
 
+  const restartSourceTranscode = async (job: SourceTranscodeJob) => {
+    setSourceBusy(true);
+    try {
+      const updated = await client.restartSourceTranscode(job);
+      setSourceJobs((current) => current.map((item) => (item.id === job.id ? updated : item)));
+      onNotify("success", `Restarted ${job.name}.`);
+    } catch (error) {
+      onNotify("error", error instanceof Error ? error.message : "Could not restart the source transcode.");
+    } finally {
+      setSourceBusy(false);
+    }
+  };
+
   const removeSourceTranscode = async (job: SourceTranscodeJob) => {
     setSourceBusy(true);
     try {
@@ -1092,6 +1105,11 @@ function ApplicationDetailPage({
                   {job.detail && <div className="assignment-empty"><Layers3 size={19} /><span>{job.detail}</span></div>}
                   <div className="assignment-actions">
                     <button className="secondary-button danger-text" disabled={sourceBusy} onClick={() => setPendingDeleteJob(job)}><Trash2 size={15} /> Delete</button>
+                    {job.enabled && (
+                      <button className="secondary-button" disabled={sourceBusy} onClick={() => restartSourceTranscode(job)}>
+                        <RefreshCw size={15} /> Restart
+                      </button>
+                    )}
                     <button className="secondary-button" disabled={sourceBusy} onClick={() => toggleSourceTranscode(job)}>
                       <SlidersHorizontal size={15} /> {job.enabled ? "Pause" : "Resume"}
                     </button>
