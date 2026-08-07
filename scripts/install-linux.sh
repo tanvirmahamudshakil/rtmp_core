@@ -829,7 +829,11 @@ log "Configuring Varnish HLS segment cache"
 # Varnish sits between Caddy and the origin (127.0.0.1:8080) for /hls/*
 # traffic only, caching immutable .ts segments in RAM so repeat viewer
 # requests never reach the origin process. Playlists (.m3u8) change every
-# few seconds, so they are always passed straight through, never cached.
+# few seconds, so they get only a 1s micro-cache: long enough to collapse
+# a thousand viewers' near-simultaneous polling into one origin fetch per
+# second, short enough that live-edge latency is unaffected. Token-gated
+# playlist requests (query string present) bypass the cache entirely, since
+# a cached response would leak across viewers/expiries.
 # Bound to loopback only: never exposed directly to the internet.
 MEM_TOTAL_KB="$(awk '/^MemTotal:/ { print $2 }' /proc/meminfo)"
 [[ "${MEM_TOTAL_KB}" =~ ^[0-9]+$ ]] || die "Could not determine total system memory."
@@ -850,9 +854,14 @@ sub vcl_recv {
     if (req.method != "GET" && req.method != "HEAD") {
         return (pass);
     }
-    # Playlists are near-live and must never be served stale.
     if (req.url ~ "\.m3u8(\?.*)?$") {
-        return (pass);
+        # A query string means a playback token (expiry/claims tied to one
+        # viewer's request): never share that response across viewers.
+        if (req.url ~ "\?") {
+            return (pass);
+        }
+        # Unauthenticated playlist: fall through to the 1s micro-cache
+        # configured in vcl_backend_response below.
     }
     return (hash);
 }
@@ -873,6 +882,17 @@ sub vcl_backend_response {
         } else {
             # Anything but a clean 200 (404, 5xx) must not be cached and
             # poison every viewer behind it.
+            set beresp.ttl = 0s;
+            set beresp.uncacheable = true;
+        }
+    } else if (bereq.url ~ "\.m3u8(\?.*)?$") {
+        if (beresp.status == 200) {
+            # Micro-cache: collapses concurrent viewer polling of the same
+            # playlist into one origin fetch/second, without measurably
+            # delaying live-edge updates (segments are several seconds long).
+            set beresp.ttl = 1s;
+            set beresp.grace = 2s;
+        } else {
             set beresp.ttl = 0s;
             set beresp.uncacheable = true;
         }
@@ -1014,7 +1034,7 @@ printf '  Install mode:     %s\n' "$(if [[ "${FRESH_INSTALL}" == "1" ]]; then pr
 printf '  Network device:   %s\n' "${PRIMARY_INTERFACE}"
 printf '  Link bandwidth:   %s Mbps — %s\n' "${BANDWIDTH_MBIT}" "${BANDWIDTH_SOURCE}"
 printf '  Media workers:    %s\n' "${WORKERS}"
-printf '  HLS segment cache: Varnish, %s MB RAM, 127.0.0.1:6081 (.ts cached 1h, .m3u8 never cached)\n' "${VARNISH_CACHE_MB}"
+printf '  HLS segment cache: Varnish, %s MB RAM, 127.0.0.1:6081 (.ts cached 1h, .m3u8 micro-cached 1s)\n' "${VARNISH_CACHE_MB}"
 if [[ "${BITRATE_MODE}" == "auto" ]]; then
   printf '  Bitrate source:   OBS/transcoder traffic, measured after publishing starts\n'
   printf '  Safety ceiling:   %s viewers (resources sized at %s Mbps; media is not altered)\n' \
