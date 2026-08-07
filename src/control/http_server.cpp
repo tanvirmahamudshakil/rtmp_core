@@ -72,6 +72,7 @@ bool read_request(int fd, const HttpServerOptions& options, HttpRequest& out, in
         return false;
     }
     out.method = request_line.substr(0, sp1);
+    out.http_version = request_line.substr(sp2 + 1);
     std::string target = request_line.substr(sp1 + 1, sp2 - sp1 - 1);
     if (auto qpos = target.find('?'); qpos != std::string::npos) {
         out.path = target.substr(0, qpos);
@@ -142,7 +143,7 @@ const char* reason_phrase(int status) {
     }
 }
 
-void write_response(int fd, const HttpResponse& response) {
+bool write_response(int fd, const HttpResponse& response, bool keep_alive) {
     std::string out = "HTTP/1.1 " + std::to_string(response.status) + " ";
     out += reason_phrase(response.status);
     out += "\r\n";
@@ -154,7 +155,7 @@ void write_response(int fd, const HttpResponse& response) {
     if (!response.headers.contains("Content-Length")) {
         out += "Content-Length: " + std::to_string(response.payload_size()) + "\r\n";
     }
-    out += "Connection: close\r\n";
+    out += keep_alive ? "Connection: keep-alive\r\n" : "Connection: close\r\n";
     for (const auto& [k, v] : response.headers) out += k + ": " + v + "\r\n";
     out += "\r\n";
 
@@ -169,19 +170,18 @@ void write_response(int fd, const HttpResponse& response) {
         return true;
     };
 
-    if (!send_all(out.data(), out.size())) return;
+    if (!send_all(out.data(), out.size())) return false;
     if (!response.shared_body.empty()) {
         const auto view = response.shared_body.view();
         if (response.shared_body_offset > view.size() ||
             response.shared_body_length > view.size() - response.shared_body_offset) {
-            return;
+            return false;
         }
         const auto* bytes =
             reinterpret_cast<const char*>(view.data() + response.shared_body_offset);
-        static_cast<void>(send_all(bytes, response.shared_body_length));
-    } else {
-        static_cast<void>(send_all(response.body.data(), response.body.size()));
+        return send_all(bytes, response.shared_body_length);
     }
+    return send_all(response.body.data(), response.body.size());
 }
 
 } // namespace
@@ -327,47 +327,77 @@ void HttpServer::worker_loop() {
 }
 
 void HttpServer::handle_connection(int client_fd, std::string client_ip) {
-    HttpRequest request;
-    request.client_ip = client_ip;
-    int failure_status = 400;
+    for (std::size_t requests_served = 0;; ++requests_served) {
+        HttpRequest request;
+        request.client_ip = client_ip;
+        int failure_status = 400;
 
-    if (!read_request(client_fd, options_, request, failure_status)) {
-        HttpResponse response;
-        response.status = failure_status;
-        response.body = R"({"error":"bad_request"})";
-        write_response(client_fd, response);
-        ::close(client_fd);
-        return;
-    }
+        if (!read_request(client_fd, options_, request, failure_status)) {
+            // A keep-alive peer that simply closed/timed out between requests
+            // reads as EOF here, which read_request reports as a plain
+            // failure; only send a 4xx if bytes of a new request had actually
+            // started arriving is not distinguishable at this layer, so this
+            // matches the original single-shot behaviour (best-effort 4xx).
+            if (requests_served == 0 || failure_status != 400) {
+                HttpResponse response;
+                response.status = failure_status;
+                response.body = R"({"error":"bad_request"})";
+                write_response(client_fd, response, false);
+            }
+            break;
+        }
 
-    // Caddy reaches this listener over loopback and supplies the original
-    // address in X-Forwarded-For. Trust that header only from loopback;
-    // accepting it from a public peer would let an attacker bypass per-IP
-    // authentication throttles. Validate the first hop as an IP literal so
-    // arbitrary header text never becomes a rate-limit map key.
-    if (client_ip == "127.0.0.1") {
-        auto forwarded = request.headers.find("x-forwarded-for");
-        if (forwarded != request.headers.end()) {
-            std::string candidate = forwarded->second.substr(0, forwarded->second.find(','));
-            while (!candidate.empty() && candidate.front() == ' ') candidate.erase(candidate.begin());
-            while (!candidate.empty() && candidate.back() == ' ') candidate.pop_back();
-            in_addr ipv4{};
-            in6_addr ipv6{};
-            if (::inet_pton(AF_INET, candidate.c_str(), &ipv4) == 1 ||
-                ::inet_pton(AF_INET6, candidate.c_str(), &ipv6) == 1) {
-                request.client_ip = std::move(candidate);
+        // Caddy reaches this listener over loopback and supplies the original
+        // address in X-Forwarded-For. Trust that header only from loopback;
+        // accepting it from a public peer would let an attacker bypass per-IP
+        // authentication throttles. Validate the first hop as an IP literal so
+        // arbitrary header text never becomes a rate-limit map key.
+        if (client_ip == "127.0.0.1") {
+            auto forwarded = request.headers.find("x-forwarded-for");
+            if (forwarded != request.headers.end()) {
+                std::string candidate = forwarded->second.substr(0, forwarded->second.find(','));
+                while (!candidate.empty() && candidate.front() == ' ') candidate.erase(candidate.begin());
+                while (!candidate.empty() && candidate.back() == ' ') candidate.pop_back();
+                in_addr ipv4{};
+                in6_addr ipv6{};
+                if (::inet_pton(AF_INET, candidate.c_str(), &ipv4) == 1 ||
+                    ::inet_pton(AF_INET6, candidate.c_str(), &ipv6) == 1) {
+                    request.client_ip = std::move(candidate);
+                }
             }
         }
-    }
 
-    HttpResponse response;
-    if (handler_) {
-        response = handler_(request);
-    } else {
-        response.status = 503;
-        response.body = R"({"error":"no_handler"})";
+        HttpResponse response;
+        if (handler_) {
+            response = handler_(request);
+        } else {
+            response.status = 503;
+            response.body = R"({"error":"no_handler"})";
+        }
+
+        // HTTP/1.1 defaults to persistent; HTTP/1.0 defaults to close unless
+        // the client opts in. Either side can veto with "Connection: close".
+        auto conn_it = request.headers.find("connection");
+        const bool client_wants_close = conn_it != request.headers.end() && conn_it->second == "close";
+        const bool client_wants_keep_alive =
+            conn_it != request.headers.end() && conn_it->second == "keep-alive";
+        const bool http_1_1 = request.http_version == "HTTP/1.1";
+        bool keep_alive = options_.enable_keep_alive && !client_wants_close &&
+                           (http_1_1 || client_wants_keep_alive) &&
+                           requests_served + 1 < options_.max_requests_per_connection;
+
+        if (!write_response(client_fd, response, keep_alive) || !keep_alive) break;
+
+        // Bound how long this worker thread waits idle for the next request
+        // on this connection: an idle keep-alive peer must not hold a worker
+        // forever out of the fixed pool that serves every other connection.
+        pollfd pfd{};
+        pfd.fd = client_fd;
+        pfd.events = POLLIN;
+        const int timeout_ms = static_cast<int>(options_.keep_alive_idle_timeout.count());
+        const int ready = ::poll(&pfd, 1, timeout_ms);
+        if (ready <= 0) break; // idle timeout or poll error: close
     }
-    write_response(client_fd, response);
     ::close(client_fd);
 }
 

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
@@ -24,6 +25,7 @@ struct HttpRequest {
     std::string method;
     std::string path;              // decoded path only, no query string
     std::string query;              // raw query string, no leading '?'
+    std::string http_version;       // "HTTP/1.1" or "HTTP/1.0", as sent
     std::unordered_map<std::string, std::string> headers; // lower-cased keys
     std::string body;
     std::string client_ip;
@@ -68,6 +70,17 @@ struct HttpServerOptions {
     std::size_t max_pending_requests = 256; // bounded queue between accept and workers
     std::size_t max_header_bytes = 8 * 1024;
     std::size_t max_body_bytes = 64 * 1024;
+
+    // Off by default: every existing caller (management API, tests) expects
+    // one request per connection and detects response-end via EOF. Set true
+    // for a route serving frequent, repeated small fetches from the same
+    // peer (e.g. HLS playlists/segments) to skip the accept+handshake cost
+    // per request. A worker thread is held by the connection while it waits
+    // for the next request, so this trades some idle-thread cost for far
+    // fewer connection setups under high request rates.
+    bool enable_keep_alive = false;
+    std::chrono::milliseconds keep_alive_idle_timeout{15'000};
+    std::size_t max_requests_per_connection = 1000; // bound a single client's thread hold time
 };
 
 // Minimal, bounded, single-threaded-accept + fixed-worker-pool HTTP/1.1

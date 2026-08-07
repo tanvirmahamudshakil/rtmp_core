@@ -639,9 +639,16 @@ int main(int argc, char** argv) {
     const auto hardware_threads = std::max(1U, std::thread::hardware_concurrency());
     const auto hls_http_workers =
         std::clamp<std::size_t>(static_cast<std::size_t>(hardware_threads) * 16, 64, 256);
-    rtmp_server::control::HttpServer api_server(
-        {config.api_bind_address, config.api_port, 65'535, hls_http_workers, 65'536,
-         16 * 1024, 128 * 1024});
+    rtmp_server::control::HttpServerOptions api_server_options{
+        config.api_bind_address, config.api_port, 65'535, hls_http_workers, 65'536,
+        16 * 1024, 128 * 1024};
+    // Caddy reuses its loopback connections to this backend; without
+    // keep-alive here, every playlist/segment fetch across the public edge
+    // paid a fresh accept() + TCP handshake on the loopback hop too. At
+    // thousands of concurrent HLS viewers polling every few seconds, that
+    // accept-loop churn is avoidable cost.
+    api_server_options.enable_keep_alive = true;
+    rtmp_server::control::HttpServer api_server(api_server_options);
     api_server.set_handler([&hls_handler](const rtmp_server::control::HttpRequest& request) {
         return hls_handler.handle(request);
     });
