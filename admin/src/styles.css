@@ -1489,6 +1489,23 @@ tbody tr:hover { background: #fcfcfd; }
   font-weight: 600;
 }
 .assignment-select input:focus { border-color: var(--teal); box-shadow: 0 0 0 3px rgba(18, 155, 145, .1); }
+.assignment-checkbox {
+  margin-top: 15px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--soft);
+  font-size: 11px;
+  font-weight: 700;
+  cursor: pointer;
+}
+.assignment-checkbox input[type="checkbox"] {
+  width: 16px;
+  height: 16px;
+  margin: 0;
+  accent-color: var(--teal);
+  cursor: pointer;
+}
 .source-form { display: grid; gap: 4px; }
 .rendition-list { margin-top: 13px; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 7px; }
 .rendition-list > span { min-width: 0; padding: 9px; background: #f5faf9; border: 1px solid #dbecea; border-radius: 8px; }

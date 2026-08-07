@@ -1047,13 +1047,13 @@ function ApplicationDetailPage({
                 ))}
               </select>
             </label>
-            <label className="assignment-select">
+            <label className="assignment-checkbox">
               <input
                 type="checkbox"
                 checked={sourceAutoRestart}
                 onChange={(event) => setSourceAutoRestart(event.target.checked)}
               />
-              {" "}Auto-restart on error
+              Auto-restart on error
             </label>
             {sourceAutoRestart && (
               <label className="assignment-select">Restart after (seconds)
