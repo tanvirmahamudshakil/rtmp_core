@@ -277,7 +277,8 @@ core::Result<void> SourceTranscoder::on_audio(std::span<const std::byte> adts,
             // says. Falls back to 0 if video hasn't produced a frame yet
             // (audio arrived first); video's own first frame doesn't need
             // to agree with this since video never reads audio's clock.
-            rendition.audio_base_pts_90k = video_clock_set_ ? next_output_video_pts_90k_ : 0;
+            rendition.audio_base_pts_90k =
+                video_clock_set_ ? next_output_video_pts_90k_.load() : std::int64_t{0};
             rendition.audio_base_set = true;
         }
 
