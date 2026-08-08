@@ -129,11 +129,17 @@ core::Result<void> SourceTranscoder::on_video(std::span<const std::byte> annexb,
             // never fires for those and this gate would otherwise silently
             // drop every frame for up to 5s each time -- audio has no
             // equivalent gate, so it kept playing throughout, which is what
-            // read as "video freezes constantly, audio keeps going". Once a
-            // run of consecutive drops covers about half a second of real
-            // frames, treat it as a discontinuity instead of waiting out the
-            // rest of the tolerance.
-            if (++consecutive_backward_drops_ < std::max<std::int64_t>(1, fps_ / 2)) {
+            // read as "video freezes constantly, audio keeps going". A real
+            // reset (source's internal segment boundary) persists for many
+            // consecutive frames; ordinary decode-level noise (duplicate or
+            // slightly-reordered timestamps) self-corrects within a frame or
+            // two. So there's little upside to waiting anywhere near 0.5s to
+            // decide which one this is -- a handful of frames (well under
+            // 200ms at any realistic fps) is enough to tell them apart, and
+            // recovering that fast keeps a real reset from reading as a
+            // visible freeze at all.
+            constexpr std::int64_t kMaxToleratedDrops = 3;
+            if (++consecutive_backward_drops_ < kMaxToleratedDrops) {
                 return {};
             }
         }
