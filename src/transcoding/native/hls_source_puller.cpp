@@ -74,6 +74,12 @@ public:
         if (thread_.joinable()) thread_.join();
     }
 
+    // Diagnostic only: lets the puller loop log how much is backed up here.
+    [[nodiscard]] std::size_t queue_size() const {
+        std::lock_guard lock(mutex_);
+        return queue_.size();
+    }
+
 private:
     void run() {
         while (!stopped_.load()) {
@@ -112,7 +118,7 @@ private:
     std::chrono::milliseconds interval_;
     std::chrono::steady_clock::time_point next_publish_;
     std::deque<hls::SegmentPtr> queue_;
-    std::mutex mutex_;
+    mutable std::mutex mutex_;
     std::condition_variable wake_;
     std::thread thread_;
     std::atomic<bool> stopped_{false};
@@ -379,6 +385,32 @@ void HlsSourcePuller::run() {
             }
             static_cast<void>(demux.feed(result.value()));
             demux.flush(); // each TS segment is a self-contained unit
+        }
+
+        // Temporary diagnostic: the reported symptom (buffered position
+        // drifting further ahead of playback, big catch-up skips) implies
+        // published media is falling behind wall-clock time by more than the
+        // pacing backlog cap alone explains. Log where the pipeline actually
+        // stands after every poll -- fetched-vs-pending count, and per
+        // rendition how many frames the decoder/encoder actually saw versus
+        // how many it dropped, how many segments it cut, and how many are
+        // still sitting in the pacing queue -- to see which stage (source
+        // fetch, decode/encode, or the publisher) is where time is actually
+        // being lost, instead of guessing further. Remove once the deficit
+        // is root-caused.
+        if (!pending.empty()) {
+            for (std::size_t i = 0; i < segmenters.size(); ++i) {
+                const auto& stats = segmenters[i]->stats();
+                RTMP_LOG(LogLevel::Info, "source-transcoder", "pipeline diagnostic",
+                         {{"rendition_index", std::to_string(i)},
+                          {"pending_this_poll", std::to_string(pending.size())},
+                          {"segments_produced", std::to_string(stats.segments_produced)},
+                          {"video_frames", std::to_string(stats.video_frames)},
+                          {"dropped_frames", std::to_string(stats.dropped_frames)},
+                          {"forced_cuts", std::to_string(stats.forced_cuts)},
+                          {"discontinuities", std::to_string(stats.discontinuities)},
+                          {"publisher_queue_depth", std::to_string(publishers[i]->queue_size())}});
+            }
         }
 
         if (playlist.endlist) {
