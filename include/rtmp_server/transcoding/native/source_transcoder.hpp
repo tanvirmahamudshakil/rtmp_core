@@ -94,6 +94,7 @@ public:
     // frame re-anchor to its own incoming pts_90k, the same way video
     // re-anchors to its next decoded frame's PTS.
     void mark_discontinuity() noexcept {
+        program_start_set_ = false;
         video_clock_set_ = false;
         frame_selection_accumulator_ = 0;
         consecutive_backward_drops_ = 0;
@@ -132,6 +133,19 @@ private:
     AudioOutput audio_output_;
     bool started_ = false;
     bool audio_configured_ = false;
+    // Shared zero point for both output clocks, set once from whichever of
+    // on_video/on_audio decodes a frame first (and re-set on every
+    // discontinuity). The source's own audio and video PTS values are not
+    // guaranteed to share a common origin -- muxing/buffering quirks upstream
+    // can leave them offset from each other by a large, arbitrary amount even
+    // though the source's own player handles it fine (it likely has its own
+    // A/V sync logic). Anchoring video's and audio's *output* clocks to this
+    // one shared reference, instead of each independently to its own raw
+    // incoming pts_90k, is what actually guarantees the two output tracks
+    // agree on what "time zero" means; anchoring them independently (the
+    // previous fix) preserved whatever offset the source had between them.
+    bool program_start_set_ = false;
+    std::int64_t program_start_pts_90k_ = 0;
     bool video_clock_set_ = false;
     std::int64_t last_input_video_pts_90k_ = 0;
     std::int64_t next_output_video_pts_90k_ = 0;

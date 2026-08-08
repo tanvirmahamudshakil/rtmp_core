@@ -158,8 +158,18 @@ core::Result<void> SourceTranscoder::on_video(std::span<const std::byte> annexb,
         }
         next_output_video_pts_90k_ += output_interval_90k;
     } else {
+        if (!program_start_set_) {
+            program_start_pts_90k_ = decoded_.pts_90k;
+            program_start_set_ = true;
+        }
         video_clock_set_ = true;
-        next_output_video_pts_90k_ = decoded_.pts_90k;
+        // Relative to the shared program start, not the raw source PTS: see
+        // program_start_pts_90k_'s comment for why anchoring independently
+        // to each stream's own incoming PTS isn't enough to keep audio and
+        // video aligned. last_input_video_pts_90k_ stays in raw source units
+        // -- it's only ever compared against future raw decoded_.pts_90k
+        // values above, never mixed with the output clock.
+        next_output_video_pts_90k_ = decoded_.pts_90k - program_start_pts_90k_;
         last_input_video_pts_90k_ = decoded_.pts_90k;
         consecutive_backward_drops_ = 0;
     }
@@ -231,8 +241,19 @@ core::Result<void> SourceTranscoder::on_audio(std::span<const std::byte> adts,
             if (auto r = rendition.audio_encoder.open(params); !r) return r.error();
             rendition.audio_open = true;
         }
+        if (!program_start_set_) {
+            program_start_pts_90k_ = pts_90k;
+            program_start_set_ = true;
+        }
         if (!rendition.audio_base_set) {
-            rendition.audio_base_pts_90k = pts_90k;
+            // Relative to the shared program start -- see
+            // program_start_pts_90k_'s comment. If video already set the
+            // program start (from an earlier-arriving frame), this anchors
+            // audio's output clock to that same zero point instead of its
+            // own raw incoming PTS, so the two tracks agree on "time zero"
+            // even when the source's own audio/video PTS values don't share
+            // one.
+            rendition.audio_base_pts_90k = pts_90k - program_start_pts_90k_;
             rendition.audio_base_set = true;
         }
 
