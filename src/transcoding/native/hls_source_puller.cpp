@@ -341,6 +341,14 @@ void HlsSourcePuller::run() {
     }
 
     std::unordered_set<std::uint64_t> seen; // segment sequence numbers already pulled
+    // Some upstream IPTV/CDN panels list a segment in the playlist slightly
+    // before (or after) it's actually available, so a fetch can 404 even
+    // though we just saw it advertised. That segment's media is simply gone
+    // -- skipping it is correct -- but without flagging it, the next segment
+    // we do land splices onto the previous one with a PTS gap the player was
+    // never told about, which reads as a much worse stall/seek than a
+    // properly marked discontinuity would.
+    bool pending_fetch_gap = false;
 
     while (running_.load()) {
         std::vector<std::byte> playlist_bytes;
@@ -396,10 +404,12 @@ void HlsSourcePuller::run() {
             if (!result) {
                 RTMP_LOG(LogLevel::Warn, "source-transcoder", "segment fetch failed",
                          {{"url", segment->uri}, {"error", result.error().message()}});
+                pending_fetch_gap = true;
                 continue;
             }
-            if (segment->discontinuity) {
+            if (segment->discontinuity || pending_fetch_gap) {
                 for (auto& feed : feeds) feed->mark_discontinuity();
+                pending_fetch_gap = false;
             }
             static_cast<void>(demux.feed(result.value()));
             demux.flush(); // each TS segment is a self-contained unit
