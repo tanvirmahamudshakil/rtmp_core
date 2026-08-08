@@ -113,7 +113,21 @@ void SourceJobManager::start_locked(Job& job) {
     std::vector<hls::Rendition> master_renditions;
     puller_renditions.reserve(config.renditions.size());
     for (const auto& spec : config.renditions) {
-        auto store = std::make_shared<hls::SegmentStore>();
+        // A source-transcode job pulls from an upstream HLS/IPTV panel whose
+        // own publish cadence can be irregular (observed: mostly steady
+        // ~4-9s between segments, occasionally 12-13s -- see
+        // hls_source_puller.cpp's polling comments). The default live
+        // window (6 segments, ~24-36s at this target duration) is sized for
+        // a well-behaved RTMP publisher and leaves no slack: one slow
+        // upstream segment and the player has already drained everything
+        // advertised. A wider window here gives the player enough
+        // pre-buffered segments to absorb one of those slow patches without
+        // visibly stalling, at the cost of a few more seconds of live
+        // latency (the window is what a player buffers behind live edge).
+        hls::SegmentStoreConfig store_config;
+        store_config.live_window_segments = 12;
+        store_config.retention_grace_segments = 6;
+        auto store = std::make_shared<hls::SegmentStore>(store_config);
         if (hooks_.register_store) hooks_.register_store(config.application, spec.output_stream, store);
         job.output_streams.push_back(spec.output_stream);
 
