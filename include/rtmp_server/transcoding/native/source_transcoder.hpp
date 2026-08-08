@@ -85,6 +85,7 @@ public:
     void mark_discontinuity() noexcept {
         video_clock_set_ = false;
         frame_selection_accumulator_ = 0;
+        consecutive_backward_drops_ = 0;
     }
 
 private:
@@ -120,6 +121,11 @@ private:
     std::int64_t last_input_video_pts_90k_ = 0;
     std::int64_t next_output_video_pts_90k_ = 0;
     std::int64_t frame_selection_accumulator_ = 0;
+    // Consecutive frames dropped by on_video's backward-discontinuity gate;
+    // once this covers about half a second of real frames, the gate treats
+    // it as an unflagged discontinuity instead of waiting out the full
+    // tolerance (see on_video's comment on the gate itself).
+    std::int64_t consecutive_backward_drops_ = 0;
 
     // Scale+encode is CPU-bound per rendition; fanning renditions across a
     // pool (rather than looping them serially on this call's thread) is what

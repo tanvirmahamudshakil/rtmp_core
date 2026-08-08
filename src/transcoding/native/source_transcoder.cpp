@@ -120,7 +120,24 @@ core::Result<void> SourceTranscoder::on_video(std::span<const std::byte> annexb,
     if (video_clock_set_) {
         const auto input_delta = decoded_.pts_90k - last_input_video_pts_90k_;
         constexpr std::int64_t kBackwardDiscontinuity90k = 5 * 90'000;
-        if (input_delta <= 0 && input_delta > -kBackwardDiscontinuity90k) return {};
+        if (input_delta <= 0 && input_delta > -kBackwardDiscontinuity90k) {
+            // Tolerate brief backward jitter (ordinary source noise), but
+            // don't let it freeze video for the full 5s tolerance: many
+            // upstream IPTV panels reset timestamps at their own internal
+            // segment boundaries without ever setting EXT-X-DISCONTINUITY,
+            // so mark_discontinuity()'s explicit reset (hls_source_puller.cpp)
+            // never fires for those and this gate would otherwise silently
+            // drop every frame for up to 5s each time -- audio has no
+            // equivalent gate, so it kept playing throughout, which is what
+            // read as "video freezes constantly, audio keeps going". Once a
+            // run of consecutive drops covers about half a second of real
+            // frames, treat it as a discontinuity instead of waiting out the
+            // rest of the tolerance.
+            if (++consecutive_backward_drops_ < std::max<std::int64_t>(1, fps_ / 2)) {
+                return {};
+            }
+        }
+        consecutive_backward_drops_ = 0;
         last_input_video_pts_90k_ = decoded_.pts_90k;
 
         if (input_delta <= 0 || input_delta > kBackwardDiscontinuity90k) {
@@ -144,6 +161,7 @@ core::Result<void> SourceTranscoder::on_video(std::span<const std::byte> annexb,
         video_clock_set_ = true;
         next_output_video_pts_90k_ = decoded_.pts_90k;
         last_input_video_pts_90k_ = decoded_.pts_90k;
+        consecutive_backward_drops_ = 0;
     }
     // Output H.264 has no B-frames. Give every accepted frame an exact,
     // monotonic output cadence so MPEG-TS DTS can never move backwards even
