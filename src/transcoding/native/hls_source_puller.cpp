@@ -80,8 +80,24 @@ private:
             std::unique_lock lock(mutex_);
             wake_.wait_for(lock, std::chrono::milliseconds(200), [this] { return stopped_.load(); });
             if (stopped_.load()) break;
+            if (queue_.empty()) continue;
             const auto now = std::chrono::steady_clock::now();
-            if (queue_.empty() || now < next_publish_) continue;
+            // Only hold a segment back for pacing while the backlog is small
+            // (a couple of segments -- exactly the kind of single-poll burst
+            // this class exists to smooth). A source that's genuinely
+            // publishing faster than we're releasing would otherwise build an
+            // ever-growing backlog behind pacing that never repays itself --
+            // each publish resets next_publish_ another interval_ into the
+            // future regardless of how much is still queued, so a source
+            // outrunning that fixed rate falls permanently further behind
+            // live with every segment (this is exactly what was reported:
+            // playback drifting further from the live edge over the session,
+            // not just occasional stalls). Once the backlog passes
+            // kMaxBacklog, drain immediately instead of waiting for
+            // next_publish_, which caps how far behind live pacing can ever
+            // push the stream and self-corrects any drift within a couple of
+            // segments.
+            if (queue_.size() <= kMaxBacklog && now < next_publish_) continue;
             auto segment = std::move(queue_.front());
             queue_.pop_front();
             lock.unlock();
@@ -89,6 +105,8 @@ private:
             next_publish_ = now + interval_;
         }
     }
+
+    static constexpr std::size_t kMaxBacklog = 2;
 
     std::shared_ptr<hls::SegmentStore> store_;
     std::chrono::milliseconds interval_;
