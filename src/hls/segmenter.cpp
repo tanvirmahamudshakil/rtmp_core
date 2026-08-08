@@ -62,7 +62,6 @@ bool Segmenter::is_discontinuous(std::uint32_t timestamp) const {
 }
 
 void Segmenter::mark_publisher_reconnect() {
-    std::lock_guard<std::mutex> lock(mutex_);
     // Close whatever was open under the old publisher, then force the next
     // segment onto a fresh timeline with a discontinuity marker.
     flush_segment();
@@ -120,23 +119,17 @@ void Segmenter::flush_segment() {
     }
     stats_.segments_produced += 1;
 
-    // Invoked with mutex_ held (flush_segment() is only ever called from an
-    // already-locked public method). Fine as long as on_segment_ stays fast
-    // and non-reentrant into this Segmenter, which every current callback
-    // (PacedSegmentPublisher::push(), a brief lock on its own separate
-    // mutex) satisfies.
+    // Callback is invoked with no lock held by this class (3.7).
     if (on_segment_) on_segment_(std::move(segment));
 }
 
 void Segmenter::on_metadata(const protocol::chunk::RtmpMessage&) {
-    std::lock_guard<std::mutex> lock(mutex_);
     // onMetaData carries no data the TS packaging needs: the SPS/PPS and
     // AudioSpecificConfig are authoritative for resolution and sample rate.
     // Deliberately ignored rather than half-used.
 }
 
 void Segmenter::on_video(const protocol::chunk::RtmpMessage& message) {
-    std::lock_guard<std::mutex> lock(mutex_);
     if (finalized_ || message.payload.empty()) return;
 
     auto parsed = media::h264::parse_video_tag(payload_span(message));
@@ -231,7 +224,6 @@ void Segmenter::on_video(const protocol::chunk::RtmpMessage& message) {
 }
 
 void Segmenter::on_audio(const protocol::chunk::RtmpMessage& message) {
-    std::lock_guard<std::mutex> lock(mutex_);
     if (finalized_ || message.payload.empty()) return;
 
     auto parsed = media::aac::parse_audio_tag(payload_span(message));
@@ -286,7 +278,6 @@ void Segmenter::on_audio(const protocol::chunk::RtmpMessage& message) {
 }
 
 void Segmenter::finalize() {
-    std::lock_guard<std::mutex> lock(mutex_);
     if (finalized_) return;
     finalized_ = true;
     // Publish whatever partial segment exists so the tail of the stream is
