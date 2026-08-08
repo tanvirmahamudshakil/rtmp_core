@@ -368,16 +368,19 @@ void HlsSourcePuller::run() {
             break; // VOD: nothing more to pull
         }
 
-        // Live: poll at half the target duration (standard HLS client practice).
-        // Waiting a full target duration compounds with our own fetch/transcode
-        // time, so a segment that becomes available just after we slept can sit
-        // unpicked for close to two target durations — output then arrives in
-        // bursts (all segments since last poll) followed by an idle gap, which
-        // shows up as stall/lag on the viewer side. Polling twice as often keeps
-        // that worst case near one target duration without materially raising
-        // request load (the playlist itself is a few hundred bytes).
-        const auto wait = std::chrono::milliseconds(
-            static_cast<long long>(std::max(1.0, playlist.target_duration / 2.0) * 1000));
+        // Live: poll at a fixed short interval rather than a fraction of the
+        // source's own EXT-X-TARGETDURATION. Some IPTV/CDN panels advertise a
+        // large target duration (10-15s) that doesn't reflect how often a
+        // segment actually lands -- even at half that (5-7.5s) a segment
+        // published just after we slept could sit unpicked long enough to
+        // read as a stall to a viewer. A 2s floor bounds worst-case detection
+        // lag to ~2s regardless of what the source claims, at negligible
+        // extra cost (the playlist itself is a few hundred bytes). Never
+        // waits longer than the old half-target-duration figure either, so a
+        // source with a genuinely short target duration doesn't get polled
+        // more slowly than before.
+        const auto wait = std::chrono::milliseconds(std::min<long long>(
+            2000, static_cast<long long>(std::max(1.0, playlist.target_duration / 2.0) * 1000)));
         std::unique_lock lock(sleep_mutex);
         sleep_cv.wait_for(lock, wait, [&] { return !running_.load(); });
     }
