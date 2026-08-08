@@ -82,10 +82,25 @@ public:
     // the last pre-gap frame, dropping every video frame while audio -- which
     // has no equivalent gate -- keeps playing: audio continues, video
     // freezes, exactly the reported symptom.
+    // Also re-anchors every rendition's audio clock. on_audio's output PTS is
+    // audio_base_pts_90k + (samples emitted so far * clock/rate) -- a
+    // running total set once from the very first audio frame and never
+    // revisited, completely independent of on_video's PTS. Once video's
+    // clock resets here on a discontinuity but audio's doesn't, the two
+    // tracks' PTS values in the same TS segment diverge by however much the
+    // discontinuity jumped -- exactly the kind of mismatch that makes a
+    // player (VLC included) drop or refuse to play the audio track instead
+    // of merely desyncing it. Clearing audio_base_set makes the next audio
+    // frame re-anchor to its own incoming pts_90k, the same way video
+    // re-anchors to its next decoded frame's PTS.
     void mark_discontinuity() noexcept {
         video_clock_set_ = false;
         frame_selection_accumulator_ = 0;
         consecutive_backward_drops_ = 0;
+        for (auto& rendition : renditions_) {
+            rendition->audio_base_set = false;
+            rendition->audio_samples = 0;
+        }
     }
 
 private:
