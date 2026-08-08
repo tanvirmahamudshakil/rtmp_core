@@ -5,6 +5,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <deque>
+#include <future>
 #include <mutex>
 #include <thread>
 
@@ -316,21 +317,49 @@ void HlsSourcePuller::run() {
                                     playlist_bytes.size());
         const auto playlist = parse_media_playlist(text, media_url);
 
+        // Collect every not-yet-pulled segment from this playlist window
+        // first, then fetch them all concurrently (one HttpClient per fetch —
+        // the member `http` above is single-use, reserved for the playlist
+        // itself). A playlist poll regularly turns up 2-3 unseen segments at
+        // once (the window is wider than the source's own publish interval),
+        // and fetching them one at a time serially adds each segment's
+        // network round-trip to the next one's, on a 24-core box that spends
+        // the rest of its time idle. Demuxing must still happen strictly in
+        // playlist order (PTS/DTS continuity depends on it), so only the
+        // network fetch is parallel; feeding to the demuxer below is
+        // unchanged serial code.
+        std::vector<const decltype(playlist.segments)::value_type*> pending;
         for (const auto& segment : playlist.segments) {
-            if (!running_.load()) break;
             if (seen.contains(segment.sequence)) continue;
             seen.insert(segment.sequence);
+            pending.push_back(&segment);
+        }
 
-            std::vector<std::byte> ts_bytes;
-            if (auto r = http.get(segment.uri, ts_bytes); !r) {
+        std::vector<std::future<core::Result<std::vector<std::byte>>>> fetches;
+        fetches.reserve(pending.size());
+        for (const auto* segment : pending) {
+            fetches.push_back(std::async(std::launch::async, [uri = segment->uri]() {
+                HttpClient segment_http;
+                std::vector<std::byte> bytes;
+                auto result = segment_http.get(uri, bytes);
+                if (!result) return core::Result<std::vector<std::byte>>(result.error());
+                return core::Result<std::vector<std::byte>>(std::move(bytes));
+            }));
+        }
+
+        for (std::size_t i = 0; i < pending.size(); ++i) {
+            if (!running_.load()) break;
+            const auto* segment = pending[i];
+            auto result = fetches[i].get();
+            if (!result) {
                 RTMP_LOG(LogLevel::Warn, "source-transcoder", "segment fetch failed",
-                         {{"url", segment.uri}, {"error", r.error().message()}});
+                         {{"url", segment->uri}, {"error", result.error().message()}});
                 continue;
             }
-            if (segment.discontinuity) {
+            if (segment->discontinuity) {
                 for (auto& feed : feeds) feed->mark_discontinuity();
             }
-            static_cast<void>(demux.feed(ts_bytes));
+            static_cast<void>(demux.feed(result.value()));
             demux.flush(); // each TS segment is a self-contained unit
         }
 
