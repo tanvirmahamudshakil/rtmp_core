@@ -5,6 +5,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <deque>
+#include <functional>
 #include <future>
 #include <mutex>
 #include <thread>
@@ -129,6 +130,86 @@ private:
     std::condition_variable wake_;
     std::thread thread_;
     std::atomic<bool> stopped_{false};
+};
+
+// Runs one dedicated worker thread draining a queue of decoded access units
+// into `handler`. Video decode+scale+encode (fanned across its own thread
+// pool for multi-rendition jobs, SourceTranscoder::start()) and audio
+// decode+encode were both being invoked synchronously from the demuxer's
+// callbacks on the single puller thread -- audio had to wait for whatever
+// video work was in flight for a given TS packet before its own turn came,
+// even though the two are otherwise independent pipelines with no reason to
+// serialize against each other. Two of these (one for video work items, one
+// for audio) let the demux thread just hand off a copy of each decoded
+// access unit and move on immediately, so video's (typically heavier)
+// per-frame work never blocks audio's.
+//
+// Item must be movable and cheap to default-construct. Everything queued
+// here is copied out of the demuxer's buffers first (see the video/audio
+// handlers below) since those buffers are only valid for the duration of the
+// synchronous demux callback, not for whenever this worker gets around to
+// the item.
+template <typename Item>
+class WorkerQueue {
+public:
+    using Handler = std::function<void(Item&&)>;
+
+    explicit WorkerQueue(Handler handler) : handler_(std::move(handler)) {
+        thread_ = std::thread([this] { run(); });
+    }
+
+    ~WorkerQueue() { stop(); }
+
+    void push(Item item) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        queue_.push_back(std::move(item));
+        wake_.notify_one();
+    }
+
+    // Drains everything already queued before actually stopping, so the
+    // last few frames pushed before a shutdown aren't silently dropped.
+    void stop() {
+        if (stopped_.exchange(true)) return;
+        wake_.notify_one();
+        if (thread_.joinable()) thread_.join();
+    }
+
+private:
+    void run() {
+        for (;;) {
+            Item item;
+            {
+                std::unique_lock<std::mutex> lock(mutex_);
+                wake_.wait(lock, [this] { return stopped_.load() || !queue_.empty(); });
+                if (queue_.empty()) {
+                    if (stopped_.load()) break;
+                    continue;
+                }
+                item = std::move(queue_.front());
+                queue_.pop_front();
+            }
+            handler_(std::move(item));
+        }
+    }
+
+    Handler handler_;
+    std::deque<Item> queue_;
+    std::mutex mutex_;
+    std::condition_variable wake_;
+    std::thread thread_;
+    std::atomic<bool> stopped_{false};
+};
+
+struct VideoWorkItem {
+    std::vector<std::byte> annexb;
+    std::int64_t pts_90k = 0;
+    std::int64_t dts_90k = 0;
+    bool keyframe = false;
+};
+
+struct AudioWorkItem {
+    std::vector<std::byte> adts;
+    std::int64_t pts_90k = 0;
 };
 
 // Many IPTV/CDN panels answer an .m3u8-shaped URL with a redirect straight to
@@ -277,14 +358,34 @@ void HlsSourcePuller::run() {
         return;
     }
 
+    // See WorkerQueue's comment: video and audio decode/encode run on their
+    // own dedicated threads instead of both blocking the single demux
+    // thread. The Segmenter both eventually push into (via transcoder's own
+    // output callbacks above) protects itself with its own mutex for exactly
+    // this reason (hls/segmenter.hpp), and video_clock_set_ /
+    // next_output_video_pts_90k_ (the only SourceTranscoder state on_audio
+    // reads that on_video writes) are atomics for the same reason.
+    WorkerQueue<VideoWorkItem> video_queue([&](VideoWorkItem&& item) {
+        static_cast<void>(
+            transcoder.on_video(item.annexb, item.pts_90k, item.dts_90k, item.keyframe));
+    });
+    WorkerQueue<AudioWorkItem> audio_queue([&](AudioWorkItem&& item) {
+        static_cast<void>(transcoder.on_audio(item.adts, item.pts_90k));
+    });
+
     media::ts::TsDemuxer demux;
     demux.set_video_handler([&](std::span<const std::byte> annexb, std::uint64_t pts,
                                 std::uint64_t dts, bool keyframe) {
-        static_cast<void>(transcoder.on_video(annexb, static_cast<std::int64_t>(pts),
-                                              static_cast<std::int64_t>(dts), keyframe));
+        // Copy out of the demuxer's buffer: annexb is only valid for this
+        // callback's duration, but the video worker may not get to it until
+        // well after this call returns.
+        video_queue.push(VideoWorkItem{std::vector<std::byte>(annexb.begin(), annexb.end()),
+                                       static_cast<std::int64_t>(pts),
+                                       static_cast<std::int64_t>(dts), keyframe});
     });
     demux.set_audio_handler([&](std::span<const std::byte> adts, std::uint64_t pts) {
-        static_cast<void>(transcoder.on_audio(adts, static_cast<std::int64_t>(pts)));
+        audio_queue.push(
+            AudioWorkItem{std::vector<std::byte>(adts.begin(), adts.end()), static_cast<std::int64_t>(pts)});
     });
 
     status_.store(PullerStatus::Running);
@@ -332,6 +433,10 @@ void HlsSourcePuller::run() {
             sleep_cv.wait_for(lock, std::chrono::seconds(2), [&] { return !running_.load(); });
         }
 
+        // Drain whatever's still queued through the video/audio workers
+        // before finalizing, so the last frames received aren't lost.
+        video_queue.stop();
+        audio_queue.stop();
         for (auto& segmenter : segmenters) segmenter->finalize();
         for (auto& publisher : publishers) publisher->flush();
         for (auto& rendition : renditions_) rendition.store->mark_ended();
@@ -442,7 +547,10 @@ void HlsSourcePuller::run() {
         sleep_cv.wait_for(lock, wait, [&] { return !running_.load(); });
     }
 
-    // Drain encoders and close every rendition's final segment.
+    // Drain whatever's still queued through the video/audio workers, then
+    // the encoders, then close every rendition's final segment.
+    video_queue.stop();
+    audio_queue.stop();
     for (auto& segmenter : segmenters) segmenter->finalize();
     for (auto& publisher : publishers) publisher->flush();
     for (auto& rendition : renditions_) rendition.store->mark_ended();

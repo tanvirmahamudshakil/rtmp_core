@@ -3,6 +3,7 @@
 #include <chrono>
 #include <cstdint>
 #include <functional>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <vector>
@@ -95,6 +96,18 @@ private:
     bool is_discontinuous(std::uint32_t timestamp) const;
     void start_segment(std::uint32_t timestamp);
     [[nodiscard]] std::uint64_t to_90k(std::int64_t milliseconds) const;
+
+    // Guards every method below: on_metadata/on_audio/on_video/finalize
+    // (RecorderSink) and mark_publisher_reconnect() all read or mutate the
+    // shared TS-building state (current_, muxer_, next_sequence_, ...).
+    // Originally safe because everything came from one "media thread"; a
+    // source-transcode job now decodes/encodes video and audio on their own
+    // threads for throughput and pushes into the same Segmenter from both,
+    // so this class has to serialize its own state instead of trusting a
+    // single-caller assumption that no longer holds. The critical section is
+    // just muxing one already-encoded access unit -- short relative to the
+    // decode/encode work callers do outside the lock.
+    mutable std::mutex mutex_;
 
     SegmentCallback on_segment_;
     SegmenterConfig config_;

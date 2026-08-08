@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -125,9 +126,15 @@ private:
     AudioOutput audio_output_;
     bool started_ = false;
     bool audio_configured_ = false;
-    bool video_clock_set_ = false;
+    // Atomic: written only from on_video's own caller thread, but read from
+    // on_audio's anchor logic, which (per the caller's own threading model --
+    // see hls_source_puller.cpp) can now run on a different thread than
+    // on_video for throughput. last_input_video_pts_90k_ and
+    // frame_selection_accumulator_ stay plain -- on_video-internal only,
+    // never read from on_audio.
+    std::atomic<bool> video_clock_set_ = false;
     std::int64_t last_input_video_pts_90k_ = 0;
-    std::int64_t next_output_video_pts_90k_ = 0;
+    std::atomic<std::int64_t> next_output_video_pts_90k_ = 0;
     std::int64_t frame_selection_accumulator_ = 0;
     // Consecutive frames dropped by on_video's backward-discontinuity gate;
     // once this covers about half a second of real frames, the gate treats
