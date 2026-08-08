@@ -291,6 +291,25 @@ core::Result<void> SourceTranscoder::on_audio(std::span<const std::byte> adts,
             rendition.audio_samples += frame.samples_per_channel;
             if (audio_output_) audio_output_(i, frame, out_pts);
         }
+
+        // Periodic resync rather than a one-time anchor. Audio's clock is
+        // paced purely from its own decoded sample count from the anchor
+        // point on, which is precise sample-to-sample but has no way to
+        // correct for video's clock not perfectly tracking real time (video
+        // silently discards a little real time on every frame its own
+        // backward-jitter gate drops, on_video's comment above). That
+        // per-frame slip is imperceptible on its own but compounds over a
+        // long session. Re-anchoring to video's current position every ~3s
+        // of audio caps how far the two can ever drift apart at whatever
+        // accumulates within one such window, rather than letting it grow
+        // for the life of the stream.
+        constexpr std::int64_t kResyncIntervalTicks = 3 * static_cast<std::int64_t>(kClockHz);
+        const std::int64_t elapsed_ticks =
+            static_cast<std::int64_t>(rendition.audio_samples * kClockHz / std::max(rate, 1u));
+        if (elapsed_ticks >= kResyncIntervalTicks) {
+            rendition.audio_base_set = false;
+            rendition.audio_samples = 0;
+        }
     }
     return {};
 }
