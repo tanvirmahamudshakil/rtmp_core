@@ -234,6 +234,20 @@ core::Result<void> SourceTranscoder::on_audio(std::span<const std::byte> adts,
     if (auto r = audio_decoder_.decode(adts, pcm_, produced); !r) return r.error();
     if (!produced) return {};
 
+    // Audio's anchor (below) is video's current output position -- there is
+    // no valid fallback for "video hasn't decoded a frame yet": video's
+    // clock is in raw source-PTS units (arbitrarily large, whatever the
+    // source's own absolute clock says), so any placeholder value picked
+    // here (0, or audio's own raw PTS) would be in a completely different
+    // coordinate space once video does start, producing exactly the kind of
+    // massive misalignment this anchor exists to prevent. Simplest correct
+    // behavior: audio frames that arrive before video's first one are
+    // dropped (still decoded, to keep the decoder's internal state warm --
+    // just not encoded/emitted) until video establishes a real position to
+    // anchor to. In practice video locks onto its first keyframe within a
+    // frame or two, so this costs at most a handful of audio frames.
+    if (!video_clock_set_) return {};
+
     for (std::size_t i = 0; i < renditions_.size(); ++i) {
         auto& rendition = *renditions_[i];
         if (!rendition.audio_open) {
