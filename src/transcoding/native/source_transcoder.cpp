@@ -47,16 +47,27 @@ core::Result<void> SourceTranscoder::start() {
     // only two cores even though its 720p/360p peers finish much earlier.
     const auto hardware = std::thread::hardware_concurrency();
     const std::size_t core_budget = static_cast<std::size_t>(hardware > 0 ? hardware : 1);
+    // A resolution-tiered baseline alone left a low-res job (720p and below
+    // -- most source-transcode jobs, which are typically one or two low-
+    // bitrate renditions) pinned to 1-2 encoder threads regardless of how
+    // many cores the box actually has, since desired was never more than
+    // that below 1080p. fair_share spreads the box's cores evenly across
+    // however many renditions this job has instead, so a single-rendition
+    // job on a 24-core box gets a real slice of it rather than the
+    // resolution tier's fixed floor; higher tiers still get at least their
+    // own floor on a box with more renditions than cores to go around.
+    const std::size_t fair_share =
+        std::max<std::size_t>(1, core_budget / std::max<std::size_t>(renditions_.size(), 1));
     for (auto& rendition : renditions_) {
         const auto pixels =
             static_cast<std::uint64_t>(rendition->spec.width) * rendition->spec.height;
-        std::size_t desired = 1;
+        std::size_t desired = fair_share;
         if (pixels >= 3840ULL * 2160ULL) {
-            desired = 8;
+            desired = std::max(fair_share, std::size_t{8});
         } else if (pixels >= 1920ULL * 1080ULL) {
-            desired = 4;
+            desired = std::max(fair_share, std::size_t{4});
         } else if (pixels >= 1280ULL * 720ULL) {
-            desired = 2;
+            desired = std::max(fair_share, std::size_t{2});
         }
         rendition->video_threads =
             static_cast<std::uint32_t>(std::clamp<std::size_t>(desired, 1, core_budget));

@@ -877,8 +877,18 @@ sub vcl_backend_fetch {
 sub vcl_backend_response {
     if (bereq.url ~ "\.ts(\?.*)?$") {
         if (beresp.status == 200) {
-            set beresp.ttl = 1h;
-            set beresp.grace = 1h;
+            # A source-transcode job's SegmentStore only keeps a live sliding
+            # window (tens of seconds -- see source_job_manager.cpp) before
+            # evicting a segment for good; the origin 404s anything older.
+            # Caching a segment for the old 1h/1h meant Varnish kept serving
+            # (and holding memory for) copies of segments no live viewer
+            # could still be behind, for up to an hour after they stopped
+            # mattering. A few minutes covers every real reason to still
+            # want the cached bytes -- concurrent viewers on the same
+            # segment, a brief origin hiccup -- without holding stale data
+            # around once it's actually been served out to everyone watching.
+            set beresp.ttl = 2m;
+            set beresp.grace = 10s;
         } else {
             # Anything but a clean 200 (404, 5xx) must not be cached and
             # poison every viewer behind it.
