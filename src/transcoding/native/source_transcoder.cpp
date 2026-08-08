@@ -223,7 +223,7 @@ core::Result<void> SourceTranscoder::on_video(std::span<const std::byte> annexb,
 }
 
 core::Result<void> SourceTranscoder::on_audio(std::span<const std::byte> adts,
-                                              std::int64_t pts_90k) {
+                                              std::int64_t /*pts_90k*/) {
     if (!started_) return source_error("transcoder not started");
     if (!audio_configured_) {
         if (auto r = audio_decoder_.configure_adts(); !r) return r.error();
