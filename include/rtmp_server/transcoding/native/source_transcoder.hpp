@@ -72,6 +72,21 @@ public:
 
     [[nodiscard]] std::size_t rendition_count() const noexcept { return renditions_.size(); }
 
+    // Call after a source reconnect/gap (a skipped segment, an upstream
+    // EXT-X-DISCONTINUITY) so the next video frame's PTS is treated as a
+    // fresh clock start instead of being compared against the pre-gap
+    // timeline. Without this, on_video's backward-discontinuity gate (it
+    // silently drops a frame whose PTS looks like it went backwards by less
+    // than 5s, to absorb ordinary jitter) can keep tripping on the new
+    // segment's timestamps for as long as they read as "slightly behind"
+    // the last pre-gap frame, dropping every video frame while audio -- which
+    // has no equivalent gate -- keeps playing: audio continues, video
+    // freezes, exactly the reported symptom.
+    void mark_discontinuity() noexcept {
+        video_clock_set_ = false;
+        frame_selection_accumulator_ = 0;
+    }
+
 private:
     struct Rendition {
         RenditionSpec spec;

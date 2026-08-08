@@ -409,6 +409,11 @@ void HlsSourcePuller::run() {
             }
             if (segment->discontinuity || pending_fetch_gap) {
                 for (auto& feed : feeds) feed->mark_discontinuity();
+                // Also reset the transcoder's own video clock gate -- see
+                // SourceTranscoder::mark_discontinuity()'s comment for why
+                // skipping this left video frozen (while audio kept
+                // playing) after exactly this kind of gap.
+                transcoder.mark_discontinuity();
                 pending_fetch_gap = false;
             }
             static_cast<void>(demux.feed(result.value()));
