@@ -164,18 +164,15 @@ core::Result<void> SourceTranscoder::on_video(std::span<const std::byte> annexb,
         }
         next_output_video_pts_90k_ += output_interval_90k;
     } else {
-        if (!program_start_set_) {
-            program_start_pts_90k_ = decoded_.pts_90k;
-            program_start_set_ = true;
-        }
         video_clock_set_ = true;
-        // Relative to the shared program start, not the raw source PTS: see
-        // program_start_pts_90k_'s comment for why anchoring independently
-        // to each stream's own incoming PTS isn't enough to keep audio and
-        // video aligned. last_input_video_pts_90k_ stays in raw source units
-        // -- it's only ever compared against future raw decoded_.pts_90k
-        // values above, never mixed with the output clock.
-        next_output_video_pts_90k_ = decoded_.pts_90k - program_start_pts_90k_;
+        // Video's own output clock just starts from its own raw source PTS
+        // -- it never needs to agree with any other stream's coordinate
+        // space, only be internally consistent with its own later frames
+        // (the delta comparisons above). on_audio anchors to *this* value
+        // directly (see its comment) rather than to any shared "program
+        // start", so audio ends up in video's coordinate space automatically
+        // regardless of what video's own base happens to be.
+        next_output_video_pts_90k_ = decoded_.pts_90k;
         last_input_video_pts_90k_ = decoded_.pts_90k;
         consecutive_backward_drops_ = 0;
     }
@@ -247,19 +244,26 @@ core::Result<void> SourceTranscoder::on_audio(std::span<const std::byte> adts,
             if (auto r = rendition.audio_encoder.open(params); !r) return r.error();
             rendition.audio_open = true;
         }
-        if (!program_start_set_) {
-            program_start_pts_90k_ = pts_90k;
-            program_start_set_ = true;
-        }
         if (!rendition.audio_base_set) {
-            // Relative to the shared program start -- see
-            // program_start_pts_90k_'s comment. If video already set the
-            // program start (from an earlier-arriving frame), this anchors
-            // audio's output clock to that same zero point instead of its
-            // own raw incoming PTS, so the two tracks agree on "time zero"
-            // even when the source's own audio/video PTS values don't share
-            // one.
-            rendition.audio_base_pts_90k = pts_90k - program_start_pts_90k_;
+            // Anchor to video's *current output position*, not to this
+            // frame's own raw incoming pts_90k. Measured on real sources:
+            // the source's own audio and video PES streams can carry PTS
+            // values tens of seconds apart with no discontinuity between
+            // them -- an upstream muxing quirk, not something libfdk-aac
+            // being slow to lock on explains (it produces output within a
+            // frame or two of being fed valid ADTS). Trusting audio's own
+            // raw PTS for the anchor just inherited that gap verbatim into
+            // the output, which was severe enough that players dropped the
+            // audio track rather than play it desynced. Tying the anchor to
+            // wherever video's output clock already is sidesteps the
+            // source's PTS relationship entirely -- audio starts exactly
+            // when it's decoded, at whatever point in the stream video is
+            // currently showing, and paces itself from there purely by its
+            // own sample count (below), immune to whatever the source's PTS
+            // says. Falls back to 0 if video hasn't produced a frame yet
+            // (audio arrived first); video's own first frame doesn't need
+            // to agree with this since video never reads audio's clock.
+            rendition.audio_base_pts_90k = video_clock_set_ ? next_output_video_pts_90k_ : 0;
             rendition.audio_base_set = true;
         }
 
