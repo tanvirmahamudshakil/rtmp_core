@@ -113,13 +113,17 @@ private:
     }
 
     // A source's ~9-12s chunk decodes into roughly that many ~1s output
-    // segments in one burst (hls_source_puller.cpp's run() -- 4x the burst
-    // size the old 4s target produced), so the backlog allowance scales with
-    // it: high enough that a typical single-poll burst still gets smoothed
-    // at the steady 1-per-interval pace, low enough to still cap how far a
-    // genuinely faster-than-expected source could push the stream behind
-    // live before this drains it immediately instead of waiting.
-    static constexpr std::size_t kMaxBacklog = 8;
+    // segments in one burst. The previous value (8) sat inside that same
+    // 9-12 range, so a typical burst hit the "drain immediately" path on
+    // almost every poll instead of the smoothed 1-per-interval path this
+    // class exists to provide -- the entire burst flushed out in well under
+    // a second, then the live edge sat static for the rest of the source's
+    // ~9-12s publish interval, which is a worse stall than not smoothing at
+    // all would have produced. Set comfortably above a typical burst (~1.5x
+    // the high end) so normal bursts stay on the smoothed path; only a
+    // burst genuinely larger than what one source poll should ever produce
+    // still triggers the fast-drain catch-up.
+    static constexpr std::size_t kMaxBacklog = 18;
 
     std::shared_ptr<hls::SegmentStore> store_;
     std::chrono::milliseconds interval_;
