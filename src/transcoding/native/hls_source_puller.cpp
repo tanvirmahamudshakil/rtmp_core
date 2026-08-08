@@ -112,7 +112,14 @@ private:
         }
     }
 
-    static constexpr std::size_t kMaxBacklog = 2;
+    // A source's ~9-12s chunk decodes into roughly that many ~1s output
+    // segments in one burst (hls_source_puller.cpp's run() -- 4x the burst
+    // size the old 4s target produced), so the backlog allowance scales with
+    // it: high enough that a typical single-poll burst still gets smoothed
+    // at the steady 1-per-interval pace, low enough to still cap how far a
+    // genuinely faster-than-expected source could push the stream behind
+    // live before this drains it immediately instead of waiting.
+    static constexpr std::size_t kMaxBacklog = 8;
 
     std::shared_ptr<hls::SegmentStore> store_;
     std::chrono::milliseconds interval_;
@@ -235,11 +242,22 @@ void HlsSourcePuller::run() {
     segmenters.reserve(renditions_.size());
     feeds.reserve(renditions_.size());
     publishers.reserve(renditions_.size());
+    // Source-transcode jobs cut much shorter segments than the 4s default:
+    // pulling from an upstream that publishes in irregular 9-12s chunks
+    // means every second waiting for a *segment* (not just for the source)
+    // adds latency and makes a stall/catch-up more visible when it happens.
+    // 1s segments (the segmenter can only actually cut on a keyframe, so
+    // real durations round up to the source's own keyframe spacing) get
+    // smaller pieces of already-decoded video in front of viewers sooner,
+    // and give PacedSegmentPublisher finer-grained steps to release instead
+    // of a few large ones.
+    hls::SegmenterConfig segmenter_config;
+    segmenter_config.target_duration = std::chrono::milliseconds(1000);
     for (auto& rendition : renditions_) {
         auto store = rendition.store;
-        auto publisher = std::make_shared<PacedSegmentPublisher>(store, hls::SegmenterConfig{}.target_duration);
+        auto publisher = std::make_shared<PacedSegmentPublisher>(store, segmenter_config.target_duration);
         auto segmenter = std::make_unique<hls::Segmenter>(
-            [publisher](hls::SegmentPtr segment) { publisher->push(std::move(segment)); });
+            [publisher](hls::SegmentPtr segment) { publisher->push(std::move(segment)); }, segmenter_config);
         feeds.push_back(std::make_unique<hls::RenditionFeed>(*segmenter));
         segmenters.push_back(std::move(segmenter));
         publishers.push_back(std::move(publisher));

@@ -116,17 +116,18 @@ void SourceJobManager::start_locked(Job& job) {
         // A source-transcode job pulls from an upstream HLS/IPTV panel whose
         // own publish cadence can be irregular (observed: mostly steady
         // ~4-9s between segments, occasionally 12-13s -- see
-        // hls_source_puller.cpp's polling comments). The default live
-        // window (6 segments, ~24-36s at this target duration) is sized for
-        // a well-behaved RTMP publisher and leaves no slack: one slow
-        // upstream segment and the player has already drained everything
-        // advertised. A wider window here gives the player enough
-        // pre-buffered segments to absorb one of those slow patches without
-        // visibly stalling, at the cost of a few more seconds of live
-        // latency (the window is what a player buffers behind live edge).
+        // hls_source_puller.cpp's polling comments), and its Segmenter now
+        // cuts ~1s segments (also hls_source_puller.cpp) instead of the 4s
+        // default, so viewers get new video sooner instead of waiting for a
+        // full multi-second chunk. Both the segment-count and the
+        // target-duration-seconds hint below scale with that: the same
+        // ~48-60s of pre-buffered runway as before now takes ~40-60 shorter
+        // segments to hold rather than 12 long ones, still enough slack to
+        // absorb one slow upstream patch without a visible stall.
         hls::SegmentStoreConfig store_config;
-        store_config.live_window_segments = 12;
-        store_config.retention_grace_segments = 6;
+        store_config.live_window_segments = 40;
+        store_config.retention_grace_segments = 20;
+        store_config.target_duration_seconds = 1;
         auto store = std::make_shared<hls::SegmentStore>(store_config);
         if (hooks_.register_store) hooks_.register_store(config.application, spec.output_stream, store);
         job.output_streams.push_back(spec.output_stream);
