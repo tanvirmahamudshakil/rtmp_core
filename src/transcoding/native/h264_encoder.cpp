@@ -37,7 +37,15 @@ H264EncoderConfig build_h264_config(std::uint32_t out_w, std::uint32_t out_h, st
     config.fps = std::max<std::uint32_t>(fps, 1);
     config.bitrate = std::max<std::uint32_t>(bitrate, 100'000);
     config.gop = std::max<std::uint32_t>(gop, 1);
-    config.threads = std::clamp<std::uint32_t>(threads, 1, 8);
+    // Was capped at 8 regardless of what the caller asked for, which
+    // silently discarded SourceTranscoder::start()'s fair_share allocation
+    // on a box with more cores than that available for a job (e.g. 24 cores
+    // split across one or two low-res renditions). x264's own sliced
+    // threading (config below) already stops adding slices once a frame is
+    // too short to split further, so raising this ceiling doesn't force
+    // over-slicing on a small frame -- it just stops throwing away threads
+    // that fair_share correctly decided this job could have.
+    config.threads = std::clamp<std::uint32_t>(threads, 1, 16);
     return config;
 }
 
