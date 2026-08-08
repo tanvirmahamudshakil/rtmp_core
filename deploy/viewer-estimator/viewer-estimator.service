@@ -1,0 +1,17 @@
+[Unit]
+Description=Real HLS viewer estimator (tails Varnish log, corrects origin undercount)
+After=varnish.service
+Requires=varnish.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /usr/local/bin/viewer_estimator.py
+Restart=on-failure
+RestartSec=2
+User=root
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/rtmp-server
+
+[Install]
+WantedBy=multi-user.target

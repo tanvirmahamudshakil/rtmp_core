@@ -936,6 +936,13 @@ ${CADDY_SITE} {
         reverse_proxy 127.0.0.1:8080
     }
 
+    @viewer_estimate path /internal/viewer_estimate.json
+    handle @viewer_estimate {
+        root * /var/lib/rtmp-server
+        rewrite * /viewer_estimate.json
+        file_server
+    }
+
     @hls path /hls/*
     handle @hls {
         reverse_proxy 127.0.0.1:6081
@@ -1002,6 +1009,12 @@ for _ in $(seq 1 15); do
   sleep 1
 done
 [[ "${VARNISH_READY}" == "1" ]] || die "Varnish did not start; check 'journalctl -u varnish.service'."
+
+log "Installing viewer estimator (corrects viewer counts for Varnish cache hits)"
+install -m 0755 "${SOURCE_DIR}/deploy/viewer-estimator/viewer_estimator.py" /usr/local/bin/viewer_estimator.py
+install -m 0644 "${SOURCE_DIR}/deploy/viewer-estimator/viewer-estimator.service" /etc/systemd/system/viewer-estimator.service
+systemctl daemon-reload
+systemctl enable --now viewer-estimator.service >/dev/null
 
 systemctl enable --now caddy.service >/dev/null
 systemctl restart caddy.service

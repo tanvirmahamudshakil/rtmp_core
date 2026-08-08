@@ -87,6 +87,32 @@ export type Snapshot = {
 
 type ListResponse<T> = { items: T[]; total: number };
 
+// Varnish caches nearly every HLS segment/playlist request, so the origin's
+// own per-IP viewer tracking (which only sees cache misses) badly undercounts
+// real viewers. viewer-estimator.service tails Varnish's own request log
+// instead and republishes distinct-IP-in-window counts, keyed by
+// "application/renditionStreamName" (e.g. "kk/RRR_480"), at
+// /internal/viewer_estimate.json. This folds that in wherever the API's
+// viewer_count would otherwise be shown, falling back to the API's number
+// when the estimator has no data yet (just started, or stream just began).
+function realViewerCount(
+  estimate: Record<string, number>,
+  application: string,
+  name: string,
+  fallback?: number
+): number | undefined {
+  const prefix = `${application}/${name}`;
+  let sum = 0;
+  let matched = false;
+  for (const [key, count] of Object.entries(estimate)) {
+    if (key === prefix || key.startsWith(`${prefix}_`)) {
+      sum += count;
+      matched = true;
+    }
+  }
+  return matched ? sum : fallback;
+}
+
 export class ApiError extends Error {
   constructor(
     message: string,
@@ -177,6 +203,21 @@ export class ControlClient {
     return (text ? JSON.parse(text) : {}) as T;
   }
 
+  // Best-effort: served as a static file outside /api, and simply absent
+  // until viewer-estimator.service has completed its first write, so a
+  // missing/unreachable file falls back silently to the API's own count.
+  private async fetchViewerEstimate(): Promise<Record<string, number>> {
+    if (this.demo) return {};
+    try {
+      const response = await fetch("/internal/viewer_estimate.json", { headers: { Accept: "application/json" } });
+      if (!response.ok) return {};
+      const body = (await response.json()) as { viewers?: Record<string, number> };
+      return body.viewers ?? {};
+    } catch {
+      return {};
+    }
+  }
+
   async snapshot(): Promise<Snapshot> {
     if (this.demo) {
       demoStreams = demoStreams.map((stream) =>
@@ -201,15 +242,17 @@ export class ControlClient {
       )
     ).flatMap((response) => response.items);
 
+    const viewerEstimate = await this.fetchViewerEstimate();
     const withStatus = await Promise.all(
       streams.map(async (stream) => {
         try {
           const status = await this.request<{ is_live: boolean; viewer_count: number; egress_bytes_total?: number }>(
             `/v1/streams/${encodeURIComponent(`${stream.application}:${stream.name}`)}/status`
           );
-          return { ...stream, ...status };
+          const merged = { ...stream, ...status };
+          return { ...merged, viewer_count: realViewerCount(viewerEstimate, stream.application, stream.name, merged.viewer_count) };
         } catch {
-          return { ...stream };
+          return { ...stream, viewer_count: realViewerCount(viewerEstimate, stream.application, stream.name, stream.viewer_count) };
         }
       })
     );
@@ -420,10 +463,16 @@ export class ControlClient {
     if (this.demo) {
       return demoSourceJobs.filter((job) => job.application === application).map((job) => ({ ...job, outputs: [...job.outputs] }));
     }
-    const response = await this.request<{ items: SourceTranscodeJob[] }>(
-      `/v1/transcoding/source-jobs?application=${encodeURIComponent(application)}`
-    );
-    return response.items;
+    const [response, viewerEstimate] = await Promise.all([
+      this.request<{ items: SourceTranscodeJob[] }>(
+        `/v1/transcoding/source-jobs?application=${encodeURIComponent(application)}`
+      ),
+      this.fetchViewerEstimate()
+    ]);
+    return response.items.map((job) => ({
+      ...job,
+      viewer_count: realViewerCount(viewerEstimate, job.application, job.name, job.viewer_count)
+    }));
   }
 
   async createSourceTranscode(
