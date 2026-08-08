@@ -247,9 +247,16 @@ void HlsSourcePuller::run() {
             break; // VOD: nothing more to pull
         }
 
-        // Live: wait roughly one target duration before refreshing the window.
+        // Live: poll at half the target duration (standard HLS client practice).
+        // Waiting a full target duration compounds with our own fetch/transcode
+        // time, so a segment that becomes available just after we slept can sit
+        // unpicked for close to two target durations — output then arrives in
+        // bursts (all segments since last poll) followed by an idle gap, which
+        // shows up as stall/lag on the viewer side. Polling twice as often keeps
+        // that worst case near one target duration without materially raising
+        // request load (the playlist itself is a few hundred bytes).
         const auto wait = std::chrono::milliseconds(
-            static_cast<long long>(std::max(1.0, playlist.target_duration) * 1000));
+            static_cast<long long>(std::max(1.0, playlist.target_duration / 2.0) * 1000));
         std::unique_lock lock(sleep_mutex);
         sleep_cv.wait_for(lock, wait, [&] { return !running_.load(); });
     }
