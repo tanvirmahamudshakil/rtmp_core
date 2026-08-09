@@ -87,14 +87,11 @@ export type Snapshot = {
 
 type ListResponse<T> = { items: T[]; total: number };
 
-// Varnish caches nearly every HLS segment/playlist request, so the origin's
-// own per-IP viewer tracking (which only sees cache misses) badly undercounts
-// real viewers. viewer-estimator.service tails Varnish's own request log
-// instead and republishes distinct-IP-in-window counts, keyed by
-// "application/renditionStreamName" (e.g. "kk/RRR_480"), at
-// /internal/viewer_estimate.json. This folds that in wherever the API's
-// viewer_count would otherwise be shown, falling back to the API's number
-// when the estimator has no data yet (just started, or stream just began).
+// Varnish sees every HLS request, including cache hits. The edge estimator
+// republishes active playback-session counts keyed directly by the master
+// link (e.g. "kk/RRR") at /internal/viewer_estimate.json. Session identity,
+// unlike IP identity, counts multiple VLC players behind one NAT separately.
+// Legacy per-rendition keys are still summed during rolling upgrades.
 function realViewerCount(
   estimate: Record<string, number>,
   application: string,

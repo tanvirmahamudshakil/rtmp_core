@@ -88,7 +88,7 @@ public:
     // rather than to its own raw incoming PTS.
     void mark_discontinuity() noexcept {
         video_clock_set_ = false;
-        frame_selection_accumulator_ = 0;
+        next_input_video_pts_90k_ = 0;
         consecutive_backward_drops_ = 0;
         for (auto& rendition : renditions_) {
             rendition->audio_base_set = false;
@@ -128,7 +128,10 @@ private:
     bool video_clock_set_ = false;
     std::int64_t last_input_video_pts_90k_ = 0;
     std::int64_t next_output_video_pts_90k_ = 0;
-    std::int64_t frame_selection_accumulator_ = 0;
+    // Absolute input-PTS deadline for output frame sampling. Unlike a delta
+    // accumulator this tolerates 30fps's normal 2970/3060 tick rounding
+    // without dropping a third of the pictures.
+    std::int64_t next_input_video_pts_90k_ = 0;
     // Consecutive frames dropped by on_video's backward-discontinuity gate;
     // once this covers about half a second of real frames, the gate treats
     // it as an unflagged discontinuity instead of waiting out the full

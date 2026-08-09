@@ -1,5 +1,5 @@
 [Unit]
-Description=Real HLS viewer estimator (tails Varnish log, corrects origin undercount)
+Description=Active HLS playback-session counter (includes Varnish cache hits)
 After=varnish.service
 Requires=varnish.service
 

@@ -1,139 +1,20 @@
 #include "rtmp_server/transcoding/native/hls_source_puller.hpp"
 
 #include <algorithm>
-#include <atomic>
 #include <chrono>
 #include <condition_variable>
-#include <deque>
 #include <future>
 #include <mutex>
 #include <thread>
 
 #include "rtmp_server/observability/logger.hpp"
 #include "rtmp_server/transcoding/native/hls_playlist.hpp"
+#include "rtmp_server/transcoding/native/paced_segment_publisher.hpp"
 
 namespace rtmp_server::transcoding::native {
 
 namespace {
 using observability::LogLevel;
-
-bool ends_with(const std::string& s, std::string_view suffix) {
-    return s.size() >= suffix.size() && s.compare(s.size() - suffix.size(), suffix.size(), suffix) == 0;
-}
-
-// The source's own segment cadence (10-15s) is bursty relative to what we
-// publish (~4s per output segment): a single playlist poll can turn up
-// several unseen source segments at once, which the decode/transcode loop
-// races through in well under a second. Handing each finished output
-// segment to the SegmentStore the instant Segmenter produces it would mirror
-// that burst straight through to viewers -- several segments appear at once,
-// then the live playlist sits static for 8-13s until the next source chunk
-// arrives, which is exactly the stall/lag viewers see.
-//
-// This sits between Segmenter's on_segment callback and the store, and
-// releases at most one queued segment every `interval` (matching the
-// rendition's own target duration) rather than the instant it's ready. A
-// burst of newly-transcoded segments queues up here and drains out at the
-// steady rate viewers actually expect; the first segment after an idle
-// period is released immediately rather than waiting a full interval, so
-// steady-state latency isn't worsened, only bursts are smoothed. Because the
-// source only ever exposes a few segments per playlist window, the queue is
-// naturally bounded to a handful of entries -- there is no unbounded
-// look-ahead to buffer against, only what the source has already published.
-class PacedSegmentPublisher {
-public:
-    PacedSegmentPublisher(std::shared_ptr<hls::SegmentStore> store, std::chrono::milliseconds interval)
-        : store_(std::move(store)), interval_(interval), next_publish_(std::chrono::steady_clock::now()) {
-        thread_ = std::thread([this] { run(); });
-    }
-
-    ~PacedSegmentPublisher() { stop(); }
-
-    void push(hls::SegmentPtr segment) {
-        std::lock_guard lock(mutex_);
-        queue_.push_back(std::move(segment));
-        wake_.notify_one();
-    }
-
-    // Releases everything still queued right now, bypassing the pacing
-    // delay. Called when the puller itself is stopping (source ended,
-    // shutdown) so the last few buffered seconds aren't stranded behind an
-    // interval that will never fire again.
-    void flush() {
-        std::deque<hls::SegmentPtr> pending;
-        {
-            std::lock_guard lock(mutex_);
-            pending.swap(queue_);
-        }
-        for (auto& segment : pending) store_->add_segment(std::move(segment));
-    }
-
-    void stop() {
-        if (stopped_.exchange(true)) return;
-        wake_.notify_one();
-        if (thread_.joinable()) thread_.join();
-    }
-
-    // Diagnostic only: lets the puller loop log how much is backed up here.
-    [[nodiscard]] std::size_t queue_size() const {
-        std::lock_guard lock(mutex_);
-        return queue_.size();
-    }
-
-private:
-    void run() {
-        while (!stopped_.load()) {
-            std::unique_lock lock(mutex_);
-            wake_.wait_for(lock, std::chrono::milliseconds(200), [this] { return stopped_.load(); });
-            if (stopped_.load()) break;
-            if (queue_.empty()) continue;
-            const auto now = std::chrono::steady_clock::now();
-            // Only hold a segment back for pacing while the backlog is small
-            // (a couple of segments -- exactly the kind of single-poll burst
-            // this class exists to smooth). A source that's genuinely
-            // publishing faster than we're releasing would otherwise build an
-            // ever-growing backlog behind pacing that never repays itself --
-            // each publish resets next_publish_ another interval_ into the
-            // future regardless of how much is still queued, so a source
-            // outrunning that fixed rate falls permanently further behind
-            // live with every segment (this is exactly what was reported:
-            // playback drifting further from the live edge over the session,
-            // not just occasional stalls). Once the backlog passes
-            // kMaxBacklog, drain immediately instead of waiting for
-            // next_publish_, which caps how far behind live pacing can ever
-            // push the stream and self-corrects any drift within a couple of
-            // segments.
-            if (queue_.size() <= kMaxBacklog && now < next_publish_) continue;
-            auto segment = std::move(queue_.front());
-            queue_.pop_front();
-            lock.unlock();
-            store_->add_segment(std::move(segment));
-            next_publish_ = now + interval_;
-        }
-    }
-
-    // A source's ~9-12s chunk decodes into roughly that many ~1s output
-    // segments in one burst. The previous value (8) sat inside that same
-    // 9-12 range, so a typical burst hit the "drain immediately" path on
-    // almost every poll instead of the smoothed 1-per-interval path this
-    // class exists to provide -- the entire burst flushed out in well under
-    // a second, then the live edge sat static for the rest of the source's
-    // ~9-12s publish interval, which is a worse stall than not smoothing at
-    // all would have produced. Set comfortably above a typical burst (~1.5x
-    // the high end) so normal bursts stay on the smoothed path; only a
-    // burst genuinely larger than what one source poll should ever produce
-    // still triggers the fast-drain catch-up.
-    static constexpr std::size_t kMaxBacklog = 18;
-
-    std::shared_ptr<hls::SegmentStore> store_;
-    std::chrono::milliseconds interval_;
-    std::chrono::steady_clock::time_point next_publish_;
-    std::deque<hls::SegmentPtr> queue_;
-    mutable std::mutex mutex_;
-    std::condition_variable wake_;
-    std::thread thread_;
-    std::atomic<bool> stopped_{false};
-};
 
 // Many IPTV/CDN panels answer an .m3u8-shaped URL with a redirect straight to
 // a continuously-flowing raw MPEG-TS body (no playlist, connection never
@@ -259,7 +140,10 @@ void HlsSourcePuller::run() {
     segmenter_config.target_duration = std::chrono::milliseconds(1000);
     for (auto& rendition : renditions_) {
         auto store = rendition.store;
-        auto publisher = std::make_shared<PacedSegmentPublisher>(store, segmenter_config.target_duration);
+        PacedSegmentPublisherConfig publisher_config;
+        publisher_config.startup_buffer = std::chrono::seconds(30);
+        publisher_config.fallback_interval = segmenter_config.target_duration;
+        auto publisher = std::make_shared<PacedSegmentPublisher>(store, publisher_config);
         auto segmenter = std::make_unique<hls::Segmenter>(
             [publisher](hls::SegmentPtr segment) { publisher->push(std::move(segment)); }, segmenter_config);
         feeds.push_back(std::make_unique<hls::RenditionFeed>(*segmenter));

@@ -1,5 +1,6 @@
 #include "rtmp_server/transcoding/native/source_job_manager.hpp"
 
+#include <algorithm>
 #include <limits>
 
 #include "rtmp_server/core/error.hpp"
@@ -113,21 +114,20 @@ void SourceJobManager::start_locked(Job& job) {
     std::vector<hls::Rendition> master_renditions;
     puller_renditions.reserve(config.renditions.size());
     for (const auto& spec : config.renditions) {
-        // A source-transcode job pulls from an upstream HLS/IPTV panel whose
-        // own publish cadence can be irregular (observed: mostly steady
-        // ~4-9s between segments, occasionally 12-13s -- see
-        // hls_source_puller.cpp's polling comments), and its Segmenter now
-        // cuts ~1s segments (also hls_source_puller.cpp) instead of the 4s
-        // default, so viewers get new video sooner instead of waiting for a
-        // full multi-second chunk. Both the segment-count and the
-        // target-duration-seconds hint below scale with that: the same
-        // ~48-60s of pre-buffered runway as before now takes ~40-60 shorter
-        // segments to hold rather than 12 long ones, still enough slack to
-        // absorb one slow upstream patch without a visible stall.
+        // Keep 30 seconds advertised plus another 30 seconds of stale-request
+        // grace. Segment count is derived from the rendition's real GOP
+        // duration: the Segmenter target may be 1s, but a 60-frame GOP at
+        // 30fps can only produce independently decodable ~2s segments.
+        constexpr std::size_t kWindowSeconds = 30;
+        const auto fps = std::max<std::uint32_t>(config.fps, 1);
+        const auto segment_seconds =
+            std::max<std::uint32_t>(1, (spec.gop + fps - 1) / fps);
+        const auto window_segments = std::max<std::size_t>(
+            3, (kWindowSeconds + segment_seconds - 1) / segment_seconds);
         hls::SegmentStoreConfig store_config;
-        store_config.live_window_segments = 40;
-        store_config.retention_grace_segments = 20;
-        store_config.target_duration_seconds = 1;
+        store_config.live_window_segments = window_segments;
+        store_config.retention_grace_segments = window_segments;
+        store_config.target_duration_seconds = segment_seconds;
         auto store = std::make_shared<hls::SegmentStore>(store_config);
         if (hooks_.register_store) hooks_.register_store(config.application, spec.output_stream, store);
         job.output_streams.push_back(spec.output_stream);

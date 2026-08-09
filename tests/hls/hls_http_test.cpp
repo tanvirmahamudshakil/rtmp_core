@@ -16,6 +16,12 @@ using namespace std::chrono_literals;
 namespace {
 
 constexpr const char* kSecret = "phase6-test-signing-secret";
+constexpr const char* kSessionA = "00112233445566778899aabbccddeeff";
+constexpr const char* kSessionB = "ffeeddccbbaa99887766554433221100";
+
+std::string session_query(std::string_view session, std::string_view master = "demo") {
+    return "viewer_session=" + std::string(session) + "&viewer_stream=" + std::string(master);
+}
 
 hls::SegmentPtr make_segment(std::uint64_t sequence, std::size_t bytes = 1024) {
     auto segment = std::make_shared<hls::Segment>();
@@ -99,6 +105,58 @@ TEST(HlsHttpTest, ServesTheMasterPlaylistWhenRenditionsAreDeclared) {
     EXPECT_EQ(response.content_type, kContentTypeM3u8);
     EXPECT_NE(response.body.find("BANDWIDTH=2500000"), std::string::npos);
     EXPECT_NE(response.body.find("RESOLUTION=1280x720"), std::string::npos);
+}
+
+TEST(HlsHttpTest, FreshPlaylistOpenGetsUniquePlaybackSessionRedirect) {
+    HlsHttpOptions options;
+    options.enable_playback_sessions = true;
+    options.playback_session_id_factory = [] { return std::string(kSessionA); };
+    HlsHttpHandler handler{options};
+    handler.register_stream("live", "demo", populated_store());
+    hls::Rendition rendition;
+    rendition.uri = "../demo_480/index.m3u8";
+    handler.set_renditions("live", "demo", {rendition});
+
+    const auto response = handler.handle(get("/hls/live/demo/master.m3u8", "token=keep-me"));
+    EXPECT_EQ(response.status, 302);
+    EXPECT_EQ(header_of(response, "Cache-Control"), "private, no-store");
+    EXPECT_EQ(header_of(response, "Location"),
+              "/hls/live/demo/master.m3u8?token=keep-me&" + session_query(kSessionA));
+}
+
+TEST(HlsHttpTest, PlaybackSessionPropagatesFromMasterToVariantAndSegments) {
+    HlsHttpOptions options;
+    options.enable_playback_sessions = true;
+    HlsHttpHandler handler{options};
+    handler.register_stream("live", "demo", populated_store());
+    handler.register_stream("live", "demo_480", populated_store(3));
+    hls::Rendition rendition;
+    rendition.uri = "../demo_480/index.m3u8";
+    handler.set_renditions("live", "demo", {rendition});
+    const auto query = session_query(kSessionA);
+
+    const auto master = handler.handle(get("/hls/live/demo/master.m3u8", query));
+    ASSERT_EQ(master.status, 200);
+    EXPECT_EQ(header_of(master, "Cache-Control"), "private, no-store");
+    EXPECT_NE(master.body.find("../demo_480/index.m3u8?" + query), std::string::npos) << master.body;
+
+    const auto media = handler.handle(get("/hls/live/demo_480/index.m3u8", query));
+    ASSERT_EQ(media.status, 200);
+    EXPECT_NE(media.body.find("segment-0.ts?" + query), std::string::npos) << media.body;
+}
+
+TEST(HlsHttpTest, InvalidCallerSessionIsReplacedInsteadOfTrusted) {
+    HlsHttpOptions options;
+    options.enable_playback_sessions = true;
+    options.playback_session_id_factory = [] { return std::string(kSessionB); };
+    HlsHttpHandler handler{options};
+    handler.register_stream("live", "demo", populated_store());
+
+    const auto response = handler.handle(
+        get("/hls/live/demo/index.m3u8", "viewer_session=forged&viewer_stream=fake&token=x"));
+    ASSERT_EQ(response.status, 302);
+    EXPECT_EQ(header_of(response, "Location"),
+              "/hls/live/demo/index.m3u8?token=x&" + session_query(kSessionB));
 }
 
 TEST(HlsHttpTest, UnknownStreamAndUnknownSegmentReturn404) {
@@ -444,11 +502,11 @@ TEST(HlsHttpTest, ManyConcurrentViewersFetchPlaylistsAndSegmentsSafely) {
 
 // --- Live delivery stats (per-stream bandwidth/viewer tracking) -----------
 
-TEST(HlsHttpTest, LinkStatsAccumulateBytesAndDedupeViewersByIp) {
+TEST(HlsHttpTest, LinkStatsAccumulateBytesAndDedupeByPlaybackSessionNotIp) {
     HlsHttpHandler handler{HlsHttpOptions{}};
     handler.register_stream("live", "demo", populated_store());
 
-    auto request_a = get("/hls/live/demo/index.m3u8");
+    auto request_a = get("/hls/live/demo/index.m3u8", session_query(kSessionA));
     request_a.client_ip = "10.0.0.1";
     auto first = handler.handle(request_a);
     ASSERT_EQ(first.status, 200);
@@ -458,21 +516,35 @@ TEST(HlsHttpTest, LinkStatsAccumulateBytesAndDedupeViewersByIp) {
     auto second = handler.handle(request_a_again);
     ASSERT_EQ(second.status, 200);
 
-    auto request_b = get("/hls/live/demo/index.m3u8");
-    request_b.client_ip = "10.0.0.2";
+    // A second VLC on the exact same NAT/IP is still a second viewer.
+    auto request_b = get("/hls/live/demo/index.m3u8", session_query(kSessionB));
+    request_b.client_ip = "10.0.0.1";
     auto third = handler.handle(request_b);
     ASSERT_EQ(third.status, 200);
 
     const auto stats = handler.link_stats("live", "demo");
     EXPECT_EQ(stats.bytes_total, first_bytes + second.payload_size() + third.payload_size());
-    EXPECT_EQ(stats.viewer_count, 2u); // 10.0.0.1 deduped across its two requests, plus 10.0.0.2
+    EXPECT_EQ(stats.viewer_count, 2u);
+}
+
+TEST(HlsHttpTest, SamePlaybackSessionOnDifferentIpsStillCountsOnce) {
+    HlsHttpHandler handler{HlsHttpOptions{}};
+    handler.register_stream("live", "demo", populated_store());
+
+    auto first = get("/hls/live/demo/index.m3u8", session_query(kSessionA));
+    first.client_ip = "10.0.0.1";
+    auto second = first;
+    second.client_ip = "203.0.113.9";
+    ASSERT_EQ(handler.handle(first).status, 200);
+    ASSERT_EQ(handler.handle(second).status, 200);
+    EXPECT_EQ(handler.link_stats("live", "demo").viewer_count, 1u);
 }
 
 TEST(HlsHttpTest, SegmentDeliveryAlsoCountsTowardsLinkStats) {
     HlsHttpHandler handler{HlsHttpOptions{}};
     handler.register_stream("live", "demo", populated_store());
 
-    auto segment = handler.handle(get("/hls/live/demo/segment-0.ts"));
+    auto segment = handler.handle(get("/hls/live/demo/segment-0.ts", session_query(kSessionA)));
     ASSERT_EQ(segment.status, 200);
 
     const auto stats = handler.link_stats("live", "demo");
@@ -509,12 +581,12 @@ TEST(HlsHttpTest, AggregateLinkStatsSumsAcrossEveryAdvertisedRendition) {
     low.uri = "../job-480p/index.m3u8";
     handler.set_renditions("live", "job", {high, low});
 
-    auto request_720p = get("/hls/live/job-720p/index.m3u8");
+    auto request_720p = get("/hls/live/job-720p/index.m3u8", session_query(kSessionA, "job"));
     request_720p.client_ip = "10.0.0.1";
     auto response_720p = handler.handle(request_720p);
     ASSERT_EQ(response_720p.status, 200);
 
-    auto request_480p = get("/hls/live/job-480p/index.m3u8");
+    auto request_480p = get("/hls/live/job-480p/index.m3u8", session_query(kSessionB, "job"));
     request_480p.client_ip = "10.0.0.2";
     auto response_480p = handler.handle(request_480p);
     ASSERT_EQ(response_480p.status, 200);
@@ -528,6 +600,22 @@ TEST(HlsHttpTest, AggregateLinkStatsSumsAcrossEveryAdvertisedRendition) {
     EXPECT_EQ(handler.link_stats("live", "job").bytes_total, 0u);
 }
 
+TEST(HlsHttpTest, AggregateLinkStatsDedupesOneSessionAcrossAbrRenditions) {
+    HlsHttpHandler handler{HlsHttpOptions{}};
+    handler.register_stream("live", "job-720p", populated_store());
+    handler.register_stream("live", "job-480p", populated_store());
+    hls::Rendition high;
+    high.uri = "../job-720p/index.m3u8";
+    hls::Rendition low;
+    low.uri = "../job-480p/index.m3u8";
+    handler.set_renditions("live", "job", {high, low});
+
+    const auto query = session_query(kSessionA, "job");
+    ASSERT_EQ(handler.handle(get("/hls/live/job-720p/index.m3u8", query)).status, 200);
+    ASSERT_EQ(handler.handle(get("/hls/live/job-480p/index.m3u8", query)).status, 200);
+    EXPECT_EQ(handler.aggregate_link_stats("live", "job").viewer_count, 1u);
+}
+
 TEST(HlsHttpTest, AggregateLinkStatsFallsBackToOwnStatsWithoutParseableRenditions) {
     HlsHttpHandler handler{HlsHttpOptions{}};
     handler.register_stream("live", "demo", populated_store());
@@ -537,7 +625,7 @@ TEST(HlsHttpTest, AggregateLinkStatsFallsBackToOwnStatsWithoutParseableRendition
     rendition.uri = "index.m3u8";
     handler.set_renditions("live", "demo", {rendition});
 
-    ASSERT_EQ(handler.handle(get("/hls/live/demo/index.m3u8")).status, 200);
+    ASSERT_EQ(handler.handle(get("/hls/live/demo/index.m3u8", session_query(kSessionA))).status, 200);
 
     const auto aggregate = handler.aggregate_link_stats("live", "demo");
     EXPECT_GT(aggregate.bytes_total, 0u);

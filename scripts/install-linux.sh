@@ -828,7 +828,10 @@ fi
 log "Configuring Varnish HLS segment cache"
 # Varnish sits between Caddy and the origin (127.0.0.1:8080) for /hls/*
 # traffic only, caching immutable .ts segments in RAM so repeat viewer
-# requests never reach the origin process. Playlists (.m3u8) change every
+# requests never reach the origin process. Each player has unique viewer
+# query metadata; vcl_hash deliberately excludes only that metadata from a
+# segment's cache key, retaining shared segment bytes across all sessions.
+# Playlists (.m3u8) change every
 # few seconds, so they get only a 1s micro-cache: long enough to collapse
 # a thousand viewers' near-simultaneous polling into one origin fetch per
 # second, short enough that live-edge latency is unaffected. Token-gated
@@ -841,86 +844,7 @@ VARNISH_CACHE_MB=$(( MEM_TOTAL_KB / 1024 / 4 ))
 if (( VARNISH_CACHE_MB < 256 )); then VARNISH_CACHE_MB=256; fi
 if (( VARNISH_CACHE_MB > 4096 )); then VARNISH_CACHE_MB=4096; fi
 
-cat > /etc/varnish/streamforge.vcl <<'EOF'
-# Managed by StreamForge install-linux.sh
-vcl 4.1;
-
-backend default {
-    .host = "127.0.0.1";
-    .port = "8080";
-}
-
-sub vcl_recv {
-    if (req.method != "GET" && req.method != "HEAD") {
-        return (pass);
-    }
-    if (req.url ~ "\.m3u8(\?.*)?$") {
-        # A query string means a playback token (expiry/claims tied to one
-        # viewer's request): never share that response across viewers.
-        if (req.url ~ "\?") {
-            return (pass);
-        }
-        # Unauthenticated playlist: fall through to the 1s micro-cache
-        # configured in vcl_backend_response below.
-    }
-    return (hash);
-}
-
-sub vcl_backend_fetch {
-    # Always fetch the whole segment from the origin, never a client's partial
-    # range: caching a 206 as if it were the full object would let one
-    # viewer's arbitrary seek range get served to every other viewer.
-    # Varnish serves byte ranges to clients itself from the full cached copy.
-    unset bereq.http.Range;
-}
-
-sub vcl_backend_response {
-    if (bereq.url ~ "\.ts(\?.*)?$") {
-        if (beresp.status == 200) {
-            # A source-transcode job's SegmentStore only keeps a live sliding
-            # window (tens of seconds -- see source_job_manager.cpp) before
-            # evicting a segment for good; the origin 404s anything older.
-            # Caching a segment for the old 1h/1h meant Varnish kept serving
-            # (and holding memory for) copies of segments no live viewer
-            # could still be behind, for up to an hour after they stopped
-            # mattering. A few minutes covers every real reason to still
-            # want the cached bytes -- concurrent viewers on the same
-            # segment, a brief origin hiccup -- without holding stale data
-            # around once it's actually been served out to everyone watching.
-            set beresp.ttl = 2m;
-            set beresp.grace = 10s;
-        } else {
-            # Anything but a clean 200 (404, 5xx) must not be cached and
-            # poison every viewer behind it.
-            set beresp.ttl = 0s;
-            set beresp.uncacheable = true;
-        }
-    } else if (bereq.url ~ "\.m3u8(\?.*)?$") {
-        if (beresp.status == 200) {
-            # Micro-cache: collapses concurrent viewer polling of the same
-            # playlist into one origin fetch/second, without measurably
-            # delaying live-edge updates (segments are several seconds long).
-            set beresp.ttl = 1s;
-            set beresp.grace = 2s;
-        } else {
-            set beresp.ttl = 0s;
-            set beresp.uncacheable = true;
-        }
-    } else {
-        set beresp.ttl = 0s;
-        set beresp.uncacheable = true;
-    }
-    return (deliver);
-}
-
-sub vcl_deliver {
-    unset resp.http.X-Varnish;
-    unset resp.http.Via;
-    unset resp.http.Server;
-}
-EOF
-chown root:root /etc/varnish/streamforge.vcl
-chmod 0644 /etc/varnish/streamforge.vcl
+install -m 0644 "${SOURCE_DIR}/deploy/varnish/streamforge.vcl" /etc/varnish/streamforge.vcl
 
 install -d -m 0755 /etc/systemd/system/varnish.service.d
 cat > /etc/systemd/system/varnish.service.d/streamforge.conf <<EOF
@@ -1020,7 +944,7 @@ for _ in $(seq 1 15); do
 done
 [[ "${VARNISH_READY}" == "1" ]] || die "Varnish did not start; check 'journalctl -u varnish.service'."
 
-log "Installing viewer estimator (corrects viewer counts for Varnish cache hits)"
+log "Installing playback-session viewer counter (includes Varnish cache hits)"
 install -m 0755 "${SOURCE_DIR}/deploy/viewer-estimator/viewer_estimator.py" /usr/local/bin/viewer_estimator.py
 install -m 0644 "${SOURCE_DIR}/deploy/viewer-estimator/viewer-estimator.service" /etc/systemd/system/viewer-estimator.service
 systemctl daemon-reload

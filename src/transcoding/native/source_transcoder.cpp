@@ -149,18 +149,25 @@ core::Result<void> SourceTranscoder::on_video(std::span<const std::byte> annexb,
         if (input_delta <= 0 || input_delta > kBackwardDiscontinuity90k) {
             // Start a new sampling phase after a real timestamp discontinuity,
             // while keeping the generated output clock monotonic.
-            frame_selection_accumulator_ = 0;
+            next_input_video_pts_90k_ = decoded_.pts_90k + output_interval_90k;
         } else {
-            // Accumulate elapsed source time instead of comparing one rounded
-            // delta with output_interval_90k. MPEG-TS sources often express
-            // 60 fps as alternating millisecond-rounded deltas (for example
-            // 1440/1530 ticks); a strict 3000-tick comparison selected every
-            // third frame and turned 60 fps into 20 fps. This phase
-            // accumulator preserves the requested average for any input FPS.
-            frame_selection_accumulator_ +=
-                input_delta * static_cast<std::int64_t>(fps_);
-            if (frame_selection_accumulator_ < static_cast<std::int64_t>(kClockHz)) return {};
-            frame_selection_accumulator_ %= static_cast<std::int64_t>(kClockHz);
+            // Select against an absolute input-PTS deadline, with a small
+            // tolerance for MPEG-TS's millisecond-rounded timestamps. At
+            // 30fps those timestamps commonly alternate 2970/3060 ticks. A
+            // delta accumulator starting from zero treated every 2970-tick
+            // frame as "too early" and emitted only 2/3 of a genuine 30fps
+            // source, while audio kept all of its samples and ran far ahead.
+            // Absolute deadlines preserve all ~30fps frames and still select
+            // every other frame from a 60fps source.
+            const auto jitter_tolerance_90k = std::max<std::int64_t>(1, output_interval_90k / 20);
+            if (decoded_.pts_90k + jitter_tolerance_90k < next_input_video_pts_90k_) return {};
+            next_input_video_pts_90k_ += output_interval_90k;
+            if (next_input_video_pts_90k_ <= decoded_.pts_90k + jitter_tolerance_90k) {
+                // A low-frame-rate source can cross more than one nominal
+                // deadline between pictures. Never duplicate a picture to
+                // catch up; schedule the next decision from this one.
+                next_input_video_pts_90k_ = decoded_.pts_90k + output_interval_90k;
+            }
         }
         next_output_video_pts_90k_ += output_interval_90k;
     } else {
@@ -173,6 +180,7 @@ core::Result<void> SourceTranscoder::on_video(std::span<const std::byte> annexb,
         // start", so audio ends up in video's coordinate space automatically
         // regardless of what video's own base happens to be.
         next_output_video_pts_90k_ = decoded_.pts_90k;
+        next_input_video_pts_90k_ = decoded_.pts_90k + output_interval_90k;
         last_input_video_pts_90k_ = decoded_.pts_90k;
         consecutive_backward_drops_ = 0;
     }
@@ -274,10 +282,10 @@ core::Result<void> SourceTranscoder::on_audio(std::span<const std::byte> adts,
             // when it's decoded, at whatever point in the stream video is
             // currently showing, and paces itself from there purely by its
             // own sample count (below), immune to whatever the source's PTS
-            // says. Falls back to 0 if video hasn't produced a frame yet
-            // (audio arrived first); video's own first frame doesn't need
-            // to agree with this since video never reads audio's clock.
-            rendition.audio_base_pts_90k = video_clock_set_ ? next_output_video_pts_90k_ : 0;
+            // says. on_audio already returned above if video has not produced
+            // a frame yet, so this anchor is always in video's real clock
+            // domain and never needs an incompatible zero fallback.
+            rendition.audio_base_pts_90k = next_output_video_pts_90k_;
             rendition.audio_base_set = true;
         }
 
@@ -292,24 +300,14 @@ core::Result<void> SourceTranscoder::on_audio(std::span<const std::byte> adts,
             if (audio_output_) audio_output_(i, frame, out_pts);
         }
 
-        // Periodic resync rather than a one-time anchor. Audio's clock is
-        // paced purely from its own decoded sample count from the anchor
-        // point on, which is precise sample-to-sample but has no way to
-        // correct for video's clock not perfectly tracking real time (video
-        // silently discards a little real time on every frame its own
-        // backward-jitter gate drops, on_video's comment above). That
-        // per-frame slip is imperceptible on its own but compounds over a
-        // long session. Re-anchoring to video's current position every ~3s
-        // of audio caps how far the two can ever drift apart at whatever
-        // accumulates within one such window, rather than letting it grow
-        // for the life of the stream.
-        constexpr std::int64_t kResyncIntervalTicks = 3 * static_cast<std::int64_t>(kClockHz);
-        const std::int64_t elapsed_ticks =
-            static_cast<std::int64_t>(rendition.audio_samples * kClockHz / std::max(rate, 1u));
-        if (elapsed_ticks >= kResyncIntervalTicks) {
-            rendition.audio_base_set = false;
-            rendition.audio_samples = 0;
-        }
+        // Never hard-reset this sample clock to the most recently processed
+        // video callback. Real TS muxes may place audio PES packets seconds
+        // ahead of video in packet order even when their timestamps are
+        // valid. Re-anchoring to callback order made AAC PTS jump backwards
+        // by seconds every few moments. This exact sample count stays
+        // monotonic until an explicit source discontinuity, where
+        // mark_discontinuity() starts a fresh clock and HLS emits the matching
+        // EXT-X-DISCONTINUITY marker.
     }
     return {};
 }

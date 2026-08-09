@@ -4,8 +4,10 @@
 #include <charconv>
 #include <chrono>
 #include <cstdlib>
+#include <unordered_set>
 #include <utility>
 
+#include "rtmp_server/core/random.hpp"
 #include "rtmp_server/management/token.hpp"
 
 namespace rtmp_server::control {
@@ -27,6 +29,82 @@ std::unordered_map<std::string, std::string> parse_query(std::string_view query)
         pos = amp + 1;
     }
     return params;
+}
+
+constexpr std::string_view kPlaybackSessionParam = "viewer_session";
+constexpr std::string_view kPlaybackStreamParam = "viewer_stream";
+
+bool is_playback_session(std::string_view value) {
+    if (value.size() != 32) return false;
+    return std::all_of(value.begin(), value.end(), [](unsigned char c) {
+        return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+    });
+}
+
+// Stream/application path components are already split before this is used.
+// Percent-encode again when putting one into a query value so '&', '=', '%'
+// or whitespace can never manufacture an extra parameter.
+std::string percent_encode(std::string_view value) {
+    static constexpr char kHex[] = "0123456789ABCDEF";
+    std::string out;
+    out.reserve(value.size());
+    for (const char raw : value) {
+        const auto c = static_cast<unsigned char>(raw);
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+            (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' || c == '~') {
+            out.push_back(static_cast<char>(c));
+        } else {
+            out.push_back('%');
+            out.push_back(kHex[c >> 4]);
+            out.push_back(kHex[c & 0x0f]);
+        }
+    }
+    return out;
+}
+
+// Remove caller-supplied session metadata before minting a replacement.
+// This prevents duplicate parameters from making a player follow redirects
+// forever and prevents a forged viewer_stream value from surviving.
+std::string query_without_session_params(std::string_view query) {
+    std::string out;
+    std::size_t pos = 0;
+    while (pos < query.size()) {
+        const auto amp = query.find('&', pos);
+        const auto pair = query.substr(pos, amp == std::string_view::npos ? std::string_view::npos : amp - pos);
+        const auto eq = pair.find('=');
+        const auto key = pair.substr(0, eq);
+        if (!pair.empty() && key != kPlaybackSessionParam && key != kPlaybackStreamParam) {
+            if (!out.empty()) out.push_back('&');
+            out.append(pair);
+        }
+        if (amp == std::string_view::npos) break;
+        pos = amp + 1;
+    }
+    return out;
+}
+
+std::string playback_session_from_query(std::string_view query) {
+    const auto params = parse_query(query);
+    const auto it = params.find(std::string(kPlaybackSessionParam));
+    return it != params.end() && is_playback_session(it->second) ? it->second : std::string{};
+}
+
+void append_query_to_playlist_uris(std::string& body, std::string_view query) {
+    if (query.empty()) return;
+    const std::string suffix = "?" + std::string(query);
+    std::string decorated;
+    decorated.reserve(body.size() + 64);
+    std::size_t pos = 0;
+    while (pos < body.size()) {
+        const auto nl = body.find('\n', pos);
+        const std::string line = body.substr(pos, nl == std::string::npos ? std::string::npos : nl - pos);
+        decorated += line;
+        if (!line.empty() && line.front() != '#') decorated += suffix;
+        decorated += "\n";
+        if (nl == std::string::npos) break;
+        pos = nl + 1;
+    }
+    body = std::move(decorated);
 }
 
 // Splits a path into segments, rejecting anything containing a traversal
@@ -139,18 +217,19 @@ HlsHttpHandler::Stats HlsHttpHandler::stats() const {
 }
 
 void HlsHttpHandler::record_delivery(const std::string& application, const std::string& stream, std::uint64_t bytes,
-                                     const std::string& client_ip) {
+                                     const std::string& playback_session) {
     std::lock_guard lock(mutex_);
     const auto it = streams_.find(application + "/" + stream);
     if (it == streams_.end()) return;
     it->second.bytes_total += bytes;
-    auto& ips = it->second.recent_viewer_ips;
-    ips[client_ip] = std::chrono::steady_clock::now();
-    if (ips.size() > kMaxTrackedViewerIps) {
+    if (playback_session.empty()) return;
+    auto& sessions = it->second.recent_viewer_sessions;
+    sessions[playback_session] = std::chrono::steady_clock::now();
+    if (sessions.size() > kMaxTrackedViewerSessions) {
         const auto cutoff = std::chrono::steady_clock::now() - kViewerWindow;
-        for (auto iter = ips.begin(); iter != ips.end();) {
+        for (auto iter = sessions.begin(); iter != sessions.end();) {
             if (iter->second < cutoff) {
-                iter = ips.erase(iter);
+                iter = sessions.erase(iter);
             } else {
                 ++iter;
             }
@@ -165,10 +244,10 @@ HlsHttpHandler::LinkStats HlsHttpHandler::link_stats(const std::string& applicat
     LinkStats result;
     result.bytes_total = it->second.bytes_total;
     const auto cutoff = std::chrono::steady_clock::now() - kViewerWindow;
-    auto& ips = it->second.recent_viewer_ips;
-    for (auto iter = ips.begin(); iter != ips.end();) {
+    auto& sessions = it->second.recent_viewer_sessions;
+    for (auto iter = sessions.begin(); iter != sessions.end();) {
         if (iter->second < cutoff) {
-            iter = ips.erase(iter);
+            iter = sessions.erase(iter);
         } else {
             ++result.viewer_count;
             ++iter;
@@ -208,14 +287,24 @@ HlsHttpHandler::LinkStats HlsHttpHandler::aggregate_link_stats(const std::string
     if (rendition_streams.empty()) return link_stats(application, master_stream);
 
     LinkStats aggregate;
+    std::unordered_set<std::string> active_sessions;
+    const auto cutoff = std::chrono::steady_clock::now() - kViewerWindow;
+    std::lock_guard lock(mutex_);
     for (const auto& stream : rendition_streams) {
-        // Summed, not deduplicated, across renditions: a viewer switching
-        // ABR quality mid-session can be double-counted for up to
-        // kViewerWindow (see the LinkStats doc comment above).
-        const auto per_rendition = link_stats(application, stream);
-        aggregate.bytes_total += per_rendition.bytes_total;
-        aggregate.viewer_count += per_rendition.viewer_count;
+        const auto it = streams_.find(application + "/" + stream);
+        if (it == streams_.end()) continue;
+        aggregate.bytes_total += it->second.bytes_total;
+        auto& sessions = it->second.recent_viewer_sessions;
+        for (auto iter = sessions.begin(); iter != sessions.end();) {
+            if (iter->second < cutoff) {
+                iter = sessions.erase(iter);
+            } else {
+                active_sessions.insert(iter->first);
+                ++iter;
+            }
+        }
     }
+    aggregate.viewer_count = active_sessions.size();
     return aggregate;
 }
 
@@ -262,27 +351,8 @@ HttpResponse HlsHttpHandler::serve_media_playlist(const HttpRequest& request, co
     (void)stream;
     // Preserve the caller's query string on segment URIs so a token-gated
     // stream stays playable: the player copies the URI verbatim.
-    std::string prefix;
-    std::string suffix;
-    if (!request.query.empty()) suffix = "?" + request.query;
-
-    std::string body = entry.store->playlist(prefix);
-    if (!suffix.empty()) {
-        // Append the query to each segment line (lines not starting with '#').
-        std::string decorated;
-        decorated.reserve(body.size() + 64);
-        std::size_t pos = 0;
-        while (pos < body.size()) {
-            const auto nl = body.find('\n', pos);
-            const std::string line = body.substr(pos, nl == std::string::npos ? std::string::npos : nl - pos);
-            decorated += line;
-            if (!line.empty() && line.front() != '#') decorated += suffix;
-            decorated += "\n";
-            if (nl == std::string::npos) break;
-            pos = nl + 1;
-        }
-        body = std::move(decorated);
-    }
+    std::string body = entry.store->playlist({});
+    append_query_to_playlist_uris(body, request.query);
 
     HttpResponse response;
     response.status = 200;
@@ -292,7 +362,7 @@ HttpResponse HlsHttpHandler::serve_media_playlist(const HttpRequest& request, co
     return response;
 }
 
-HttpResponse HlsHttpHandler::serve_master_playlist(const StreamEntry& entry) {
+HttpResponse HlsHttpHandler::serve_master_playlist(const HttpRequest& request, const StreamEntry& entry) {
     if (entry.renditions.empty()) {
         return plain(404, "no renditions declared for this stream");
     }
@@ -300,7 +370,8 @@ HttpResponse HlsHttpHandler::serve_master_playlist(const StreamEntry& entry) {
     response.status = 200;
     response.content_type = kContentTypeM3u8;
     response.body = hls::build_master_playlist(entry.renditions);
-    decorate(response, options_.master_cache_control);
+    append_query_to_playlist_uris(response.body, request.query);
+    decorate(response, options_.enable_playback_sessions ? "private, no-store" : options_.master_cache_control);
     return response;
 }
 
@@ -423,6 +494,42 @@ HttpResponse HlsHttpHandler::handle(const HttpRequest& request) {
         entry = it->second;
     }
 
+    // A public, stable HLS URL starts a fresh playback session on each open.
+    // VLC and every standards-compliant HTTP client follow this redirect,
+    // then copy the query carried by master -> media -> segment playlists.
+    // Segment cache identity is normalised at Varnish, independently of this
+    // per-player query, so session counting never sacrifices cache sharing.
+    if (options_.enable_playback_sessions && ends_with(resource, ".m3u8")) {
+        const auto params = parse_query(request.query);
+        const auto session_it = params.find(std::string(kPlaybackSessionParam));
+        const auto stream_it = params.find(std::string(kPlaybackStreamParam));
+        const bool valid_session = session_it != params.end() && is_playback_session(session_it->second);
+        const bool valid_stream = stream_it != params.end() && !stream_it->second.empty();
+        if (!valid_session || !valid_stream) {
+            const std::string session = options_.playback_session_id_factory
+                ? options_.playback_session_id_factory()
+                : core::generate_secure_token(16);
+            if (!is_playback_session(session)) {
+                auto response = plain(500, "playback session generator failed");
+                response.headers["Cache-Control"] = "no-store";
+                return response;
+            }
+            std::string query = query_without_session_params(request.query);
+            if (!query.empty()) query.push_back('&');
+            query += std::string(kPlaybackSessionParam) + "=" + session;
+            query += "&" + std::string(kPlaybackStreamParam) + "=" + percent_encode(stream);
+            HttpResponse redirect;
+            redirect.status = 302;
+            redirect.content_type = "text/plain";
+            redirect.headers["Location"] = request.path + "?" + query;
+            redirect.headers["Cache-Control"] = "private, no-store";
+            if (!options_.cors_allow_origin.empty()) {
+                redirect.headers["Access-Control-Allow-Origin"] = options_.cors_allow_origin;
+            }
+            return redirect;
+        }
+    }
+
     HttpResponse response;
     bool countable = false;
     if (resource == "master.m3u8") {
@@ -430,7 +537,7 @@ HttpResponse HlsHttpHandler::handle(const HttpRequest& request) {
             std::lock_guard lock(mutex_);
             stats_.playlist_requests += 1;
         }
-        response = serve_master_playlist(entry);
+        response = serve_master_playlist(request, entry);
     } else if (ends_with(resource, ".m3u8")) {
         {
             std::lock_guard lock(mutex_);
@@ -456,7 +563,7 @@ HttpResponse HlsHttpHandler::handle(const HttpRequest& request) {
     // master.m3u8 is fetched once at session start and would undercount a
     // long-running viewer, so it deliberately isn't counted here.
     if (countable && (response.status == 200 || response.status == 206)) {
-        record_delivery(application, stream, response.payload_size(), request.client_ip);
+        record_delivery(application, stream, response.payload_size(), playback_session_from_query(request.query));
     }
 
     // HEAD must carry identical headers but no body (RFC 9110). Content-Length

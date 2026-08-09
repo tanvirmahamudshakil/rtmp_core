@@ -29,6 +29,14 @@ struct HlsHttpOptions {
     bool require_playback_token = false;
     std::string token_signing_secret;
 
+    // Give every fresh playlist open a distinct, opaque playback session.
+    // The session travels in playlist/segment query strings, allowing an
+    // edge cache to count two VLC instances behind the same NAT separately.
+    bool enable_playback_sessions = false;
+    // Injectable only so tests can make redirects deterministic. Empty uses
+    // core::generate_secure_token(16), i.e. 128 bits from OpenSSL RAND_bytes.
+    std::function<std::string()> playback_session_id_factory;
+
     // Cache-Control for the live media playlist. A live playlist changes
     // every segment duration, so it must never be cached beyond that or
     // viewers stall on a stale window.
@@ -113,11 +121,9 @@ public:
     // subscriber exists for a pure HLS puller/consumer). See docs/hls.md.
     struct LinkStats {
         std::uint64_t bytes_total = 0;
-        // Distinct client IPs that fetched a media playlist or segment for
-        // this exact stream key within the last kViewerWindow. This is a
-        // liveness estimate, not an exact concurrent-viewer count: a viewer
-        // idle longer than the window drops off, and a viewer behind a
-        // shared/rotating IP may be undercounted or overcounted.
+        // Distinct playback sessions that fetched a media playlist or segment
+        // for this exact stream key within the last kViewerWindow. A viewer
+        // idle longer than the window drops off promptly.
         std::size_t viewer_count = 0;
     };
     // Stats for exactly one registered stream key (one rendition, or a plain
@@ -127,10 +133,10 @@ public:
     // advertises (parsed from each Rendition::uri, always built as
     // "../" + output_stream + "/index.m3u8" by every renditions-ready
     // callback — see apps/rtmp_server/main.cpp and
-    // src/transcoding/native/source_job_manager.cpp). A viewer switching
-    // rendition mid-session can be transiently double-counted for up to
-    // kViewerWindow; falls back to the entry's own stats when it advertises
-    // no renditions (a plain, non-ABR stream).
+    // src/transcoding/native/source_job_manager.cpp). Viewer sessions are
+    // unioned across renditions, so an ABR switch never double-counts one
+    // player. Falls back to the entry's own stats when it advertises no
+    // renditions (a plain, non-ABR stream).
     [[nodiscard]] LinkStats aggregate_link_stats(const std::string& application, const std::string& master_stream);
 
 private:
@@ -140,10 +146,10 @@ private:
     // cadence never drops a still-connected viewer, but short enough that a
     // closed player disappears from the count promptly.
     static constexpr std::chrono::seconds kViewerWindow{20};
-    // Hard cap on tracked IPs per stream key, swept opportunistically once
+    // Hard cap on tracked sessions per stream key, swept opportunistically once
     // exceeded. Bounds memory even if a stream is hit by a huge number of
-    // distinct, non-returning IPs (e.g. an unauthenticated segment scrape).
-    static constexpr std::size_t kMaxTrackedViewerIps = 20000;
+    // distinct, non-returning sessions (e.g. an unauthenticated scrape).
+    static constexpr std::size_t kMaxTrackedViewerSessions = 20000;
 
     struct StreamEntry {
         std::shared_ptr<hls::SegmentStore> store;
@@ -151,21 +157,21 @@ private:
         // Both guarded by mutex_, same lock already taken per-request for
         // stats_ below — piggybacking avoids adding new contention.
         std::uint64_t bytes_total = 0;
-        std::unordered_map<std::string, std::chrono::steady_clock::time_point> recent_viewer_ips;
+        std::unordered_map<std::string, std::chrono::steady_clock::time_point> recent_viewer_sessions;
     };
 
     // Records one successful delivery for `application/stream` — called for
     // every 2xx/206 media-playlist or segment response. No-op if the stream
     // was unregistered between building the response and this call.
     void record_delivery(const std::string& application, const std::string& stream, std::uint64_t bytes,
-                         const std::string& client_ip);
+                         const std::string& playback_session);
 
     [[nodiscard]] bool authorized(const HttpRequest& request, const std::string& application,
                                   const std::string& stream) const;
     [[nodiscard]] HttpResponse serve_media_playlist(const HttpRequest& request, const StreamEntry& entry,
                                                     const std::string& application,
                                                     const std::string& stream);
-    [[nodiscard]] HttpResponse serve_master_playlist(const StreamEntry& entry);
+    [[nodiscard]] HttpResponse serve_master_playlist(const HttpRequest& request, const StreamEntry& entry);
     [[nodiscard]] HttpResponse serve_segment(const HttpRequest& request, const StreamEntry& entry,
                                              const std::string& name);
     void decorate(HttpResponse& response, const std::string& cache_control) const;

@@ -46,7 +46,8 @@ TEST(ManagementApiTest, SourceJobsCanBeCreatedListedAndRemoved) {
             return std::string(R"({"items":[{"application":")") + std::string(application) + R"("}]})";
         },
         [&](std::string_view application, std::string_view name, std::string_view source_url,
-            std::string_view /*tmpl*/, std::string_view /*rules*/)
+            std::string_view /*tmpl*/, std::string_view /*rules*/, bool /*auto_restart*/,
+            std::uint32_t /*restart_delay_seconds*/)
             -> rtmp_server::core::Result<std::string> {
             created_for = std::string(application) + "/" + std::string(name) + " <- " + std::string(source_url);
             return std::string(R"({"id":")") + std::string(application) + ":" + std::string(name) +
@@ -84,7 +85,9 @@ TEST(ManagementApiTest, SourceJobCreateRejectsMissingHeaders) {
     api.set_source_job_handlers(
         [](std::string_view) -> rtmp_server::core::Result<std::string> { return std::string("{}"); },
         [](std::string_view, std::string_view, std::string_view, std::string_view,
-           std::string_view) -> rtmp_server::core::Result<std::string> { return std::string("{}"); },
+           std::string_view, bool, std::uint32_t) -> rtmp_server::core::Result<std::string> {
+            return std::string("{}");
+        },
         [](std::string_view, std::string_view) -> rtmp_server::core::Result<void> { return {}; });
 
     // No X-* headers, empty body: rejected as a bad request.

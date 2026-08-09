@@ -463,6 +463,43 @@ TEST(NativeSourceTranscoder, ReducesSixtyFpsInputToConfiguredThirtyFpsWithMonoto
     }
 }
 
+TEST(NativeSourceTranscoder, KeepsMillisecondRoundedThirtyFpsInputAtThirtyFps) {
+    auto source_config = build_h264_config(320, 240, 30, 1'500'000, 30, 1);
+    source_config.allow_frame_skip = false;
+    H264Encoder source_encoder;
+    ASSERT_TRUE(source_encoder.open(source_config).ok());
+
+    std::vector<EncodedAccessUnit> source_aus;
+    for (int i = 0; i < 60; ++i) {
+        // TS demuxers often expose a millisecond clock before conversion to
+        // 90kHz: 33ms, 33ms, 34ms. These are genuine 30fps frames even though
+        // two out of three deltas are 2970 rather than exactly 3000 ticks.
+        const auto pts_90k = static_cast<std::int64_t>(i * 1000 / 30) * 90;
+        ASSERT_TRUE(source_encoder
+                        .encode(make_gradient_frame(320, 240, pts_90k, i), source_aus)
+                        .ok());
+    }
+    ASSERT_GE(source_aus.size(), 58U);
+
+    SourceTranscoder transcoder({{"30fps", "out_30", 320, 240, 1'000'000, 30, 96'000}}, 30);
+    ASSERT_TRUE(transcoder.start().ok());
+    std::vector<std::int64_t> output_pts;
+    transcoder.set_video_output(
+        [&](std::size_t, const EncodedAccessUnit& au) { output_pts.push_back(au.pts_90k); });
+    for (const auto& au : source_aus) {
+        ASSERT_TRUE(transcoder.on_video(au.annexb, au.pts_90k, au.dts_90k, au.keyframe).ok());
+    }
+
+    // OpenH264 can retain the last couple of decoded pictures until a flush;
+    // the important regression bound is that normal 2970-tick deltas no
+    // longer discard roughly one third of the stream.
+    EXPECT_GE(output_pts.size(), 55U);
+    EXPECT_LE(output_pts.size(), 60U);
+    for (std::size_t i = 1; i < output_pts.size(); ++i) {
+        EXPECT_EQ(output_pts[i] - output_pts[i - 1], 3000);
+    }
+}
+
 TEST(NativeSourceTranscoder, ReEncodesAudioPerRendition) {
     // Make an ADTS source with the AAC encoder, then re-encode per rendition.
     AacParamSet source_params;
@@ -473,7 +510,7 @@ TEST(NativeSourceTranscoder, ReEncodesAudioPerRendition) {
     ASSERT_TRUE(source_encoder.open(source_params).ok());
     std::vector<EncodedAudioFrame> adts_frames;
     double phase = 0.0;
-    for (int i = 0; i < 20; ++i) {
+    for (int i = 0; i < 180; ++i) {
         const PcmBlock block = make_sine_block(44100, 2, 1024, phase);
         phase += 1024 * 2.0 * 3.14159265358979 * 440.0 / 44100;
         ASSERT_TRUE(source_encoder.encode(block, adts_frames).ok());
@@ -485,13 +522,31 @@ TEST(NativeSourceTranscoder, ReEncodesAudioPerRendition) {
     SourceTranscoder transcoder(renditions, 30);
     ASSERT_TRUE(transcoder.start().ok());
 
+    // Establish video's real clock before audio starts. Keep it stationary
+    // afterwards: the old 3-second hard re-anchor then jumped audio back to
+    // this point, which makes this a deterministic regression test.
+    const auto video_config = build_h264_config(320, 240, 30, 1'000'000, 30, 1);
+    H264Encoder video_encoder;
+    ASSERT_TRUE(video_encoder.open(video_config).ok());
+    std::vector<EncodedAccessUnit> video;
+    for (int i = 0; i < 3; ++i) {
+        ASSERT_TRUE(video_encoder.encode(make_gradient_frame(320, 240, i * 3000, i), video).ok());
+    }
+    ASSERT_FALSE(video.empty());
+    for (const auto& frame : video) {
+        ASSERT_TRUE(transcoder.on_video(frame.annexb, frame.pts_90k, frame.dts_90k,
+                                        frame.keyframe).ok());
+    }
+
     std::vector<int> audio_outputs(2, 0);
+    std::vector<std::int64_t> audio_pts;
     transcoder.set_audio_output(
         [&](std::size_t rendition, const EncodedAudioFrame& frame, std::int64_t pts) {
             ASSERT_LT(rendition, audio_outputs.size());
             EXPECT_FALSE(frame.adts.empty());
             EXPECT_GE(pts, 0);
             audio_outputs[rendition]++;
+            if (rendition == 0) audio_pts.push_back(pts);
         });
 
     std::int64_t pts = 0;
@@ -503,7 +558,12 @@ TEST(NativeSourceTranscoder, ReEncodesAudioPerRendition) {
 
     EXPECT_GT(audio_outputs[0], 0);
     EXPECT_GT(audio_outputs[1], 0);
+    ASSERT_GT(audio_pts.size(), 140U);
+    for (std::size_t i = 1; i < audio_pts.size(); ++i) {
+        EXPECT_GT(audio_pts[i], audio_pts[i - 1]);
+    }
 }
+
 #endif // RTMP_NATIVE_TRANSCODE
 
 } // namespace

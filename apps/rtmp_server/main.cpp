@@ -190,6 +190,7 @@ int main(int argc, char** argv) {
     // shares the same segment bytes instead of allocating its own media copy.
     rtmp_server::control::HlsHttpOptions hls_options;
     hls_options.require_playback_token = false;
+    hls_options.enable_playback_sessions = true;
     rtmp_server::control::HlsHttpHandler hls_handler(std::move(hls_options));
     // Disabling a stream (or its application) takes its .m3u8 links offline
     // immediately, mirroring the RTMP publish/play gate above — no viewer can
