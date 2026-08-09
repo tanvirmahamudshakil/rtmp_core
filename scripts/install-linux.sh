@@ -43,6 +43,12 @@
 #                                no jobs and consumes no encoder resources.
 #   RTMP_TRANSCODING_RULES       Optional newline-delimited preset rules used
 #                                to seed /etc/rtmp-server/transcoding.conf.
+#   RTMP_ENABLE_FAST_JOIN        1 (default) sends fresh opens of one configured
+#                                master link directly to its startup rendition.
+#                                Existing rendition sessions are unaffected.
+#   RTMP_FAST_JOIN_APPLICATION   Application for the optimized link (default kk).
+#   RTMP_FAST_JOIN_STREAM        Public/base stream name (default KK).
+#   RTMP_FAST_JOIN_RENDITION     Startup rendition stream (default KK_480p).
 #
 set -Eeuo pipefail
 IFS=$'\n\t'
@@ -94,6 +100,10 @@ FORCE_ROTATE="${RTMP_FORCE_ROTATE_SECRETS:-0}"
 FRESH_INSTALL="${RTMP_FRESH_INSTALL:-1}"
 ENABLE_TRANSCODING="${RTMP_ENABLE_TRANSCODING:-1}"
 TRANSCODING_RULES="${RTMP_TRANSCODING_RULES:-}"
+ENABLE_FAST_JOIN="${RTMP_ENABLE_FAST_JOIN:-1}"
+FAST_JOIN_APPLICATION="${RTMP_FAST_JOIN_APPLICATION:-kk}"
+FAST_JOIN_STREAM="${RTMP_FAST_JOIN_STREAM:-KK}"
+FAST_JOIN_RENDITION="${RTMP_FAST_JOIN_RENDITION:-KK_480p}"
 
 if [[ "${BANDWIDTH_MBIT}" != "auto" ]]; then
   [[ "${BANDWIDTH_MBIT}" =~ ^[1-9][0-9]*$ ]] ||
@@ -125,6 +135,13 @@ fi
 [[ "${FORCE_ROTATE}" =~ ^[01]$ ]] || die "RTMP_FORCE_ROTATE_SECRETS must be 0 or 1."
 [[ "${FRESH_INSTALL}" =~ ^[01]$ ]] || die "RTMP_FRESH_INSTALL must be 0 or 1."
 [[ "${ENABLE_TRANSCODING}" =~ ^[01]$ ]] || die "RTMP_ENABLE_TRANSCODING must be 0 or 1."
+[[ "${ENABLE_FAST_JOIN}" =~ ^[01]$ ]] || die "RTMP_ENABLE_FAST_JOIN must be 0 or 1."
+if [[ "${ENABLE_FAST_JOIN}" == "1" ]]; then
+  for fast_join_value in "${FAST_JOIN_APPLICATION}" "${FAST_JOIN_STREAM}" "${FAST_JOIN_RENDITION}"; do
+    [[ "${fast_join_value}" =~ ^[A-Za-z0-9][A-Za-z0-9_-]*$ ]] ||
+      die "Fast-join application/stream/rendition names may contain only letters, numbers, underscores and hyphens."
+  done
+fi
 if [[ -n "${DOMAIN}" && ! "${DOMAIN}" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]]; then
   die "RTMP_DOMAIN must be a hostname without a URL scheme, path, port or whitespace."
 fi
@@ -831,12 +848,9 @@ log "Configuring Varnish HLS segment cache"
 # requests never reach the origin process. Each player has unique viewer
 # query metadata; vcl_hash deliberately excludes only that metadata from a
 # segment's cache key, retaining shared segment bytes across all sessions.
-# Playlists (.m3u8) change every
-# few seconds, so they get only a 1s micro-cache: long enough to collapse
-# a thousand viewers' near-simultaneous polling into one origin fetch per
-# second, short enough that live-edge latency is unaffected. Token-gated
-# playlist requests (query string present) bypass the cache entirely, since
-# a cached response would leak across viewers/expiries.
+# Caddy sends viewer-specific playlists straight to the origin. The VCL still
+# treats a direct loopback .m3u8 request conservatively, but normal public
+# traffic uses Varnish only for shared immutable segments.
 # Bound to loopback only: never exposed directly to the internet.
 MEM_TOTAL_KB="$(awk '/^MemTotal:/ { print $2 }' /proc/meminfo)"
 [[ "${MEM_TOTAL_KB}" =~ ^[0-9]+$ ]] || die "Could not determine total system memory."
@@ -859,6 +873,24 @@ if [[ -n "${DOMAIN}" ]]; then
 else
   CADDY_SITE=":80"
 fi
+FAST_JOIN_CADDY_BLOCK=""
+if [[ "${ENABLE_FAST_JOIN}" == "1" ]]; then
+  FAST_JOIN_CADDY_BLOCK="$(cat <<EOF
+    @fast_join path /hls/${FAST_JOIN_APPLICATION}/${FAST_JOIN_STREAM}/master.m3u8
+    handle @fast_join {
+        # Preserve a supplied viewer_session/token query when a player retries
+        # the stable link, but start a fresh player on the smaller rendition.
+        uri replace /hls/${FAST_JOIN_APPLICATION}/${FAST_JOIN_STREAM}/master.m3u8 /hls/${FAST_JOIN_APPLICATION}/${FAST_JOIN_RENDITION}/index.m3u8
+        reverse_proxy 127.0.0.1:8080 {
+            # The rendition origin creates the session; keep accounting and
+            # recovery attached to the public/base stream name.
+            header_down Location "viewer_stream=${FAST_JOIN_RENDITION}" "viewer_stream=${FAST_JOIN_STREAM}"
+        }
+    }
+
+EOF
+)"
+fi
 cat > /etc/caddy/Caddyfile <<EOF
 # Managed by StreamForge install-linux.sh
 ${CADDY_SITE} {
@@ -875,6 +907,15 @@ ${CADDY_SITE} {
         root * /var/lib/rtmp-server
         rewrite * /viewer_estimate.json
         file_server
+    }
+
+${FAST_JOIN_CADDY_BLOCK}
+    # Playlists carry viewer-specific session metadata and are never shared
+    # cache objects. Bypass Varnish workers for .m3u8 while keeping immutable
+    # .ts segments cached and visible to the playback-session estimator.
+    @hls_playlist path_regexp hls_playlist \.m3u8$
+    handle @hls_playlist {
+        reverse_proxy 127.0.0.1:8080
     }
 
     @hls path /hls/*
@@ -981,7 +1022,13 @@ printf '  Install mode:     %s\n' "$(if [[ "${FRESH_INSTALL}" == "1" ]]; then pr
 printf '  Network device:   %s\n' "${PRIMARY_INTERFACE}"
 printf '  Link bandwidth:   %s Mbps — %s\n' "${BANDWIDTH_MBIT}" "${BANDWIDTH_SOURCE}"
 printf '  Media workers:    %s\n' "${WORKERS}"
-printf '  HLS segment cache: Varnish, %s MB RAM, 127.0.0.1:6081 (.ts cached 1h, .m3u8 micro-cached 1s)\n' "${VARNISH_CACHE_MB}"
+printf '  HLS segment cache: Varnish, %s MB RAM, 127.0.0.1:6081 (.ts cached 1h; playlists use origin)\n' "${VARNISH_CACHE_MB}"
+if [[ "${ENABLE_FAST_JOIN}" == "1" ]]; then
+  printf '  Fast join:         /hls/%s/%s/master.m3u8 -> %s\n' \
+    "${FAST_JOIN_APPLICATION}" "${FAST_JOIN_STREAM}" "${FAST_JOIN_RENDITION}"
+else
+  printf '  Fast join:         disabled by RTMP_ENABLE_FAST_JOIN=0\n'
+fi
 if [[ "${BITRATE_MODE}" == "auto" ]]; then
   printf '  Bitrate source:   OBS/transcoder traffic, measured after publishing starts\n'
   printf '  Safety ceiling:   %s viewers (resources sized at %s Mbps; media is not altered)\n' \

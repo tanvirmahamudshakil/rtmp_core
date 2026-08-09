@@ -35,6 +35,23 @@ Caddy with automatic HTTPS, creates an isolated system user, generates
 secrets, configures systemd and conservative kernel networking baselines,
 detects the public network interface, and runs a readiness check.
 
+Fresh opens of the production HLS master link use the smaller startup
+rendition by default (`kk/KK` starts on `KK_480p`). Existing viewers keep the
+rendition URL already loaded, playlists go directly to the origin, and `.ts`
+segments continue through the shared Varnish cache. Set the names for another
+deployment at install time:
+
+```sh
+sudo env \
+  RTMP_FAST_JOIN_APPLICATION=sports \
+  RTMP_FAST_JOIN_STREAM=match \
+  RTMP_FAST_JOIN_RENDITION=match_480p \
+  bash scripts/install-linux.sh
+```
+
+Use `RTMP_ENABLE_FAST_JOIN=0` when that deployment does not have a dedicated
+startup rendition.
+
 `RTMP_BANDWIDTH_MBIT=auto` reads the primary NIC's reported link speed using
 Linux sysfs/ethtool. On virtual VPS interfaces that number can be higher than
 the bandwidth purchased from the provider, so set the committed Mbps

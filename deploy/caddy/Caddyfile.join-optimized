@@ -1,0 +1,66 @@
+# Production join-path override for the current kk/KK link.
+# scripts/install-linux.sh now generates this behavior by default. Override it
+# for another deployment with RTMP_FAST_JOIN_APPLICATION,
+# RTMP_FAST_JOIN_STREAM and RTMP_FAST_JOIN_RENDITION.
+#
+# Existing players keep using the rendition URL already loaded. A fresh open
+# of the stable master link is rewritten to the 480p media playlist, avoiding
+# a 720p cold start while the origin is close to its egress ceiling.
+:80 {
+    encode zstd gzip
+
+    @control path /api/*
+    handle @control {
+        uri strip_prefix /api
+        reverse_proxy 127.0.0.1:8080
+    }
+
+    @viewer_estimate path /internal/viewer_estimate.json
+    handle @viewer_estimate {
+        root * /var/lib/rtmp-server
+        rewrite * /viewer_estimate.json
+        file_server
+    }
+
+    @kk_join path /hls/kk/KK/master.m3u8
+    handle @kk_join {
+        # `uri replace` changes only the path and preserves the existing
+        # viewer_session/token query on retries.
+        uri replace /hls/kk/KK/master.m3u8 /hls/kk/KK_480p/index.m3u8
+        reverse_proxy 127.0.0.1:8080 {
+            # A fresh request is now handled by the KK_480p route, but its
+            # session still belongs to the public kk/KK link for counting and
+            # recovery. Rewrite only the origin-generated redirect metadata.
+            header_down Location "viewer_stream=KK_480p" "viewer_stream=KK"
+        }
+    }
+
+    # Session-bearing playlists are deliberately uncacheable. Sending them
+    # straight to the origin avoids consuming a Varnish worker thread; .ts
+    # traffic still passes through Varnish, so cache-hit viewer estimation is
+    # retained from recurring segment requests.
+    @hls_playlist path_regexp hls_playlist \.m3u8$
+    handle @hls_playlist {
+        reverse_proxy 127.0.0.1:8080
+    }
+
+    @hls path /hls/*
+    handle @hls {
+        reverse_proxy 127.0.0.1:6081
+    }
+
+    handle {
+        root * /var/www/streamforge
+        try_files {path} /index.html
+        file_server
+    }
+
+    header {
+        -Server
+        X-Content-Type-Options nosniff
+        X-Frame-Options DENY
+        Referrer-Policy no-referrer
+        Permissions-Policy "camera=(), microphone=(), geolocation=()"
+        Content-Security-Policy "default-src 'self'; connect-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'"
+    }
+}
