@@ -86,6 +86,11 @@ void SegmentStore::mark_ended() {
     ended_ = true;
 }
 
+void SegmentStore::mark_live() {
+    std::lock_guard lock(mutex_);
+    ended_ = false;
+}
+
 void SegmentStore::clear() {
     std::lock_guard lock(mutex_);
     segments_.clear();
@@ -104,6 +109,12 @@ SegmentStoreStats SegmentStore::stats() const {
 std::size_t SegmentStore::segment_count() const {
     std::lock_guard lock(mutex_);
     return segments_.size();
+}
+
+std::uint64_t SegmentStore::next_sequence() const {
+    std::lock_guard lock(mutex_);
+    if (segments_.empty() || !segments_.back()) return 0;
+    return segments_.back()->sequence + 1;
 }
 
 } // namespace rtmp_server::hls

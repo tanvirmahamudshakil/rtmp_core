@@ -71,10 +71,17 @@ public:
 
     // Marks the stream finished; subsequent playlists carry EXT-X-ENDLIST.
     void mark_ended();
+    // Reopens a retained live window when its producer is being rebuilt.
+    // Existing segments and media sequence remain intact.
+    void mark_live();
     void clear();
 
     [[nodiscard]] SegmentStoreStats stats() const;
     [[nodiscard]] std::size_t segment_count() const;
+    // Sequence the next producer should use when resuming into this store.
+    // Keeping it monotonic prevents CDN/browser cache collisions after a
+    // source-transcode pipeline is automatically rebuilt.
+    [[nodiscard]] std::uint64_t next_sequence() const;
     [[nodiscard]] const SegmentStoreConfig& config() const noexcept { return config_; }
 
 private:

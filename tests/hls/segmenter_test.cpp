@@ -121,6 +121,23 @@ TEST(SegmenterTest, SegmentsAreSequentiallyNumberedAndNamed) {
     }
 }
 
+TEST(SegmenterTest, ResumedSegmenterStartsAtConfiguredSequence) {
+    Collector collector;
+    SegmenterConfig config;
+    config.target_duration = 500ms;
+    config.initial_sequence = 42;
+    Segmenter segmenter(collector.callback(), config);
+    send_headers(segmenter);
+
+    std::uint32_t timestamp = 0;
+    for (int gop = 0; gop < 3; ++gop) feed_gop(segmenter, timestamp);
+    segmenter.finalize();
+
+    ASSERT_FALSE(collector.segments().empty());
+    EXPECT_EQ(collector.segments().front()->sequence, 42u);
+    EXPECT_EQ(collector.segments().front()->name, "segment-42.ts");
+}
+
 TEST(SegmenterTest, MediaBeforeTheSequenceHeaderIsDroppedNotPackaged) {
     Collector collector;
     Segmenter segmenter(collector.callback(), {});

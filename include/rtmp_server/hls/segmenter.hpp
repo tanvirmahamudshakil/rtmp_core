@@ -40,6 +40,12 @@ struct SegmenterConfig {
 
     std::string segment_name_prefix = "segment-";
     std::string segment_name_suffix = ".ts";
+
+    // First EXT-X-MEDIA-SEQUENCE / segment filename number to emit. Source
+    // jobs reuse their SegmentStore across an automatic recovery, so a new
+    // segmenter must continue after the last published sequence instead of
+    // colliding with immutable cached segment-0.ts, segment-1.ts, ... URLs.
+    std::uint64_t initial_sequence = 0;
 };
 
 struct SegmenterStats {

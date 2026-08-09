@@ -77,7 +77,8 @@ HttpClient::~HttpClient() {
     if (handle_) curl_easy_cleanup(static_cast<CURL*>(handle_));
 }
 
-core::Result<void> HttpClient::get(const std::string& url, std::vector<std::byte>& out) {
+core::Result<void> HttpClient::get(const std::string& url, std::vector<std::byte>& out,
+                                   std::string* effective_url) {
     if (handle_ == nullptr) return http_error("curl handle not initialized");
     out.clear();
     auto* curl = static_cast<CURL*>(handle_);
@@ -100,6 +101,11 @@ core::Result<void> HttpClient::get(const std::string& url, std::vector<std::byte
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
     if (status < 200 || status >= 300) {
         return http_error("HTTP GET returned status " + std::to_string(status) + " for " + url);
+    }
+    if (effective_url != nullptr) {
+        char* resolved = nullptr;
+        curl_easy_getinfo(curl, CURLINFO_EFFECTIVE_URL, &resolved);
+        *effective_url = resolved != nullptr ? resolved : url;
     }
     return {};
 }

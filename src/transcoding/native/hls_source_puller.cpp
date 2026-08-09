@@ -81,17 +81,21 @@ bool HlsSourcePuller::resolve_source(HttpClient& http, std::string& media_url_ou
 
     // Otherwise this is HLS playlist text — small and bounded, safe to fetch whole.
     std::vector<std::byte> body;
-    if (auto r = http.get(source_url_, body); !r) {
+    std::string effective_source_url;
+    if (auto r = http.get(source_url_, body, &effective_source_url); !r) {
         detail_out = r.error().message();
         return false;
     }
     const std::string_view text(reinterpret_cast<const char*>(body.data()), body.size());
     raw_ts_out = false;
     if (!is_master_playlist(text)) {
-        media_url_out = source_url_; // already a media playlist
+        // The playlist may have redirected to a different CDN host. Its
+        // root-relative and path-relative segment URIs belong to that final
+        // URL, so retain it for every subsequent poll and parse.
+        media_url_out = effective_source_url;
         return true;
     }
-    const auto variants = parse_master_playlist(text, source_url_);
+    const auto variants = parse_master_playlist(text, effective_source_url);
     const std::string chosen = select_variant(variants, 0);
     if (chosen.empty()) {
         detail_out = "master playlist has no variants";
@@ -140,16 +144,39 @@ void HlsSourcePuller::run() {
     // smaller pieces of already-decoded video in front of viewers sooner,
     // and give PacedSegmentPublisher finer-grained steps to release instead
     // of a few large ones.
-    hls::SegmenterConfig segmenter_config;
-    segmenter_config.target_duration = std::chrono::milliseconds(1000);
+    hls::SegmenterConfig base_segmenter_config;
+    base_segmenter_config.target_duration = std::chrono::milliseconds(1000);
+    // Segment URLs are immutable at the CDN. A whole server process restart
+    // loses the in-memory store, so starting again at segment-0.ts would make
+    // active sessions receive stale cached bytes. A wall-clock floor keeps
+    // first-start names unique across processes; retained stores continue at
+    // whichever value is higher.
+    const auto sequence_floor = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch())
+            .count());
     for (auto& rendition : renditions_) {
         auto store = rendition.store;
+        const auto retained_next_sequence = store->next_sequence();
+        const bool resuming = retained_next_sequence > 0;
+        const auto next_sequence = std::max(retained_next_sequence, sequence_floor);
         PacedSegmentPublisherConfig publisher_config;
-        publisher_config.startup_buffer = std::chrono::seconds(30);
-        publisher_config.fallback_interval = segmenter_config.target_duration;
+        // A recovered pipeline already has a complete live window available
+        // in its retained store. Re-prime with the shorter recovery runway so
+        // playback resumes before that window drains.
+        publisher_config.startup_buffer = resuming ? std::chrono::seconds(10)
+                                                   : std::chrono::seconds(30);
+        publisher_config.fallback_interval = base_segmenter_config.target_duration;
         auto publisher = std::make_shared<PacedSegmentPublisher>(store, publisher_config);
+        auto segmenter_config = base_segmenter_config;
+        segmenter_config.initial_sequence = next_sequence;
         auto segmenter = std::make_unique<hls::Segmenter>(
             [publisher](hls::SegmentPtr segment) { publisher->push(std::move(segment)); }, segmenter_config);
+        // The codec and timestamp timeline may change across a rebuilt
+        // puller or whole-process restart. This is harmless for a new viewer
+        // and tells an existing HLS player to reset its decoder at the first
+        // recovered segment while retaining the same session.
+        segmenter->mark_media_discontinuity();
         feeds.push_back(std::make_unique<hls::RenditionFeed>(*segmenter));
         segmenters.push_back(std::move(segmenter));
         publishers.push_back(std::move(publisher));
@@ -310,7 +337,8 @@ void HlsSourcePuller::run() {
 
     while (running_.load()) {
         std::vector<std::byte> playlist_bytes;
-        if (auto r = http.get(media_url, playlist_bytes); !r) {
+        std::string effective_media_url;
+        if (auto r = http.get(media_url, playlist_bytes, &effective_media_url); !r) {
             set_detail(r.error().message());
             if (++consecutive_errors >= 5) {
                 status_.store(PullerStatus::Error);
@@ -324,7 +352,10 @@ void HlsSourcePuller::run() {
         consecutive_errors = 0;
         const std::string_view text(reinterpret_cast<const char*>(playlist_bytes.data()),
                                     playlist_bytes.size());
-        const auto playlist = parse_media_playlist(text, media_url);
+        // A media-playlist endpoint can itself redirect on every refresh and
+        // change hosts/tokens. Resolve each advertised segment against the
+        // URL that produced this exact playlist body.
+        const auto playlist = parse_media_playlist(text, effective_media_url);
 
         // Collect every not-yet-pulled segment from this playlist window
         // first, then fetch them all concurrently (one HttpClient per fetch —

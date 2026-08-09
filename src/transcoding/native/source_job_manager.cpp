@@ -82,7 +82,11 @@ void SourceJobManager::monitor_loop() {
             if (!job.config.auto_restart) continue;
             const auto delay = std::chrono::seconds(job.config.restart_delay_seconds);
             if (now - job.error_since >= delay) {
-                teardown_locked(job);
+                // Preserve the registered stores during an automatic
+                // recovery. Existing players keep receiving the last live
+                // window with the same viewer_session instead of seeing a
+                // 404, and the replacement pipeline resumes its sequence.
+                teardown_locked(job, /*preserve_delivery_state=*/true);
                 start_locked(job); // resets error_since via the fresh puller's status
                 job.error_since = {};
             }
@@ -95,17 +99,19 @@ std::string SourceJobManager::master_path(const std::string& application,
     return route_prefix_ + "/" + application + "/" + name + "/master.m3u8";
 }
 
-void SourceJobManager::teardown_locked(Job& job) {
+void SourceJobManager::teardown_locked(Job& job, bool preserve_delivery_state) {
     if (job.puller) {
         job.puller->stop();
         job.puller.reset();
     }
+    if (preserve_delivery_state) return;
     if (hooks_.unregister_store) {
         for (const auto& stream : job.output_streams) {
             hooks_.unregister_store(job.config.application, stream);
         }
     }
     job.output_streams.clear();
+    job.stores.clear();
 }
 
 void SourceJobManager::start_locked(Job& job) {
@@ -113,7 +119,13 @@ void SourceJobManager::start_locked(Job& job) {
     std::vector<PullerRendition> puller_renditions;
     std::vector<hls::Rendition> master_renditions;
     puller_renditions.reserve(config.renditions.size());
-    for (const auto& spec : config.renditions) {
+    const bool first_start = job.stores.empty();
+    if (first_start) {
+        job.stores.reserve(config.renditions.size());
+        job.output_streams.reserve(config.renditions.size());
+    }
+    for (std::size_t index = 0; index < config.renditions.size(); ++index) {
+        const auto& spec = config.renditions[index];
         // Keep 30 seconds advertised plus another 30 seconds of stale-request
         // grace. Segment count is derived from the rendition's real GOP
         // duration: the Segmenter target may be 1s, but a 60-frame GOP at
@@ -124,13 +136,22 @@ void SourceJobManager::start_locked(Job& job) {
             std::max<std::uint32_t>(1, (spec.gop + fps - 1) / fps);
         const auto window_segments = std::max<std::size_t>(
             3, (kWindowSeconds + segment_seconds - 1) / segment_seconds);
-        hls::SegmentStoreConfig store_config;
-        store_config.live_window_segments = window_segments;
-        store_config.retention_grace_segments = window_segments;
-        store_config.target_duration_seconds = segment_seconds;
-        auto store = std::make_shared<hls::SegmentStore>(store_config);
-        if (hooks_.register_store) hooks_.register_store(config.application, spec.output_stream, store);
-        job.output_streams.push_back(spec.output_stream);
+        std::shared_ptr<hls::SegmentStore> store;
+        if (first_start) {
+            hls::SegmentStoreConfig store_config;
+            store_config.live_window_segments = window_segments;
+            store_config.retention_grace_segments = window_segments;
+            store_config.target_duration_seconds = segment_seconds;
+            store = std::make_shared<hls::SegmentStore>(store_config);
+            job.stores.push_back(store);
+            job.output_streams.push_back(spec.output_stream);
+            if (hooks_.register_store) {
+                hooks_.register_store(config.application, spec.output_stream, store);
+            }
+        } else {
+            store = job.stores[index];
+            store->mark_live();
+        }
 
         hls::Rendition rendition;
         rendition.uri = "../" + spec.output_stream + "/index.m3u8";
@@ -218,7 +239,7 @@ core::Result<SourceJobSnapshot> SourceJobManager::restart(const std::string& app
     if (it == jobs_.end()) return job_error("no such source job");
     Job& job = it->second;
     if (!job.enabled) return job_error("job is disabled; enable it first");
-    teardown_locked(job);
+    teardown_locked(job, /*preserve_delivery_state=*/true);
     start_locked(job);
     job.error_since = {};
     return snapshot_locked(job);

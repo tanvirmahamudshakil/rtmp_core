@@ -29,7 +29,11 @@ public:
     // Fetches `url` into `out` (replacing its contents). Fails on transport
     // error or any non-2xx status. Intended for small, bounded bodies
     // (playlists, TS segments) — never a continuously-flowing stream.
-    [[nodiscard]] core::Result<void> get(const std::string& url, std::vector<std::byte>& out);
+    // When `effective_url` is provided it receives libcurl's final URL after
+    // redirects. HLS callers must resolve relative playlist entries against
+    // that URL, not the originally requested host.
+    [[nodiscard]] core::Result<void> get(const std::string& url, std::vector<std::byte>& out,
+                                         std::string* effective_url = nullptr);
 
     // Fetches at most `max_bytes` of `url`'s body (following redirects) into
     // `out`, then aborts the transfer — a bounded sniff of a source that may be

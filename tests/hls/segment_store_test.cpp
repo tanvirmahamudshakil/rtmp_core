@@ -119,6 +119,21 @@ TEST(SegmentStoreTest, MediaSequenceAdvancesAsSegmentsScrollOut) {
     EXPECT_NE(playlist.find("#EXT-X-MEDIA-SEQUENCE:7"), std::string::npos) << playlist;
 }
 
+TEST(SegmentStoreTest, NextSequenceContinuesAfterTheNewestRetainedSegment) {
+    SegmentStoreConfig config;
+    config.live_window_segments = 2;
+    config.retention_grace_segments = 1;
+    SegmentStore store(config);
+
+    EXPECT_EQ(store.next_sequence(), 0u);
+    for (std::uint64_t i = 40; i < 46; ++i) store.add_segment(make_segment(i));
+
+    // Older segments have already been evicted, but a replacement producer
+    // still resumes after the newest retained sequence.
+    EXPECT_EQ(store.segment_count(), 3u);
+    EXPECT_EQ(store.next_sequence(), 46u);
+}
+
 TEST(SegmentStoreTest, DiscontinuitySequenceCountsDiscontinuitiesThatLeftTheWindow) {
     SegmentStoreConfig config;
     config.live_window_segments = 2;
@@ -144,6 +159,11 @@ TEST(SegmentStoreTest, MarkEndedAppendsEndlist) {
 
     store.mark_ended();
     EXPECT_NE(store.playlist().find("#EXT-X-ENDLIST"), std::string::npos);
+
+    store.mark_live();
+    EXPECT_EQ(store.playlist().find("#EXT-X-ENDLIST"), std::string::npos);
+    EXPECT_NE(store.find_segment("segment-0.ts"), nullptr);
+    EXPECT_EQ(store.next_sequence(), 1u);
 }
 
 TEST(SegmentStoreTest, ClearResetsAllState) {
@@ -153,6 +173,7 @@ TEST(SegmentStoreTest, ClearResetsAllState) {
     store.clear();
 
     EXPECT_EQ(store.segment_count(), 0u);
+    EXPECT_EQ(store.next_sequence(), 0u);
     EXPECT_EQ(store.stats().bytes_held, 0u);
     EXPECT_EQ(store.playlist().find("#EXT-X-ENDLIST"), std::string::npos);
 }

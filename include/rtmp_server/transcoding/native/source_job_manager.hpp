@@ -93,6 +93,10 @@ private:
         SourceJobConfig config;
         std::unique_ptr<HlsSourcePuller> puller;
         std::vector<std::string> output_streams; // registered stream keys
+        // Kept across automatic/manual pipeline restarts so the old live
+        // window, monotonic segment sequence and HLS viewer-session stats
+        // remain available while the source recovers.
+        std::vector<std::shared_ptr<hls::SegmentStore>> stores;
         bool enabled = true;
         // Set when the monitor loop first observes this job's puller in
         // PullerStatus::Error; cleared once it's healthy again or restarted.
@@ -101,7 +105,7 @@ private:
 
     [[nodiscard]] std::string master_path(const std::string& application,
                                           const std::string& name) const;
-    void teardown_locked(Job& job);
+    void teardown_locked(Job& job, bool preserve_delivery_state = false);
     void start_locked(Job& job);
     [[nodiscard]] SourceJobSnapshot snapshot_locked(const Job& job) const;
     void monitor_loop();

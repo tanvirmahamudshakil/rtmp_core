@@ -11,6 +11,24 @@ TEST(HlsPlaylist, ResolvesRelativeAbsoluteAndFullUrls) {
     EXPECT_EQ(resolve_url(base, "https://other.cdn/seg3.ts"), "https://other.cdn/seg3.ts");
 }
 
+TEST(HlsPlaylist, ResolvesRootRelativeSegmentsAgainstRedirectedEffectiveHost) {
+    constexpr std::string_view text = R"(#EXTM3U
+#EXT-X-TARGETDURATION:10
+#EXT-X-MEDIA-SEQUENCE:42
+#EXTINF:9.6,
+/hls/rotating-token/stream_42.ts
+)";
+
+    // The requested URL lived on a different origin, but this body came from
+    // the redirected CDN URL. Host-bound segment paths must stay on that CDN.
+    const auto playlist =
+        parse_media_playlist(text, "http://192.0.2.20/live/play/session/stream");
+
+    ASSERT_EQ(playlist.segments.size(), 1U);
+    EXPECT_EQ(playlist.segments.front().uri,
+              "http://192.0.2.20/hls/rotating-token/stream_42.ts");
+}
+
 TEST(HlsPlaylist, DetectsAndParsesMasterPlaylist) {
     const std::string text =
         "#EXTM3U\n"

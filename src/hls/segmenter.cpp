@@ -24,7 +24,7 @@ bool same_bytes(const std::vector<std::vector<std::byte>>& a,
 } // namespace
 
 Segmenter::Segmenter(SegmentCallback on_segment, SegmenterConfig config)
-    : on_segment_(std::move(on_segment)), config_(config) {}
+    : on_segment_(std::move(on_segment)), config_(config), next_sequence_(config.initial_sequence) {}
 
 std::uint64_t Segmenter::to_90k(std::int64_t milliseconds) const {
     const std::int64_t shifted = milliseconds + timeline_base_ms_;
