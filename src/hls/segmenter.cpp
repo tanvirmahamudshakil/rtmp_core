@@ -78,6 +78,17 @@ void Segmenter::mark_publisher_reconnect() {
     audio_config_.reset();
 }
 
+void Segmenter::mark_media_discontinuity() {
+    flush_segment();
+    pending_discontinuity_ = true;
+    muxer_.reset_continuity();
+    // The source transcoder owns the output clock and keeps it monotonic.
+    // Drop configs so packaging resumes only on a self-decodable IDR, but do
+    // not alter timeline_base_ms_ or clear the last monotonic timestamp.
+    video_config_.reset();
+    audio_config_.reset();
+}
+
 void Segmenter::start_segment(std::uint32_t timestamp) {
     current_.clear();
     segment_open_ = true;

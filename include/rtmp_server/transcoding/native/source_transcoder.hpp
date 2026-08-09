@@ -72,22 +72,16 @@ public:
 
     [[nodiscard]] std::size_t rendition_count() const noexcept { return renditions_.size(); }
 
-    // Call after a source reconnect/gap (a skipped segment, an upstream
-    // EXT-X-DISCONTINUITY) so the next video frame's PTS is treated as a
-    // fresh clock start instead of being compared against the pre-gap
-    // timeline. Without this, on_video's backward-discontinuity gate (it
-    // silently drops a frame whose PTS looks like it went backwards by less
-    // than 5s, to absorb ordinary jitter) can keep tripping on the new
-    // segment's timestamps for as long as they read as "slightly behind"
-    // the last pre-gap frame, dropping every video frame while audio -- which
-    // has no equivalent gate -- keeps playing: audio continues, video
-    // freezes, exactly the reported symptom.
+    // Call after a source reconnect/gap. The next decoded frame re-anchors
+    // input sampling, while the generated output clock remains monotonic.
+    // Resetting the output clock to the source's new raw PTS here produces
+    // non-monotonic DTS and long apparent freezes in VLC.
     // Also re-anchors every rendition's audio clock (audio_base_set = false),
     // so the next audio frame re-anchors to video's output position at that
     // point -- see on_audio's comment on why it anchors to video's clock
     // rather than to its own raw incoming PTS.
     void mark_discontinuity() noexcept {
-        video_clock_set_ = false;
+        awaiting_video_reanchor_ = video_clock_set_;
         next_input_video_pts_90k_ = 0;
         consecutive_backward_drops_ = 0;
         for (auto& rendition : renditions_) {
@@ -126,6 +120,7 @@ private:
     bool started_ = false;
     bool audio_configured_ = false;
     bool video_clock_set_ = false;
+    bool awaiting_video_reanchor_ = false;
     std::int64_t last_input_video_pts_90k_ = 0;
     std::int64_t next_output_video_pts_90k_ = 0;
     // Absolute input-PTS deadline for output frame sampling. Unlike a delta

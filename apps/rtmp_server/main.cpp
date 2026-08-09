@@ -643,12 +643,13 @@ int main(int argc, char** argv) {
     rtmp_server::control::HttpServerOptions api_server_options{
         config.api_bind_address, config.api_port, 65'535, hls_http_workers, 65'536,
         16 * 1024, 128 * 1024};
-    // Caddy reuses its loopback connections to this backend; without
-    // keep-alive here, every playlist/segment fetch across the public edge
-    // paid a fresh accept() + TCP handshake on the loopback hop too. At
-    // thousands of concurrent HLS viewers polling every few seconds, that
-    // accept-loop churn is avoidable cost.
-    api_server_options.enable_keep_alive = true;
+    // This server assigns one blocking worker to a connection for its entire
+    // keep-alive lifetime. A cache restart can leave hundreds of backend
+    // connections queued while every worker waits idle on an earlier one,
+    // starving health, playlist, and segment requests despite an otherwise
+    // idle machine. Loopback TCP setup is cheap; close after each response so
+    // workers are scheduled per request and no idle connection owns a slot.
+    api_server_options.enable_keep_alive = false;
     rtmp_server::control::HttpServer api_server(api_server_options);
     api_server.set_handler([&hls_handler](const rtmp_server::control::HttpRequest& request) {
         return hls_handler.handle(request);

@@ -19,6 +19,11 @@ struct PacedSegmentPublisherConfig {
     // publish cadence without making that cadence visible to viewers.
     std::chrono::milliseconds startup_buffer{30000};
 
+    // Once playback has started, an upstream hiccup must not force viewers
+    // to wait for the entire cold-start runway again. Refill a smaller
+    // recovery runway after an underrun, then resume real-time pacing.
+    std::chrono::milliseconds recovery_buffer{10000};
+
     // Used only for a malformed/empty-duration segment. Normal publication
     // is paced by each segment's actual EXTINF duration.
     std::chrono::milliseconds fallback_interval{1000};
@@ -58,6 +63,7 @@ private:
     std::chrono::milliseconds buffered_duration_{0};
     std::chrono::steady_clock::time_point next_publish_{};
     bool primed_ = false;
+    bool ever_published_ = false;
 
     mutable std::mutex mutex_;
     std::condition_variable wake_;

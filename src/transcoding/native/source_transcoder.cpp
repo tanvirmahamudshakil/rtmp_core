@@ -118,58 +118,68 @@ core::Result<void> SourceTranscoder::on_video(std::span<const std::byte> annexb,
     const auto output_interval_90k =
         std::max<std::int64_t>(1, 90'000 / static_cast<std::int64_t>(fps_));
     if (video_clock_set_) {
-        const auto input_delta = decoded_.pts_90k - last_input_video_pts_90k_;
-        constexpr std::int64_t kBackwardDiscontinuity90k = 5 * 90'000;
-        if (input_delta <= 0 && input_delta > -kBackwardDiscontinuity90k) {
-            // Tolerate brief backward jitter (ordinary source noise), but
-            // don't let it freeze video for the full 5s tolerance: many
-            // upstream IPTV panels reset timestamps at their own internal
-            // segment boundaries without ever setting EXT-X-DISCONTINUITY,
-            // so mark_discontinuity()'s explicit reset (hls_source_puller.cpp)
-            // never fires for those and this gate would otherwise silently
-            // drop every frame for up to 5s each time -- audio has no
-            // equivalent gate, so it kept playing throughout, which is what
-            // read as "video freezes constantly, audio keeps going". A real
-            // reset (source's internal segment boundary) persists for many
-            // consecutive frames; ordinary decode-level noise (duplicate or
-            // slightly-reordered timestamps) self-corrects within a frame or
-            // two. So there's little upside to waiting anywhere near 0.5s to
-            // decide which one this is -- a handful of frames (well under
-            // 200ms at any realistic fps) is enough to tell them apart, and
-            // recovering that fast keeps a real reset from reading as a
-            // visible freeze at all.
-            constexpr std::int64_t kMaxToleratedDrops = 3;
-            if (++consecutive_backward_drops_ < kMaxToleratedDrops) {
-                return {};
-            }
-        }
-        consecutive_backward_drops_ = 0;
-        last_input_video_pts_90k_ = decoded_.pts_90k;
-
-        if (input_delta <= 0 || input_delta > kBackwardDiscontinuity90k) {
-            // Start a new sampling phase after a real timestamp discontinuity,
-            // while keeping the generated output clock monotonic.
+        if (awaiting_video_reanchor_) {
+            last_input_video_pts_90k_ = decoded_.pts_90k;
             next_input_video_pts_90k_ = decoded_.pts_90k + output_interval_90k;
+            next_output_video_pts_90k_ += output_interval_90k;
+            consecutive_backward_drops_ = 0;
+            awaiting_video_reanchor_ = false;
         } else {
-            // Select against an absolute input-PTS deadline, with a small
-            // tolerance for MPEG-TS's millisecond-rounded timestamps. At
-            // 30fps those timestamps commonly alternate 2970/3060 ticks. A
-            // delta accumulator starting from zero treated every 2970-tick
-            // frame as "too early" and emitted only 2/3 of a genuine 30fps
-            // source, while audio kept all of its samples and ran far ahead.
-            // Absolute deadlines preserve all ~30fps frames and still select
-            // every other frame from a 60fps source.
-            const auto jitter_tolerance_90k = std::max<std::int64_t>(1, output_interval_90k / 20);
-            if (decoded_.pts_90k + jitter_tolerance_90k < next_input_video_pts_90k_) return {};
-            next_input_video_pts_90k_ += output_interval_90k;
-            if (next_input_video_pts_90k_ <= decoded_.pts_90k + jitter_tolerance_90k) {
-                // A low-frame-rate source can cross more than one nominal
-                // deadline between pictures. Never duplicate a picture to
-                // catch up; schedule the next decision from this one.
-                next_input_video_pts_90k_ = decoded_.pts_90k + output_interval_90k;
+            const auto input_delta = decoded_.pts_90k - last_input_video_pts_90k_;
+            constexpr std::int64_t kBackwardDiscontinuity90k = 5 * 90'000;
+            if (input_delta <= 0 && input_delta > -kBackwardDiscontinuity90k) {
+                // Tolerate brief backward jitter (ordinary source noise), but
+                // don't let it freeze video for the full 5s tolerance: many
+                // upstream IPTV panels reset timestamps at their own internal
+                // segment boundaries without ever setting EXT-X-DISCONTINUITY,
+                // so mark_discontinuity()'s explicit reset (hls_source_puller.cpp)
+                // never fires for those and this gate would otherwise silently
+                // drop every frame for up to 5s each time -- audio has no
+                // equivalent gate, so it kept playing throughout, which is what
+                // read as "video freezes constantly, audio keeps going". A real
+                // reset (source's internal segment boundary) persists for many
+                // consecutive frames; ordinary decode-level noise (duplicate or
+                // slightly-reordered timestamps) self-corrects within a frame or
+                // two. So there's little upside to waiting anywhere near 0.5s to
+                // decide which one this is -- a handful of frames (well under
+                // 200ms at any realistic fps) is enough to tell them apart, and
+                // recovering that fast keeps a real reset from reading as a
+                // visible freeze at all.
+                constexpr std::int64_t kMaxToleratedDrops = 3;
+                if (++consecutive_backward_drops_ < kMaxToleratedDrops) {
+                    return {};
+                }
             }
+            consecutive_backward_drops_ = 0;
+            last_input_video_pts_90k_ = decoded_.pts_90k;
+
+            if (input_delta <= 0 || input_delta > kBackwardDiscontinuity90k) {
+                // Start a new sampling phase after a real timestamp discontinuity,
+                // while keeping the generated output clock monotonic.
+                next_input_video_pts_90k_ = decoded_.pts_90k + output_interval_90k;
+            } else {
+                // Select against an absolute input-PTS deadline, with a small
+                // tolerance for MPEG-TS's millisecond-rounded timestamps. At
+                // 30fps those timestamps commonly alternate 2970/3060 ticks. A
+                // delta accumulator starting from zero treated every 2970-tick
+                // frame as "too early" and emitted only 2/3 of a genuine 30fps
+                // source, while audio kept all of its samples and ran far ahead.
+                // Absolute deadlines preserve all ~30fps frames and still select
+                // every other frame from a 60fps source.
+                const auto jitter_tolerance_90k =
+                    std::max<std::int64_t>(1, output_interval_90k / 20);
+                if (decoded_.pts_90k + jitter_tolerance_90k < next_input_video_pts_90k_)
+                    return {};
+                next_input_video_pts_90k_ += output_interval_90k;
+                if (next_input_video_pts_90k_ <= decoded_.pts_90k + jitter_tolerance_90k) {
+                    // A low-frame-rate source can cross more than one nominal
+                    // deadline between pictures. Never duplicate a picture to
+                    // catch up; schedule the next decision from this one.
+                    next_input_video_pts_90k_ = decoded_.pts_90k + output_interval_90k;
+                }
+            }
+            next_output_video_pts_90k_ += output_interval_90k;
         }
-        next_output_video_pts_90k_ += output_interval_90k;
     } else {
         video_clock_set_ = true;
         // Video's own output clock just starts from its own raw source PTS
@@ -254,7 +264,7 @@ core::Result<void> SourceTranscoder::on_audio(std::span<const std::byte> adts,
     // just not encoded/emitted) until video establishes a real position to
     // anchor to. In practice video locks onto its first keyframe within a
     // frame or two, so this costs at most a handful of audio frames.
-    if (!video_clock_set_) return {};
+    if (!video_clock_set_ || awaiting_video_reanchor_) return {};
 
     for (std::size_t i = 0; i < renditions_.size(); ++i) {
         auto& rendition = *renditions_[i];

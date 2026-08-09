@@ -14,6 +14,9 @@ PacedSegmentPublisher::PacedSegmentPublisher(std::shared_ptr<hls::SegmentStore> 
     if (config_.startup_buffer < std::chrono::milliseconds::zero()) {
         config_.startup_buffer = std::chrono::milliseconds::zero();
     }
+    if (config_.recovery_buffer < std::chrono::milliseconds::zero()) {
+        config_.recovery_buffer = std::chrono::milliseconds::zero();
+    }
     thread_ = std::thread([this] { run(); });
 }
 
@@ -51,9 +54,13 @@ void PacedSegmentPublisher::run() {
         }
 
         if (!primed_) {
-            if (buffered_duration_ < config_.startup_buffer) {
+            const auto required_buffer =
+                ever_published_ ? config_.recovery_buffer : config_.startup_buffer;
+            if (buffered_duration_ < required_buffer) {
                 wake_.wait(lock, [this] {
-                    return stopped_.load() || buffered_duration_ >= config_.startup_buffer;
+                    const auto required =
+                        ever_published_ ? config_.recovery_buffer : config_.startup_buffer;
+                    return stopped_.load() || buffered_duration_ >= required;
                 });
                 continue;
             }
@@ -75,6 +82,7 @@ void PacedSegmentPublisher::run() {
         lock.unlock();
         store_->add_segment(std::move(segment));
         lock.lock();
+        ever_published_ = true;
 
         // Schedule from the actual release time. Trying to "catch up" after
         // a delayed wake by emitting several segments together would recreate

@@ -31,8 +31,16 @@ public:
     // automatically from the first frame's ADTS header.
     void push_audio(std::span<const std::byte> adts, std::int64_t pts_90k);
 
-    // Signals a source restart so the next segment carries EXT-X-DISCONTINUITY.
-    void mark_discontinuity() { segmenter_.mark_publisher_reconnect(); }
+    // Signals a source gap so the next independently-decodable segment
+    // carries EXT-X-DISCONTINUITY without shifting the transcoder's already
+    // monotonic output timestamps a second time.
+    void mark_discontinuity() {
+        segmenter_.mark_media_discontinuity();
+        video_config_sent_ = false;
+        audio_config_sent_ = false;
+        video_sps_.clear();
+        video_pps_.clear();
+    }
 
 private:
     Segmenter& segmenter_;

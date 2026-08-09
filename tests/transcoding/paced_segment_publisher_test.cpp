@@ -76,6 +76,7 @@ TEST(PacedSegmentPublisherTest, ReprimesAfterACompleteUpstreamUnderrun) {
     auto store = std::make_shared<SegmentStore>();
     PacedSegmentPublisherConfig config;
     config.startup_buffer = 60ms;
+    config.recovery_buffer = 30ms;
     config.fallback_interval = 30ms;
     PacedSegmentPublisher publisher(store, config);
 
@@ -84,10 +85,24 @@ TEST(PacedSegmentPublisherTest, ReprimesAfterACompleteUpstreamUnderrun) {
     ASSERT_TRUE(wait_for_count(store, 2));
 
     publisher.push(make_segment(2, 30ms));
-    std::this_thread::sleep_for(50ms);
-    EXPECT_EQ(store->segment_count(), 2U);
-    publisher.push(make_segment(3, 30ms));
     EXPECT_TRUE(wait_for_count(store, 3));
+}
+
+TEST(PacedSegmentPublisherTest, RecoveryDoesNotWaitForTheFullColdStartRunway) {
+    auto store = std::make_shared<SegmentStore>();
+    PacedSegmentPublisherConfig config;
+    config.startup_buffer = 90ms;
+    config.recovery_buffer = 30ms;
+    config.fallback_interval = 30ms;
+    PacedSegmentPublisher publisher(store, config);
+
+    publisher.push(make_segment(0, 30ms));
+    publisher.push(make_segment(1, 30ms));
+    publisher.push(make_segment(2, 30ms));
+    ASSERT_TRUE(wait_for_count(store, 3));
+
+    publisher.push(make_segment(3, 30ms));
+    EXPECT_TRUE(wait_for_count(store, 4));
 }
 
 } // namespace

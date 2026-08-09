@@ -500,6 +500,46 @@ TEST(NativeSourceTranscoder, KeepsMillisecondRoundedThirtyFpsInputAtThirtyFps) {
     }
 }
 
+TEST(NativeSourceTranscoder, KeepsOutputClockMonotonicAcrossExplicitSourceGap) {
+    auto source_config = build_h264_config(320, 240, 30, 1'500'000, 10, 1);
+    source_config.allow_frame_skip = false;
+    H264Encoder source_encoder;
+    ASSERT_TRUE(source_encoder.open(source_config).ok());
+
+    std::vector<EncodedAccessUnit> source_aus;
+    for (int i = 0; i < 24; ++i) {
+        ASSERT_TRUE(source_encoder
+                        .encode(make_gradient_frame(320, 240, i * 3000, i), source_aus)
+                        .ok());
+    }
+    ASSERT_GE(source_aus.size(), 20U);
+
+    SourceTranscoder transcoder({{"30fps", "out_30", 320, 240, 1'000'000, 10, 96'000}}, 30);
+    ASSERT_TRUE(transcoder.start().ok());
+    std::vector<std::int64_t> output_pts;
+    transcoder.set_video_output(
+        [&](std::size_t, const EncodedAccessUnit& au) { output_pts.push_back(au.pts_90k); });
+
+    for (const auto& au : source_aus) {
+        ASSERT_TRUE(transcoder.on_video(au.annexb, au.pts_90k, au.dts_90k, au.keyframe).ok());
+    }
+    const auto before_gap = output_pts.size();
+    ASSERT_GT(before_gap, 10U);
+
+    // Re-feed a fresh timestamp epoch, as an upstream HLS discontinuity can
+    // do. The first output after mark_discontinuity must follow the prior
+    // generated PTS; it must not jump back to raw input PTS zero.
+    transcoder.mark_discontinuity();
+    for (const auto& au : source_aus) {
+        ASSERT_TRUE(transcoder.on_video(au.annexb, au.pts_90k, au.dts_90k, au.keyframe).ok());
+    }
+
+    ASSERT_GT(output_pts.size(), before_gap);
+    for (std::size_t i = 1; i < output_pts.size(); ++i) {
+        EXPECT_EQ(output_pts[i] - output_pts[i - 1], 3000);
+    }
+}
+
 TEST(NativeSourceTranscoder, ReEncodesAudioPerRendition) {
     // Make an ADTS source with the AAC encoder, then re-encode per rendition.
     AacParamSet source_params;

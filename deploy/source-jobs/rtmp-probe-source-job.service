@@ -1,0 +1,12 @@
+[Unit]
+Description=Ensure the test/probe HLS source-transcode job exists
+After=rtmp-server.service
+PartOf=rtmp-server.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/ensure-probe-source-job
+RemainAfterExit=yes
+
+[Install]
+WantedBy=rtmp-server.service

@@ -312,6 +312,32 @@ TEST(SegmenterTest, PublisherReconnectFlushesAndMarksADiscontinuity) {
     EXPECT_GE(collector.count(), 2u);
 }
 
+TEST(SegmenterTest, TranscodedMediaGapDoesNotApplyASecondTimestampOffset) {
+    Collector collector;
+    SegmenterConfig config;
+    config.target_duration = 500ms;
+    Segmenter segmenter(collector.callback(), config);
+    send_headers(segmenter);
+
+    std::uint32_t timestamp = 10'000;
+    feed_gop(segmenter, timestamp);
+    feed_gop(segmenter, timestamp);
+
+    segmenter.mark_media_discontinuity();
+    EXPECT_FALSE(segmenter.has_video_config());
+
+    // A transcoder-generated stream continues its clock across the gap. It
+    // still resends codec headers on the next IDR, but needs no timeline-base
+    // adjustment intended for RTMP publishers that restart from timestamp 0.
+    send_headers(segmenter);
+    feed_gop(segmenter, timestamp);
+    feed_gop(segmenter, timestamp);
+    segmenter.finalize();
+
+    EXPECT_GE(segmenter.stats().discontinuities, 1u);
+    EXPECT_GE(collector.count(), 2u);
+}
+
 // --- Bounds ---------------------------------------------------------------
 
 TEST(SegmenterTest, SegmentIsForceCutWhenTheByteBoundIsExceeded) {

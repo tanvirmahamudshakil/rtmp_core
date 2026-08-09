@@ -81,6 +81,11 @@ public:
     // EXT-X-DISCONTINUITY and the TS continuity counters restart.
     void mark_publisher_reconnect();
 
+    // Marks a media gap whose timestamps are already kept monotonic by the
+    // transcoder. Unlike a publisher reconnect this must not add another
+    // timeline offset, or every gap turns into a large artificial PTS jump.
+    void mark_media_discontinuity();
+
     [[nodiscard]] const SegmenterStats& stats() const noexcept { return stats_; }
     [[nodiscard]] bool has_video_config() const noexcept { return video_config_.has_value(); }
     [[nodiscard]] bool has_audio_config() const noexcept { return audio_config_.has_value(); }

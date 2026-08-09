@@ -25,6 +25,10 @@ bool looks_like_raw_ts(std::span<const std::byte> data) {
     if (data.size() > 188 && static_cast<unsigned char>(data[188]) != 0x47) return false;
     return true;
 }
+
+constexpr auto kInputProgressTimeout = std::chrono::seconds(45);
+constexpr auto kOutputStartupTimeout = std::chrono::seconds(90);
+constexpr auto kOutputProgressTimeout = std::chrono::seconds(45);
 } // namespace
 
 HlsSourcePuller::HlsSourcePuller(std::string source_url, std::vector<PullerRendition> renditions,
@@ -178,6 +182,72 @@ void HlsSourcePuller::run() {
     status_.store(PullerStatus::Running);
     set_detail("running");
 
+    // A successful playlist request only proves that the control plane is
+    // alive. The source can keep returning the same window forever, or the
+    // encoder/publisher can stop producing while the puller still reports
+    // Running. Track actual input and published-output progress so the job
+    // manager can replace a wedged pipeline automatically.
+    const auto pipeline_started_at = std::chrono::steady_clock::now();
+    auto last_input_progress = pipeline_started_at;
+    auto last_output_progress = pipeline_started_at;
+    bool received_input = false;
+    bool published_output = false;
+    std::uint64_t published_segment_count = 0;
+    for (const auto& rendition : renditions_) {
+        published_segment_count += rendition.store->stats().segments_added;
+    }
+    published_output = published_segment_count > 0;
+
+    auto note_input_progress = [&] {
+        received_input = true;
+        last_input_progress = std::chrono::steady_clock::now();
+    };
+    auto detect_stall = [&]() -> bool {
+        const auto now = std::chrono::steady_clock::now();
+        std::uint64_t current_output_count = 0;
+        for (const auto& rendition : renditions_) {
+            current_output_count += rendition.store->stats().segments_added;
+        }
+        if (current_output_count != published_segment_count) {
+            published_segment_count = current_output_count;
+            published_output = true;
+            last_output_progress = now;
+        }
+
+        if (now - last_input_progress >= kInputProgressTimeout) {
+            set_detail("source stalled: no media segment progress for 45 seconds");
+            status_.store(PullerStatus::Error);
+            return true;
+        }
+        if (received_input) {
+            const auto output_timeout =
+                published_output ? kOutputProgressTimeout : kOutputStartupTimeout;
+            if (now - last_output_progress >= output_timeout) {
+                set_detail(published_output
+                               ? "transcoder stalled: no output segment for 45 seconds"
+                               : "transcoder startup stalled: no output segment for 90 seconds");
+                status_.store(PullerStatus::Error);
+                return true;
+            }
+        }
+        return false;
+    };
+
+    auto finish_pipeline = [&] {
+        const bool failed = status_.load() == PullerStatus::Error;
+        if (failed) {
+            // Never publish an accumulated burst from a failed pipeline and
+            // never advertise ENDLIST for a live stream. The manager swaps
+            // this store for a fresh pipeline after its restart delay.
+            for (auto& publisher : publishers) publisher->stop();
+            for (auto& segmenter : segmenters) segmenter->finalize();
+        } else {
+            for (auto& segmenter : segmenters) segmenter->finalize();
+            for (auto& publisher : publishers) publisher->flush();
+            for (auto& rendition : renditions_) rendition.store->mark_ended();
+        }
+    };
+
     std::mutex sleep_mutex;
     std::condition_variable sleep_cv;
     int consecutive_errors = 0;
@@ -193,11 +263,13 @@ void HlsSourcePuller::run() {
                 [&](std::span<const std::byte> chunk) -> bool {
                     if (!running_.load()) return false;
                     received_any = true;
+                    note_input_progress();
                     set_detail("running");
                     static_cast<void>(demux.feed(chunk));
-                    return true;
+                    return !detect_stall();
                 });
             if (!running_.load()) break;
+            if (status_.load() == PullerStatus::Error) break;
 
             if (received_any) {
                 // Some IPTV/CDN panels close otherwise-healthy raw TS responses
@@ -220,9 +292,7 @@ void HlsSourcePuller::run() {
             sleep_cv.wait_for(lock, std::chrono::seconds(2), [&] { return !running_.load(); });
         }
 
-        for (auto& segmenter : segmenters) segmenter->finalize();
-        for (auto& publisher : publishers) publisher->flush();
-        for (auto& rendition : renditions_) rendition.store->mark_ended();
+        finish_pipeline();
         if (status_.load() == PullerStatus::Running) status_.store(PullerStatus::Stopped);
         running_.store(false);
         return;
@@ -246,6 +316,7 @@ void HlsSourcePuller::run() {
                 status_.store(PullerStatus::Error);
                 break;
             }
+            if (detect_stall()) break;
             std::unique_lock lock(sleep_mutex);
             sleep_cv.wait_for(lock, std::chrono::seconds(2), [&] { return !running_.load(); });
             continue;
@@ -280,6 +351,14 @@ void HlsSourcePuller::run() {
                 HttpClient segment_http;
                 std::vector<std::byte> bytes;
                 auto result = segment_http.get(uri, bytes);
+                if (!result) {
+                    // A segment is often still available after a transient
+                    // edge timeout. Retry once before permanently skipping
+                    // it and introducing an avoidable media discontinuity.
+                    HttpClient retry_http;
+                    bytes.clear();
+                    result = retry_http.get(uri, bytes);
+                }
                 if (!result) return core::Result<std::vector<std::byte>>(result.error());
                 return core::Result<std::vector<std::byte>>(std::move(bytes));
             }));
@@ -306,7 +385,10 @@ void HlsSourcePuller::run() {
             }
             static_cast<void>(demux.feed(result.value()));
             demux.flush(); // each TS segment is a self-contained unit
+            note_input_progress();
         }
+
+        if (detect_stall()) break;
 
         if (playlist.endlist) {
             set_detail("source ended");
@@ -330,10 +412,7 @@ void HlsSourcePuller::run() {
         sleep_cv.wait_for(lock, wait, [&] { return !running_.load(); });
     }
 
-    // Drain encoders and close every rendition's final segment.
-    for (auto& segmenter : segmenters) segmenter->finalize();
-    for (auto& publisher : publishers) publisher->flush();
-    for (auto& rendition : renditions_) rendition.store->mark_ended();
+    finish_pipeline();
     if (status_.load() == PullerStatus::Running) status_.store(PullerStatus::Stopped);
     running_.store(false);
 }
