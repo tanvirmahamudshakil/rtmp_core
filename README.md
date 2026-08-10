@@ -35,6 +35,11 @@ Caddy with automatic HTTPS, creates an isolated system user, generates
 secrets, configures systemd and conservative kernel networking baselines,
 detects the public network interface, and runs a readiness check.
 
+On dedicated VPS hosts it also disables the distro's duplicate file-based
+Varnish access logger. Viewer estimation still reads cache hits directly from
+Varnish, while system journals are capped at 128 MiB with 1 GiB reserved on
+the root filesystem so request volume cannot consume all disk space.
+
 Fresh opens of the production HLS master link use the smaller startup
 rendition by default (`kk/KK` starts on `KK_480p`). Existing viewers keep the
 rendition URL already loaded, playlists go directly to the origin, and `.ts`

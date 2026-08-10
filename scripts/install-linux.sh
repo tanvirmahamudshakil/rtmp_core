@@ -168,6 +168,7 @@ remove_managed_path() {
     /etc/systemd/system/rtmp-server.service.d | \
     /etc/systemd/system/rtmp-network-tune.service | \
     /etc/systemd/system/rtmp-network-tune.service.d | \
+    /etc/systemd/journald.conf.d/streamforge.conf | \
     /etc/sysctl.d/60-streamforge.conf | \
     /etc/default/rtmp-network | \
     /etc/logrotate.d/rtmp-server | \
@@ -278,6 +279,7 @@ clean_previous_install() {
     /etc/systemd/system/rtmp-server.service.d \
     /etc/systemd/system/rtmp-network-tune.service \
     /etc/systemd/system/rtmp-network-tune.service.d \
+    /etc/systemd/journald.conf.d/streamforge.conf \
     /etc/sysctl.d/60-streamforge.conf \
     /etc/default/rtmp-network \
     /etc/logrotate.d/rtmp-server \
@@ -841,6 +843,17 @@ else
     tc qdisc replace dev "${PRIMARY_INTERFACE}" root fq >/dev/null 2>&1 || true
   fi
 fi
+
+log "Bounding system logs and disabling the redundant Varnish access-log file"
+# viewer-estimator.service starts its own varnishncsa reader and consumes its
+# stdout in memory. The distro varnishncsa.service writes every segment request
+# to disk as well; at high viewer counts that duplicate log can fill a small
+# root filesystem in under one rotation interval.
+systemctl disable --now varnishncsa.service >/dev/null 2>&1 || true
+install -d -m 0755 /etc/systemd/journald.conf.d
+install -m 0644 "${SOURCE_DIR}/deploy/systemd/streamforge-journald.conf" \
+  /etc/systemd/journald.conf.d/streamforge.conf
+systemctl restart systemd-journald.service
 
 log "Configuring Varnish HLS segment cache"
 # Varnish sits between Caddy and the origin (127.0.0.1:8080) for /hls/*
