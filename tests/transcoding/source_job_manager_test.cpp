@@ -6,6 +6,7 @@
 #include <string>
 
 #include "rtmp_server/transcoding/native/source_job_manager.hpp"
+#include "rtmp_server/transcoding/native/rtmp_source_client.hpp"
 
 using namespace rtmp_server;
 using namespace rtmp_server::transcoding::native;
@@ -22,6 +23,29 @@ hls::SegmentPtr make_segment(std::uint64_t sequence) {
 }
 
 } // namespace
+
+TEST(RtmpSourceUrlTest, ParsesDnsIpv6PortNestedStreamAndToken) {
+    auto dns = parse_rtmp_source_url("rtmp://origin.example:1940/live/channel/hd?token=abc");
+    ASSERT_TRUE(dns.ok());
+    EXPECT_EQ(dns.value().host, "origin.example");
+    EXPECT_EQ(dns.value().port, 1940);
+    EXPECT_EQ(dns.value().application, "live");
+    EXPECT_EQ(dns.value().stream, "channel/hd?token=abc");
+    EXPECT_EQ(dns.value().tc_url, "rtmp://origin.example:1940/live");
+
+    auto ipv6 = parse_rtmp_source_url("rtmp://[2001:db8::1]/app/stream");
+    ASSERT_TRUE(ipv6.ok());
+    EXPECT_EQ(ipv6.value().host, "2001:db8::1");
+    EXPECT_EQ(ipv6.value().port, 1935);
+}
+
+TEST(RtmpSourceUrlTest, RejectsUnsafeOrIncompleteUrls) {
+    EXPECT_FALSE(parse_rtmp_source_url("rtmps://host/app/stream").ok());
+    EXPECT_FALSE(parse_rtmp_source_url("rtmp://host/only-app").ok());
+    EXPECT_FALSE(parse_rtmp_source_url("rtmp://user:pass@host/app/stream").ok());
+    EXPECT_FALSE(parse_rtmp_source_url("rtmp://host:99999/app/stream").ok());
+    EXPECT_FALSE(parse_rtmp_source_url("rtmp://host/app/stream#fragment").ok());
+}
 
 TEST(SourceJobManagerTest, ManualRestartPreservesRegisteredStoreAndSequence) {
     std::shared_ptr<hls::SegmentStore> registered_store;

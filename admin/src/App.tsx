@@ -889,7 +889,7 @@ function ApplicationDetailPage({
     const source = sourceUrl.trim();
     const name = safeRuleName(outputName, "");
     if (!source) {
-      onNotify("error", "Enter a source URL (rtmp:// or an https .m3u8).");
+      onNotify("error", "Enter an RTMP, HTTP, or HTTPS live source URL.");
       return;
     }
     if (!name) {
@@ -1018,7 +1018,7 @@ function ApplicationDetailPage({
       return (
         <section className="assignment-workspace">
           <div className="playback-heading">
-            <div><span className="eyebrow">PULL · TRANSCODE · RE-SERVE</span><h2>Transcode from a source URL</h2><p>Point at an external source (rtmp:// or an https .m3u8 carrying H.264/AAC). It is transcoded per the chosen template and re-served as one adaptive master .m3u8.</p></div>
+            <div><span className="eyebrow">PULL · TRANSCODE · RE-SERVE</span><h2>Transcode from a source URL</h2><p>Point at an RTMP or HTTP(S) HLS/TS source carrying H.264/AAC. The native pipeline detects the source by protocol/content, transcodes the chosen ladder, and serves one adaptive master .m3u8.</p></div>
             <span className="panel-count">{sourceJobs.length} running</span>
           </div>
           <article className="assignment-card source-form">

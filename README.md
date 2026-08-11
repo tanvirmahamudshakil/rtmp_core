@@ -35,16 +35,17 @@ Caddy with automatic HTTPS, creates an isolated system user, generates
 secrets, configures systemd and conservative kernel networking baselines,
 detects the public network interface, and runs a readiness check.
 
-On dedicated VPS hosts it also disables the distro's duplicate file-based
-Varnish access logger. Viewer estimation still reads cache hits directly from
-Varnish, while system journals are capped at 128 MiB with 1 GiB reserved on
-the root filesystem so request volume cannot consume all disk space.
+On dedicated VPS hosts it disables per-request Varnish log consumers. Reading
+every segment hit is itself expensive at large audience sizes; aggregate
+cache/origin metrics remain available. System journals are capped at 128 MiB
+with 1 GiB reserved on the root filesystem.
 
 Fresh opens of the production HLS master link use the smaller startup
 rendition by default (`kk/KK` starts on `KK_480p`). Existing viewers keep the
-rendition URL already loaded, playlists go directly to the origin, and `.ts`
-segments continue through the shared Varnish cache. Set the names for another
-deployment at install time:
+rendition URL already loaded. Both playlists and `.ts` segments go through the
+local shared Varnish cache, so additional viewers normally produce cache hits
+instead of additional origin work. Set the names for another deployment at
+install time:
 
 ```sh
 sudo env \
@@ -81,10 +82,13 @@ viewer budget = bandwidth × utilization ÷ (per-viewer bitrate × protocol over
 ```
 
 The default high-density target uses 90% link utilization and 5% overhead;
-both are configurable. Egress shaping is disabled by default, so a mistaken
-capacity value cannot silently cap a faster provider link. Operators may opt
-in with `RTMP_ENABLE_FAIR_QUEUE=1`; that uses CAKE at 95% of the declared
-uplink through 10 Gbps and lower-overhead Linux `fq` above it.
+both are configurable. Fair egress shaping is enabled by default so the queue
+stays on the VPS, existing viewers cannot consume the last part of the uplink,
+and a new viewer's playlist/first segment receives a fair turn. It uses CAKE
+through 10 Gbps and HTB plus `fq` above it. Set the provider's real committed
+rate with `RTMP_BANDWIDTH_MBIT`; a virtual NIC's displayed speed may be higher.
+`RTMP_ENABLE_FAIR_QUEUE=0` is available only when external shaping already
+provides equivalent headroom and per-flow fairness.
 
 The detected/declared bandwidth and auto-bitrate mode are written to the
 installer-owned `runtime-config.json`, so the admin dashboard loads the server
@@ -130,9 +134,10 @@ serve 10,000 viewers at 2.5 Mbps each: even before overhead that would require
 includes `rtmp_load_gen` for measurement on the actual VPS. The playback hot
 path reuses one immutable RTMP wire buffer across matching viewers and uses
 capability-gated Linux SEND_ZC for large writes. HLS keeps a bounded live
-window in RAM, shares immutable segment buffers across requests, and emits
-long-lived cache headers suitable for a CDN; see `docs/high-density-rtmp.md`
-and `docs/hls.md`.
+window in RAM and routes shared public playlists/segments through local
+Varnish; no external CDN is required. This removes per-viewer work inside the
+C++ origin, but it cannot reduce the VPS's bytes sent on its physical NIC; see
+`docs/high-density-rtmp.md` and `docs/hls.md`.
 
 Examples with the installer's default 90% utilization and 5% overhead:
 

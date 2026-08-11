@@ -94,6 +94,14 @@ bool is_master_playlist(std::string_view text) {
     return text.find("#EXT-X-STREAM-INF") != std::string_view::npos;
 }
 
+bool is_hls_playlist(std::string_view text) {
+    // RFC 8216 requires EXTM3U to be the first line. Tolerate a UTF-8 BOM and
+    // leading HTTP-origin whitespace, both seen in otherwise valid feeds.
+    text = trim(text);
+    if (text.starts_with("\xEF\xBB\xBF")) text.remove_prefix(3);
+    return text.starts_with("#EXTM3U");
+}
+
 std::vector<HlsVariant> parse_master_playlist(std::string_view text, std::string_view base_url) {
     std::vector<HlsVariant> variants;
     const auto lines = lines_of(text);
@@ -139,6 +147,13 @@ HlsMediaPlaylist parse_media_playlist(std::string_view text, std::string_view ba
             pending_discontinuity = true;
         } else if (line.rfind("#EXTINF:", 0) == 0) {
             pending_duration = to_double(line.substr(8));
+        } else if (line.rfind("#EXT-X-MAP:", 0) == 0) {
+            playlist.unsupported_feature = "fragmented-MP4 HLS (#EXT-X-MAP) is not supported by the native TS demuxer";
+        } else if (line.rfind("#EXT-X-BYTERANGE:", 0) == 0) {
+            playlist.unsupported_feature = "byte-range HLS segments are not supported by the native puller";
+        } else if (line.rfind("#EXT-X-KEY:", 0) == 0 &&
+                   line.find("METHOD=NONE") == std::string_view::npos) {
+            playlist.unsupported_feature = "encrypted HLS is not supported by the native puller";
         } else if (line == "#EXT-X-ENDLIST") {
             playlist.endlist = true;
         } else if (line.front() != '#') {

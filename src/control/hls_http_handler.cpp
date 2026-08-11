@@ -218,6 +218,7 @@ HlsHttpHandler::Stats HlsHttpHandler::stats() const {
 
 void HlsHttpHandler::record_delivery(const std::string& application, const std::string& stream, std::uint64_t bytes,
                                      const std::string& playback_session) {
+    if (!options_.track_delivery_stats) return;
     std::lock_guard lock(mutex_);
     const auto it = streams_.find(application + "/" + stream);
     if (it == streams_.end()) return;
@@ -352,7 +353,9 @@ HttpResponse HlsHttpHandler::serve_media_playlist(const HttpRequest& request, co
     // Preserve the caller's query string on segment URIs so a token-gated
     // stream stays playable: the player copies the URI verbatim.
     std::string body = entry.store->playlist({});
-    append_query_to_playlist_uris(body, request.query);
+    if (options_.propagate_query_to_playlist_uris) {
+        append_query_to_playlist_uris(body, request.query);
+    }
 
     HttpResponse response;
     response.status = 200;
@@ -370,7 +373,9 @@ HttpResponse HlsHttpHandler::serve_master_playlist(const HttpRequest& request, c
     response.status = 200;
     response.content_type = kContentTypeM3u8;
     response.body = hls::build_master_playlist(entry.renditions);
-    append_query_to_playlist_uris(response.body, request.query);
+    if (options_.propagate_query_to_playlist_uris) {
+        append_query_to_playlist_uris(response.body, request.query);
+    }
     decorate(response, options_.enable_playback_sessions ? "private, no-store" : options_.master_cache_control);
     return response;
 }

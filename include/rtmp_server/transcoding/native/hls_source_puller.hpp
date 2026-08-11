@@ -27,10 +27,10 @@ struct PullerRendition {
 
 enum class PullerStatus { Starting, Running, Error, Stopped };
 
-// Pulls an HLS (or plain TS) source over HTTP, demuxes it, transcodes it once
+// Pulls native RTMP, HLS, or plain HTTP TS and transcodes it once
 // into every rendition, and writes each rendition's segments into its store —
-// the FFmpeg-free source-transcode job, end to end. Runs on its own worker
-// thread; the RTMP media path and HTTP serving threads are never touched.
+// the external-process-free source-transcode job, end to end. It runs on its
+// own worker; the inbound RTMP and HTTP serving threads are never touched.
 class HlsSourcePuller {
 public:
     HlsSourcePuller(std::string source_url, std::vector<PullerRendition> renditions,
@@ -47,7 +47,7 @@ public:
 
 private:
     void run();
-    // Classifies source_url_: a bounded HLS playlist (master or media, resolved
+    // Classifies an HTTP(S) source as a bounded HLS playlist (master or media, resolved
     // to media_url_out) or a continuous raw HTTP-TS live feed (raw_ts_out set,
     // media_url_out == source_url_) — the two shapes this puller can ingest.
     [[nodiscard]] bool resolve_source(HttpClient& http, std::string& media_url_out, bool& raw_ts_out,

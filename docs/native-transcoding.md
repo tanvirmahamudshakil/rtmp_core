@@ -100,9 +100,10 @@ pull an **external source URL**, transcode it per a template, and re-serve it as
 one adaptive master `.m3u8`:
 
 ```text
-source URL (rtmp:// or https .m3u8, H.264/AAC)
-    → HttpClient (libcurl) fetch playlist + segments
-    → TsDemuxer → decode once (openh264 / libfdk-aac)
+source URL (rtmp://, HTTP(S) HLS, or raw HTTP TS; H.264/AAC)
+    → native RtmpSourceClient, or HttpClient + content-based HLS/TS detection
+    → FLV AVC/AAC conversion, or TsDemuxer
+    → decode once (openh264 / libfdk-aac)
     → per rendition: libyuv scale + libx264 H.264 encode + AAC re-encode
     → RenditionFeed → Segmenter → SegmentStore
     → /hls/{app}/{name}/master.m3u8
@@ -115,7 +116,11 @@ quality-per-bitrate than openh264's CAVLC-only encoder at the same realtime,
 zero-reorder-latency budget. Managed via `POST /v1/transcoding/source-jobs`
 (and GET/DELETE), or the admin UI's **Source Transcode** tab. Only the software
 backend with H.264/AAC is accepted — other codecs/backends are disabled in the
-UI and rejected by the API until built. libcurl is required for this path.
+UI and rejected by the API until built. The RTMP pull path uses native
+DNS/TCP, handshake, AMF/chunk decoding, acknowledgement and ping handling;
+libcurl is used only for HTTP(S) HLS/TS fetching. Encrypted, byte-range and
+fragmented-MP4 HLS playlists are rejected immediately with a precise job
+detail because the native demuxer currently accepts MPEG-TS segments.
 
 Or during a VPS install: `RTMP_ENABLE_NATIVE_TRANSCODE=1 bash scripts/install-linux.sh`.
 

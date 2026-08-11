@@ -107,6 +107,11 @@ struct ServerConfig {
     std::uint32_t transcoding_max_outputs_per_job = 16;
     std::uint32_t transcoding_max_restart_attempts = 5;
 
+    // Shared-cache HLS delivery: no per-viewer redirect/query state and no
+    // per-delivery origin accounting. This is the production default for a
+    // single VPS serving a very large public audience through local Varnish.
+    bool hls_high_scale_mode = true;
+
     std::string token_signing_secret;
     std::string api_authentication_secret;
 

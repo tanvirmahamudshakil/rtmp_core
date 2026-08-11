@@ -188,11 +188,45 @@ media sequence.
 | Playlists | `application/vnd.apple.mpegurl` |
 | Segments | `video/mp2t` |
 
+### Maximum-scale public mode
+
+Production defaults `hls_high_scale_mode: true`. In this mode there is no
+per-viewer redirect, session map, playlist query decoration, or delivery-stats
+mutex on the origin request path. Caddy sends all `/hls/*` traffic through the
+same-VPS Varnish instance. Varnish removes query strings, request-collapses a
+hot segment's first fetch, caches media playlists for 1 second, masters for 30
+seconds and immutable segments for 1 hour. Segment sequence numbers start from
+wall-clock milliseconds, so names cannot repeat after publisher reconnect or
+process restart while an older cache object still exists.
+
+This profile is deliberately for public links. Query-token authorization and
+per-viewer origin counting require `hls_high_scale_mode: false` **and** a proxy
+profile that preserves/bypasses query-bearing playlists; the installer VCL is
+intentionally public and normalizes all HLS queries. Those features cannot be
+combined safely with a fully shared public cache.
+
+The cache eliminates proportional origin CPU/memory work, not network egress.
+One VPS still sends one copy to every viewer. Approximate ceiling:
+
+```text
+viewers = usable outbound Mbps / average selected-rendition Mbps
+```
+
+Keep 10-20% headroom for protocol overhead, bursts and retransmissions and use
+the provider's committed egress rate, not merely the virtual NIC's displayed
+link speed.
+
+The production installer enforces that headroom with fair egress scheduling:
+CAKE up to 10 Gbps, or HTB plus `fq` above it. Consequently a new viewer's
+playlist and first advertised (already cached) segment are not stuck behind
+all established viewers in the provider's saturated FIFO/policer queue.
+
 ### Cache-Control
 
 | Resource | Header | Why |
 |---|---|---|
-| Media playlist | `no-cache, max-age=0` | Changes every segment duration; a cached live playlist stalls viewers |
+| Media playlist (library default) | `no-cache, max-age=0` | Safe when no reverse cache profile is selected |
+| Media playlist (production high-scale) | `public, max-age=1, s-maxage=1, stale-while-revalidate=2` | Allows a one-second shared micro-cache without stalling the live window |
 | Segment (200) | `public, max-age=31536000, immutable` | Uniquely named and never rewritten — safe to cache indefinitely |
 | Master playlist | `public, max-age=60` | Changes only when the rendition set changes |
 | Segment (404) | `no-store` | An evicted-segment 404 must not be cached, or the CDN keeps serving it after recovery |

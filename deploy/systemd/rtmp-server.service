@@ -96,7 +96,7 @@ RestartPreventExitStatus=1
 # enforces its own connection limit, but hitting the fd limit first produces
 # accept() EMFILE, which is a much worse failure mode (it degrades every
 # connection rather than cleanly refusing new ones).
-LimitNOFILE=65536
+LimitNOFILE=1048576
 
 # io_uring registers and pins buffers, which counts against RLIMIT_MEMLOCK.
 # registered_buffer_count x registered_buffer_size (1024 x 64 KiB = 64 MiB by

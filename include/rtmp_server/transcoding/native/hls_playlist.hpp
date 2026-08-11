@@ -21,6 +21,10 @@ struct HlsMediaPlaylist {
     double target_duration = 0;
     std::uint64_t media_sequence = 0;
     bool endlist = false; // true = VOD/finished, false = live (keep polling)
+    // Set when the playlist needs a container/transport feature the native
+    // MPEG-TS puller intentionally cannot decode. Callers surface this exact
+    // reason instead of timing out later with an empty output.
+    std::string unsupported_feature;
 };
 
 // One variant from a master (multivariant) playlist.
@@ -37,6 +41,10 @@ struct HlsVariant {
 
 // True if the text looks like a master playlist (contains EXT-X-STREAM-INF).
 [[nodiscard]] bool is_master_playlist(std::string_view text);
+
+// Content-based HLS detection. URLs frequently hide the .m3u8 suffix behind
+// query strings or redirects, so the EXTM3U header is authoritative.
+[[nodiscard]] bool is_hls_playlist(std::string_view text);
 
 // Parses a master playlist, resolving each variant URI against `base_url`.
 [[nodiscard]] std::vector<HlsVariant> parse_master_playlist(std::string_view text,

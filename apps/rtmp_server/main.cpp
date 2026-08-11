@@ -190,7 +190,13 @@ int main(int argc, char** argv) {
     // shares the same segment bytes instead of allocating its own media copy.
     rtmp_server::control::HlsHttpOptions hls_options;
     hls_options.require_playback_token = false;
-    hls_options.enable_playback_sessions = true;
+    hls_options.enable_playback_sessions = !config.hls_high_scale_mode;
+    hls_options.track_delivery_stats = !config.hls_high_scale_mode;
+    hls_options.propagate_query_to_playlist_uris = !config.hls_high_scale_mode;
+    if (config.hls_high_scale_mode) {
+        hls_options.playlist_cache_control = "public, max-age=1, s-maxage=1, stale-while-revalidate=2";
+        hls_options.master_cache_control = "public, max-age=30, s-maxage=30, stale-while-revalidate=60";
+    }
     rtmp_server::control::HlsHttpHandler hls_handler(std::move(hls_options));
     // Disabling a stream (or its application) takes its .m3u8 links offline
     // immediately, mirroring the RTMP publish/play gate above — no viewer can
@@ -221,6 +227,13 @@ int main(int argc, char** argv) {
             segmenter_config.target_duration = std::chrono::seconds(2);
             segmenter_config.max_segment_duration = std::chrono::seconds(8);
             segmenter_config.max_segment_bytes = 16u * 1024u * 1024u;
+            // Segment names must not repeat after a publisher reconnect or a
+            // process restart; shared caches may retain immutable objects long
+            // after the in-memory live window has advanced.
+            segmenter_config.initial_sequence = static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::system_clock::now().time_since_epoch())
+                    .count());
 
             hls_handler.register_stream(std::string(application), std::string(stream), store);
             return std::make_shared<rtmp_server::hls::StreamSink>(std::move(store),
@@ -460,8 +473,8 @@ int main(int argc, char** argv) {
             });
     }
 #ifdef RTMP_NATIVE_TRANSCODE
-    // Source-transcode jobs: pull an external URL (rtmp:// or an http(s) .m3u8),
-    // transcode it per a template with the in-process FFmpeg-free pipeline, and
+    // Source-transcode jobs: pull native RTMP or content-detected HTTP(S)
+    // HLS/TS, transcode it with the in-process external-process-free pipeline, and
     // re-serve the renditions as one adaptive master .m3u8. Each rendition's
     // segment store is registered with the HLS handler for delivery.
     rtmp_server::transcoding::native::SourceJobManager::Hooks source_hooks;

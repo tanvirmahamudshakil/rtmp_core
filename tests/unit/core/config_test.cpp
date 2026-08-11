@@ -56,6 +56,7 @@ TEST_F(ConfigTest, LoadsValidConfigWithOverrides) {
         "rtmp_port: 1936\n"
         "api_port: 8081\n"
         "handshake_timeout: 7s\n"
+        "hls_high_scale_mode: false\n"
         "token_signing_secret: 4f3c1d9a8b7e6520f1a2b3c4d5e6f708\n"
         "api_authentication_secret: 9a8b7c6d5e4f30211f2e3d4c5b6a7988\n");
 
@@ -64,6 +65,7 @@ TEST_F(ConfigTest, LoadsValidConfigWithOverrides) {
     EXPECT_EQ(result.value().rtmp_port, 1936);
     EXPECT_EQ(result.value().api_port, 8081);
     EXPECT_EQ(result.value().handshake_timeout, std::chrono::milliseconds(7000));
+    EXPECT_FALSE(result.value().hls_high_scale_mode);
 }
 
 TEST(ServerConfigValidate, RejectsZeroPorts) {

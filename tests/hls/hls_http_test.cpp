@@ -270,6 +270,62 @@ TEST(HlsHttpTest, LivePlaylistIsNotCacheableButSegmentsAreImmutable) {
     EXPECT_EQ(header_of(segment, "Cache-Control"), "public, max-age=31536000, immutable");
 }
 
+TEST(HlsHttpTest, HighScaleModeProducesSharedCacheablePlaylistsWithoutViewerState) {
+    HlsHttpOptions options;
+    options.enable_playback_sessions = false;
+    options.track_delivery_stats = false;
+    options.propagate_query_to_playlist_uris = false;
+    options.playlist_cache_control = "public, max-age=1, s-maxage=1, stale-while-revalidate=2";
+    options.master_cache_control = "public, max-age=30, s-maxage=30, stale-while-revalidate=60";
+    HlsHttpHandler handler{options};
+    handler.register_stream("live", "demo", populated_store(3));
+    hls::Rendition rendition;
+    rendition.uri = "index.m3u8";
+    handler.set_renditions("live", "demo", {rendition});
+
+    const auto master = handler.handle(get("/hls/live/demo/master.m3u8", "cache_buster=one"));
+    ASSERT_EQ(master.status, 200);
+    EXPECT_EQ(header_of(master, "Cache-Control"), options.master_cache_control);
+    EXPECT_EQ(master.body.find("cache_buster"), std::string::npos);
+
+    const auto media = handler.handle(get("/hls/live/demo/index.m3u8", "cache_buster=two"));
+    ASSERT_EQ(media.status, 200);
+    EXPECT_EQ(header_of(media, "Cache-Control"), options.playlist_cache_control);
+    EXPECT_EQ(media.body.find("cache_buster"), std::string::npos);
+    EXPECT_EQ(media.body.find("segment-0.ts?"), std::string::npos);
+
+    const auto segment = handler.handle(get("/hls/live/demo/segment-0.ts", "cache_buster=three"));
+    ASSERT_EQ(segment.status, 200);
+    EXPECT_EQ(handler.link_stats("live", "demo").bytes_total, 0u);
+}
+
+TEST(HlsHttpTest, NewViewerCanFetchTheFirstAdvertisedSegmentAfterAFullWindowAdvance) {
+    hls::SegmentStoreConfig store_config;
+    store_config.live_window_segments = 6;
+    store_config.retention_grace_segments = 6;
+    auto store = std::make_shared<hls::SegmentStore>(store_config);
+    for (std::uint64_t i = 0; i < 20; ++i) store->add_segment(make_segment(i));
+
+    HlsHttpOptions options;
+    options.enable_playback_sessions = false;
+    options.track_delivery_stats = false;
+    options.propagate_query_to_playlist_uris = false;
+    HlsHttpHandler handler{options};
+    handler.register_stream("live", "demo", store);
+
+    const auto join_playlist = handler.handle(get("/hls/live/demo/index.m3u8"));
+    ASSERT_EQ(join_playlist.status, 200);
+    ASSERT_NE(join_playlist.body.find("segment-14.ts"), std::string::npos) << join_playlist.body;
+
+    // Existing viewers may advance the live window before the new client asks
+    // for its first URI. One complete window of grace keeps that exact startup
+    // segment fetchable; the shared cache normally serves it even earlier.
+    for (std::uint64_t i = 20; i < 26; ++i) store->add_segment(make_segment(i));
+    const auto first_segment = handler.handle(get("/hls/live/demo/segment-14.ts"));
+    EXPECT_EQ(first_segment.status, 200);
+    EXPECT_EQ(first_segment.payload_size(), 1024u);
+}
+
 TEST(HlsHttpTest, CorsAndAcceptRangesHeadersArePresentForBrowserPlayers) {
     HlsHttpHandler handler{HlsHttpOptions{}};
     handler.register_stream("live", "demo", populated_store());

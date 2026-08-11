@@ -23,7 +23,7 @@ namespace rtmp_server::transcoding::native {
 struct SourceJobConfig {
     std::string application;
     std::string name;          // output base stream name
-    std::string source_url;    // rtmp:// or an http(s) .m3u8 / .ts
+    std::string source_url;    // native rtmp:// pull or content-detected HTTP(S) HLS/TS
     std::string template_name; // for display / persistence
     std::uint32_t fps = 30;
     std::vector<RenditionSpec> renditions; // each with an output_stream key
@@ -50,7 +50,7 @@ struct SourceJobSnapshot {
 
 // Owns the lifecycle of source-transcode jobs: for each rendition it creates a
 // SegmentStore, registers it for HLS serving, wires up the master playlist, and
-// runs an HlsSourcePuller. Segment-store registration and master-playlist
+// runs a native RTMP/HLS/TS source puller. Segment-store registration and master-playlist
 // declaration are injected as hooks so this stays independent of the HTTP layer.
 class SourceJobManager {
 public:

@@ -68,6 +68,12 @@ transcoding_max_active_jobs: 16
 transcoding_max_outputs_per_job: 16
 transcoding_max_restart_attempts: 5
 
+# Maximum-scale public HLS mode. This removes per-viewer origin sessions and
+# makes every viewer share the same local Varnish playlist/segment objects.
+# Set false only when per-viewer query-token propagation/counting is required;
+# also replace the installer's public Varnish profile so it preserves queries.
+hls_high_scale_mode: true
+
 # CHANGE THESE before production use. Never commit real secrets.
 token_signing_secret: "CHANGE_ME"
 api_authentication_secret: "CHANGE_ME"

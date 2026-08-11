@@ -5,6 +5,7 @@ add_executable(rtmp_server_transcoding_tests
     paced_segment_publisher_test.cpp
     hls_playlist_test.cpp
     source_job_manager_test.cpp
+    rtmp_source_client_test.cpp
 )
 
 target_link_libraries(rtmp_server_transcoding_tests PRIVATE

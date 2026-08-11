@@ -4,6 +4,7 @@
 #include <limits>
 
 #include "rtmp_server/core/error.hpp"
+#include "rtmp_server/transcoding/native/rtmp_source_client.hpp"
 
 namespace rtmp_server::transcoding::native {
 
@@ -12,6 +13,16 @@ namespace {
 core::Error job_error(std::string message) {
     return core::Error(core::ErrorCode::InvalidConfiguration, core::ErrorCategory::Configuration,
                        std::move(message));
+}
+
+core::Result<void> validate_source_url(std::string_view url) {
+    if (url.starts_with("rtmp://")) {
+        auto parsed = parse_rtmp_source_url(url);
+        if (!parsed) return parsed.error();
+        return {};
+    }
+    if (url.starts_with("http://") || url.starts_with("https://")) return {};
+    return job_error("source URL must use rtmp://, http:// or https://");
 }
 
 std::string status_text(PullerStatus status) {
@@ -157,8 +168,11 @@ void SourceJobManager::start_locked(Job& job) {
         rendition.uri = "../" + spec.output_stream + "/index.m3u8";
         rendition.average_bandwidth = spec.video_bitrate + spec.audio_bitrate;
         rendition.bandwidth = peak_hls_bandwidth(rendition.average_bandwidth);
+        rendition.codecs = "avc1.64001f,mp4a.40.2";
         rendition.width = spec.width;
         rendition.height = spec.height;
+        rendition.frame_rate = static_cast<double>(fps);
+        rendition.name = spec.name;
         master_renditions.push_back(std::move(rendition));
 
         puller_renditions.push_back(PullerRendition{spec, std::move(store)});
@@ -194,6 +208,7 @@ SourceJobSnapshot SourceJobManager::snapshot_locked(const Job& job) const {
 core::Result<SourceJobSnapshot> SourceJobManager::create(const SourceJobConfig& config) {
     if (config.name.empty()) return job_error("source job requires an output name");
     if (config.source_url.empty()) return job_error("source job requires a source URL");
+    if (auto valid = validate_source_url(config.source_url); !valid) return valid.error();
     if (config.renditions.empty()) return job_error("source job requires at least one rendition");
     for (const auto& rendition : config.renditions) {
         if (rendition.output_stream.empty()) return job_error("every rendition needs an output stream name");

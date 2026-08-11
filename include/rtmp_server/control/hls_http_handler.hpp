@@ -37,6 +37,16 @@ struct HlsHttpOptions {
     // core::generate_secure_token(16), i.e. 128 bits from OpenSSL RAND_bytes.
     std::function<std::string()> playback_session_id_factory;
 
+    // Delivery accounting takes the handler's shared registry mutex on every
+    // cache miss. Disable it when a shared reverse cache is the viewer-facing
+    // delivery tier; edge/cache metrics should be used at that scale instead.
+    bool track_delivery_stats = true;
+
+    // Token/session query values have to be copied into child playlist URIs.
+    // Public high-scale deployments should disable this so arbitrary query
+    // strings cannot fragment an otherwise shared playlist/segment cache.
+    bool propagate_query_to_playlist_uris = true;
+
     // Cache-Control for the live media playlist. A live playlist changes
     // every segment duration, so it must never be cached beyond that or
     // viewers stall on a stale window.

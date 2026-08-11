@@ -353,6 +353,7 @@ Result<ServerConfig> load_config(const std::string& path) {
     u32("transcoding_max_active_jobs", cfg.transcoding_max_active_jobs);
     u32("transcoding_max_outputs_per_job", cfg.transcoding_max_outputs_per_job);
     u32("transcoding_max_restart_attempts", cfg.transcoding_max_restart_attempts);
+    boolean("hls_high_scale_mode", cfg.hls_high_scale_mode);
     str("token_signing_secret", cfg.token_signing_secret);
     str("api_authentication_secret", cfg.api_authentication_secret);
     str("log_level", cfg.log_level);

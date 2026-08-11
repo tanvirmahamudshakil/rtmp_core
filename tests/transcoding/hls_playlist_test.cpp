@@ -4,6 +4,24 @@
 
 using namespace rtmp_server::transcoding::native;
 
+TEST(HlsPlaylistTest, DetectsPlaylistByContentInsteadOfUrlExtension) {
+    EXPECT_TRUE(is_hls_playlist("#EXTM3U\n#EXT-X-VERSION:3\n"));
+    EXPECT_TRUE(is_hls_playlist("\xEF\xBB\xBF#EXTM3U\r\n"));
+    EXPECT_FALSE(is_hls_playlist("not a playlist"));
+}
+
+TEST(HlsPlaylistTest, ReportsUnsupportedMediaFeaturesExplicitly) {
+    const auto fmp4 = parse_media_playlist(
+        "#EXTM3U\n#EXT-X-MAP:URI=\"init.mp4\"\n#EXTINF:2,\npart.m4s\n",
+        "https://host/live/index.m3u8");
+    EXPECT_NE(fmp4.unsupported_feature.find("fragmented-MP4"), std::string::npos);
+
+    const auto encrypted = parse_media_playlist(
+        "#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI=\"key\"\n#EXTINF:2,\na.ts\n",
+        "https://host/live/index.m3u8");
+    EXPECT_NE(encrypted.unsupported_feature.find("encrypted"), std::string::npos);
+}
+
 TEST(HlsPlaylist, ResolvesRelativeAbsoluteAndFullUrls) {
     const std::string base = "https://cdn.example.com/live/stream/index.m3u8";
     EXPECT_EQ(resolve_url(base, "seg1.ts"), "https://cdn.example.com/live/stream/seg1.ts");

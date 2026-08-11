@@ -4,60 +4,62 @@ vcl 4.1;
 backend default {
     .host = "127.0.0.1";
     .port = "8080";
+    .connect_timeout = 1s;
+    .first_byte_timeout = 5s;
+    .between_bytes_timeout = 5s;
+    .max_connections = 1024;
 }
 
 sub vcl_recv {
     if (req.method != "GET" && req.method != "HEAD") {
         return (pass);
     }
-    if (req.url ~ "\.m3u8(\?.*)?$") {
-        # Session/token-bearing playlists are private and their bodies contain
-        # per-player query values, so they must never be shared.
-        if (req.url ~ "\?") {
-            return (pass);
-        }
-        # A public playlist falls through to the 1s micro-cache. A fresh
-        # master request now returns an uncacheable session redirect.
+    if (req.url !~ "^/hls/") {
+        return (pass);
     }
+
+    # This is the public high-scale profile: query strings are neither auth nor
+    # viewer identity. Normalizing them prevents cache-buster attacks from
+    # creating one object/backend fetch per request.
+    if (req.url ~ "\\?") {
+        set req.url = regsub(req.url, "\\?.*$", "");
+    }
+    unset req.http.Cookie;
+    unset req.http.Authorization;
     return (hash);
 }
 
-sub vcl_hash {
-    if (req.url ~ "\.ts\?" &&
-        req.url ~ "[?&]viewer_session=[0-9a-f]{32}&viewer_stream=[^&]*$") {
-        # Session identity stays in the client access log but not the object
-        # key. Earlier query fields such as token/expires remain hashed.
-        hash_data(regsub(req.url,
-            "[?&]viewer_session=[0-9a-f]{32}&viewer_stream=[^&]*$", ""));
-    } else {
-        hash_data(req.url);
-    }
-    if (req.http.host) {
-        hash_data(req.http.host);
-    } else {
-        hash_data(server.ip);
-    }
-    return (lookup);
-}
-
 sub vcl_backend_fetch {
-    # Cache the complete immutable segment, never a viewer's partial range.
+    # Store one complete immutable segment and satisfy client ranges from it.
     unset bereq.http.Range;
 }
 
 sub vcl_backend_response {
-    if (bereq.url ~ "\.ts(\?.*)?$") {
+    if (bereq.url ~ "\\.ts$") {
         if (beresp.status == 200) {
-            set beresp.ttl = 2m;
-            set beresp.grace = 10s;
+            set beresp.ttl = 1h;
+            set beresp.grace = 5m;
+            set beresp.keep = 1h;
+            # Coalesce a hot segment's initial burst into one origin fetch.
+            set beresp.do_stream = false;
         } else {
             set beresp.ttl = 0s;
             set beresp.uncacheable = true;
         }
-    } else if (bereq.url ~ "\.m3u8(\?.*)?$") {
+    } else if (bereq.url ~ "/master\\.m3u8$") {
+        if (beresp.status == 200) {
+            set beresp.ttl = 30s;
+            set beresp.grace = 1m;
+            set beresp.keep = 5m;
+        } else {
+            set beresp.ttl = 0s;
+            set beresp.uncacheable = true;
+        }
+    } else if (bereq.url ~ "\\.m3u8$") {
         if (beresp.status == 200) {
             set beresp.ttl = 1s;
-            set beresp.grace = 2s;
+            set beresp.grace = 3s;
+            set beresp.keep = 10s;
         } else {
             set beresp.ttl = 0s;
             set beresp.uncacheable = true;

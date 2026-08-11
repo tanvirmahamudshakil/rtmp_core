@@ -22,9 +22,9 @@
 #   RTMP_PROTOCOL_OVERHEAD_PERCENT
 #                                RTMP/TCP/IP overhead budget (default 5).
 #   RTMP_ADMIN_TOKEN             Existing admin token; generated if absent.
-#   RTMP_ENABLE_FAIR_QUEUE       0 (default) leaves egress unshaped. Set 1 to
-#                                opt into CAKE at 95% up to 10 Gbps, or
-#                                high-throughput fq above it.
+#   RTMP_ENABLE_FAIR_QUEUE       1 (default) shapes at the configured link
+#                                utilization target and fairly schedules viewer
+#                                flows, reserving capacity for new joins.
 #   RTMP_CONFIGURE_FIREWALL      1 (default) adds rules only if UFW is active.
 #   RTMP_CONFIGURE_DNS            1 (default) adds public resolvers (Cloudflare,
 #                                Google, Quad9) as systemd-resolved fallback DNS
@@ -38,11 +38,10 @@
 #                                artefact before reinstalling. Set 0 only for
 #                                the legacy in-place upgrade behaviour.
 #   RTMP_FORCE_ROTATE_SECRETS    1 rotates secrets during an in-place install.
-#   RTMP_ENABLE_TRANSCODING      1 (default) installs/enables the independent
-#                                worker supervisor. An empty preset file starts
-#                                no jobs and consumes no encoder resources.
 #   RTMP_TRANSCODING_RULES       Optional newline-delimited preset rules used
-#                                to seed /etc/rtmp-server/transcoding.conf.
+#                                to seed the legacy preset file (the external
+#                                supervisor remains disabled; source jobs use
+#                                the native in-process pipeline).
 #   RTMP_ENABLE_FAST_JOIN        1 (default) sends fresh opens of one configured
 #                                master link directly to its startup rendition.
 #                                Existing rendition sessions are unaffected.
@@ -93,12 +92,14 @@ RESOURCE_SIZING_MBIT="${RTMP_RESOURCE_SIZING_MBIT:-0.50}"
 LINK_UTILIZATION_PERCENT="${RTMP_LINK_UTILIZATION_PERCENT:-90}"
 PROTOCOL_OVERHEAD_PERCENT="${RTMP_PROTOCOL_OVERHEAD_PERCENT:-5}"
 MAX_CONNECTIONS_PER_IP="${RTMP_MAX_CONNECTIONS_PER_IP:-1000}"
-ENABLE_FAIR_QUEUE="${RTMP_ENABLE_FAIR_QUEUE:-0}"
+ENABLE_FAIR_QUEUE="${RTMP_ENABLE_FAIR_QUEUE:-1}"
 CONFIGURE_FIREWALL="${RTMP_CONFIGURE_FIREWALL:-1}"
 CONFIGURE_DNS="${RTMP_CONFIGURE_DNS:-1}"
 FORCE_ROTATE="${RTMP_FORCE_ROTATE_SECRETS:-0}"
 FRESH_INSTALL="${RTMP_FRESH_INSTALL:-1}"
-ENABLE_TRANSCODING="${RTMP_ENABLE_TRANSCODING:-1}"
+# The external-process transcoder is intentionally unavailable in production.
+# Source-transcode jobs use RTMP_NATIVE_TRANSCODE and never invoke FFmpeg.
+ENABLE_TRANSCODING=0
 TRANSCODING_RULES="${RTMP_TRANSCODING_RULES:-}"
 ENABLE_FAST_JOIN="${RTMP_ENABLE_FAST_JOIN:-1}"
 FAST_JOIN_APPLICATION="${RTMP_FAST_JOIN_APPLICATION:-kk}"
@@ -134,7 +135,9 @@ fi
 [[ "${CONFIGURE_DNS}" =~ ^[01]$ ]] || die "RTMP_CONFIGURE_DNS must be 0 or 1."
 [[ "${FORCE_ROTATE}" =~ ^[01]$ ]] || die "RTMP_FORCE_ROTATE_SECRETS must be 0 or 1."
 [[ "${FRESH_INSTALL}" =~ ^[01]$ ]] || die "RTMP_FRESH_INSTALL must be 0 or 1."
-[[ "${ENABLE_TRANSCODING}" =~ ^[01]$ ]] || die "RTMP_ENABLE_TRANSCODING must be 0 or 1."
+if [[ "${RTMP_ENABLE_TRANSCODING:-0}" != "0" ]]; then
+  die "RTMP_ENABLE_TRANSCODING is not supported: production source transcoding is FFmpeg-free and native."
+fi
 [[ "${ENABLE_FAST_JOIN}" =~ ^[01]$ ]] || die "RTMP_ENABLE_FAST_JOIN must be 0 or 1."
 if [[ "${ENABLE_FAST_JOIN}" == "1" ]]; then
   for fast_join_value in "${FAST_JOIN_APPLICATION}" "${FAST_JOIN_STREAM}" "${FAST_JOIN_RENDITION}"; do
@@ -175,6 +178,7 @@ remove_managed_path() {
     /usr/local/sbin/rtmp-network-tune | \
     /root/streamforge-credentials.txt | \
     /etc/caddy/Caddyfile | \
+    /etc/systemd/system/caddy.service.d/streamforge.conf | \
     /etc/varnish/streamforge.vcl | \
     /etc/systemd/system/varnish.service.d | \
     /usr/local/bin/rtmp-server*)
@@ -285,6 +289,7 @@ clean_previous_install() {
     /etc/logrotate.d/rtmp-server \
     /usr/local/sbin/rtmp-network-tune \
     /root/streamforge-credentials.txt \
+    /etc/systemd/system/caddy.service.d/streamforge.conf \
     "${SOURCE_DIR}/build" \
     "${SOURCE_DIR}/admin/node_modules" \
     "${SOURCE_DIR}/admin/dist"; do
@@ -342,7 +347,7 @@ apt-get update
 apt-get install -y --no-install-recommends "${APT_REINSTALL_ARGS[@]}" \
   build-essential cmake ninja-build pkg-config git ca-certificates curl gnupg \
   liburing-dev liburing2 libssl-dev libsqlite3-dev libsqlite3-0 sqlite3 \
-  ffmpeg iproute2 ethtool kmod varnish
+  iproute2 ethtool kmod varnish
 
 # The distribution's default "clang" meta-package tracks whatever major
 # version that release shipped with — fine on 24.04 (clang-18) but not
@@ -383,14 +388,14 @@ log "Using ${CLANG_BIN} (clang ${DETECTED_CLANG_MAJOR})"
 # In-process FFmpeg-free transcoding pipeline + source-transcode jobs
 # (docs/native-transcoding.md): openh264 (H.264 decode), x265 (HEVC encode),
 # x264 (H.264 encode), libfdk-aac (AAC), libyuv (scale), libcurl (HLS source
-# pull). Installed by default so every feature works out of the box; set
-# RTMP_ENABLE_NATIVE_TRANSCODE=0 to build the leaner FFmpeg-supervisor-only
-# origin instead.
-NATIVE_TRANSCODE="${RTMP_ENABLE_NATIVE_TRANSCODE:-1}"
-if [[ "${NATIVE_TRANSCODE}" == "1" ]]; then
-  apt-get install -y --no-install-recommends "${APT_REINSTALL_ARGS[@]}" \
-    libx265-dev libx264-dev libopenh264-dev libfdk-aac-dev libcurl4-openssl-dev libyuv-dev
+# pull). It is mandatory in the production installer: there is deliberately no
+# FFmpeg fallback.
+NATIVE_TRANSCODE=1
+if [[ "${RTMP_ENABLE_NATIVE_TRANSCODE:-1}" != "1" ]]; then
+  die "RTMP_ENABLE_NATIVE_TRANSCODE=0 is unsupported: no FFmpeg fallback is installed."
 fi
+apt-get install -y --no-install-recommends "${APT_REINSTALL_ARGS[@]}" \
+  libx265-dev libx264-dev libopenh264-dev libfdk-aac-dev libcurl4-openssl-dev libyuv-dev
 
 if ! apt-cache show caddy >/dev/null 2>&1; then
   if [[ "${ID}" == "ubuntu" ]]; then
@@ -631,9 +636,8 @@ RTMP_SERVER_PROVIDED_BUFFER_COUNT=${PROVIDED_BUFFER_COUNT}
 RTMP_SERVER_PROVIDED_BUFFER_SIZE=16384
 RTMP_SERVER_DATABASE_TYPE=sqlite
 RTMP_SERVER_DATABASE_CONNECTION=/var/lib/rtmp-server/rtmp.db
-RTMP_SERVER_TRANSCODING_ENABLED=$(if [[ "${ENABLE_TRANSCODING}" == "1" ]]; then printf true; else printf false; fi)
+RTMP_SERVER_TRANSCODING_ENABLED=false
 RTMP_SERVER_TRANSCODING_PRESET_FILE=/etc/rtmp-server/transcoding.conf
-RTMP_SERVER_TRANSCODING_FFMPEG_PATH=/usr/bin/ffmpeg
 RTMP_SERVER_TRANSCODING_MAX_ACTIVE_JOBS=16
 RTMP_SERVER_TRANSCODING_MAX_OUTPUTS_PER_JOB=16
 RTMP_SERVER_TRANSCODING_MAX_RESTART_ATTEMPTS=5
@@ -779,7 +783,10 @@ fi
 log "Configuring NIC ${PRIMARY_INTERFACE}"
 ethtool -K "${PRIMARY_INTERFACE}" gro on gso on tso on >/dev/null 2>&1 || true
 if [[ "${ENABLE_FAIR_QUEUE}" == "1" ]]; then
-  SHAPE_MBIT=$((BANDWIDTH_MBIT * 95 / 100))
+  # Keeping the queue on this VPS instead of the provider's opaque policer is
+  # what lets a new viewer's playlist/first segment compete fairly with the
+  # already-active segment flows. The unused percentage is join/burst reserve.
+  SHAPE_MBIT=$((BANDWIDTH_MBIT * LINK_UTILIZATION_PERCENT / 100))
   cat > /etc/default/rtmp-network <<EOF
 RTMP_INTERFACE=${PRIMARY_INTERFACE}
 RTMP_SHAPE_MBIT=${SHAPE_MBIT}
@@ -812,10 +819,13 @@ if (( RTMP_SHAPE_MBIT <= 10000 )) && modprobe sch_cake 2>/dev/null; then
   tc qdisc replace dev "${RTMP_INTERFACE}" root cake bandwidth "${RTMP_SHAPE_MBIT}Mbit" \
     besteffort dual-dsthost nat nowash
 else
-  # CAKE becomes CPU-expensive at 10G+ line rates. Linux fq preserves
-  # per-flow pacing/fairness with materially less CPU overhead.
-  tc qdisc replace dev "${RTMP_INTERFACE}" root fq limit 100000 flow_limit 1000 buckets 65536 ||
-    tc qdisc replace dev "${RTMP_INTERFACE}" root fq
+  # CAKE becomes CPU-expensive at 10G+ line rates. HTB provides the required
+  # join headroom while fq fairly schedules the individual HTTP flows.
+  tc qdisc replace dev "${RTMP_INTERFACE}" root handle 1: htb default 10
+  tc class replace dev "${RTMP_INTERFACE}" parent 1: classid 1:10 htb \
+    rate "${RTMP_SHAPE_MBIT}Mbit" ceil "${RTMP_SHAPE_MBIT}Mbit" burst 16m cburst 16m
+  tc qdisc replace dev "${RTMP_INTERFACE}" parent 1:10 handle 10: \
+    fq limit 100000 flow_limit 1000 buckets 65536
 fi
 EOF
   chmod 0755 /usr/local/sbin/rtmp-network-tune
@@ -844,32 +854,32 @@ else
   fi
 fi
 
-log "Bounding system logs and disabling the redundant Varnish access-log file"
-# viewer-estimator.service starts its own varnishncsa reader and consumes its
-# stdout in memory. The distro varnishncsa.service writes every segment request
-# to disk as well; at high viewer counts that duplicate log can fill a small
-# root filesystem in under one rotation interval.
+log "Bounding system logs and disabling per-request Varnish log consumers"
+# At very high viewer counts, reading or persisting every segment request burns
+# CPU and I/O without helping delivery. Cache/origin aggregate counters remain
+# available without putting a process on the request log hot path.
 systemctl disable --now varnishncsa.service >/dev/null 2>&1 || true
+systemctl disable --now viewer-estimator.service >/dev/null 2>&1 || true
 install -d -m 0755 /etc/systemd/journald.conf.d
 install -m 0644 "${SOURCE_DIR}/deploy/systemd/streamforge-journald.conf" \
   /etc/systemd/journald.conf.d/streamforge.conf
 systemctl restart systemd-journald.service
 
-log "Configuring Varnish HLS segment cache"
+log "Configuring Varnish shared HLS cache"
 # Varnish sits between Caddy and the origin (127.0.0.1:8080) for /hls/*
-# traffic only, caching immutable .ts segments in RAM so repeat viewer
-# requests never reach the origin process. Each player has unique viewer
-# query metadata; vcl_hash deliberately excludes only that metadata from a
-# segment's cache key, retaining shared segment bytes across all sessions.
-# Caddy sends viewer-specific playlists straight to the origin. The VCL still
-# treats a direct loopback .m3u8 request conservatively, but normal public
-# traffic uses Varnish only for shared immutable segments.
+# traffic only. Public playlists are micro-cached and immutable .ts segments
+# are cached in RAM, so viewer count does not multiply origin work. Query
+# strings are normalized by the public high-scale VCL to prevent cache-key
+# fragmentation.
 # Bound to loopback only: never exposed directly to the internet.
 MEM_TOTAL_KB="$(awk '/^MemTotal:/ { print $2 }' /proc/meminfo)"
 [[ "${MEM_TOTAL_KB}" =~ ^[0-9]+$ ]] || die "Could not determine total system memory."
-VARNISH_CACHE_MB=$(( MEM_TOTAL_KB / 1024 / 4 ))
-if (( VARNISH_CACHE_MB < 256 )); then VARNISH_CACHE_MB=256; fi
-if (( VARNISH_CACHE_MB > 4096 )); then VARNISH_CACHE_MB=4096; fi
+VARNISH_CACHE_MB=$(( MEM_TOTAL_KB / 1024 / 5 ))
+if (( VARNISH_CACHE_MB < 128 )); then VARNISH_CACHE_MB=128; fi
+if (( VARNISH_CACHE_MB > 16384 )); then VARNISH_CACHE_MB=16384; fi
+VARNISH_THREAD_POOLS=$(( (WORKERS + 3) / 4 ))
+if (( VARNISH_THREAD_POOLS < 2 )); then VARNISH_THREAD_POOLS=2; fi
+if (( VARNISH_THREAD_POOLS > 8 )); then VARNISH_THREAD_POOLS=8; fi
 
 install -m 0644 "${SOURCE_DIR}/deploy/varnish/streamforge.vcl" /etc/varnish/streamforge.vcl
 
@@ -877,7 +887,14 @@ install -d -m 0755 /etc/systemd/system/varnish.service.d
 cat > /etc/systemd/system/varnish.service.d/streamforge.conf <<EOF
 [Service]
 ExecStart=
-ExecStart=/usr/sbin/varnishd -j unix,user=vcache -F -a 127.0.0.1:6081 -T localhost:6082 -f /etc/varnish/streamforge.vcl -S /etc/varnish/secret -s malloc,${VARNISH_CACHE_MB}m
+ExecStart=/usr/sbin/varnishd -j unix,user=vcache -F -a 127.0.0.1:6081 -T localhost:6082 -f /etc/varnish/streamforge.vcl -S /etc/varnish/secret -s malloc,${VARNISH_CACHE_MB}m -p thread_pools=${VARNISH_THREAD_POOLS} -p thread_pool_min=100 -p thread_pool_max=2500 -p thread_queue_limit=100000 -p listen_depth=65535
+LimitNOFILE=${NOFILE}
+EOF
+
+install -d -m 0755 /etc/systemd/system/caddy.service.d
+cat > /etc/systemd/system/caddy.service.d/streamforge.conf <<EOF
+[Service]
+LimitNOFILE=${NOFILE}
 EOF
 
 log "Configuring Caddy admin endpoint"
@@ -891,14 +908,9 @@ if [[ "${ENABLE_FAST_JOIN}" == "1" ]]; then
   FAST_JOIN_CADDY_BLOCK="$(cat <<EOF
     @fast_join path /hls/${FAST_JOIN_APPLICATION}/${FAST_JOIN_STREAM}/master.m3u8
     handle @fast_join {
-        # Preserve a supplied viewer_session/token query when a player retries
-        # the stable link, but start a fresh player on the smaller rendition.
+        # Start a fresh player on the smaller shared-cache rendition.
         uri replace /hls/${FAST_JOIN_APPLICATION}/${FAST_JOIN_STREAM}/master.m3u8 /hls/${FAST_JOIN_APPLICATION}/${FAST_JOIN_RENDITION}/index.m3u8
-        reverse_proxy 127.0.0.1:8080 {
-            # The rendition origin creates the session; keep accounting and
-            # recovery attached to the public/base stream name.
-            header_down Location "viewer_stream=${FAST_JOIN_RENDITION}" "viewer_stream=${FAST_JOIN_STREAM}"
-        }
+        reverse_proxy 127.0.0.1:6081
     }
 
 EOF
@@ -907,7 +919,9 @@ fi
 cat > /etc/caddy/Caddyfile <<EOF
 # Managed by StreamForge install-linux.sh
 ${CADDY_SITE} {
-    encode zstd gzip
+    # Avoid per-request compression CPU on the high-volume media path.
+    @compressible not path /hls/*
+    encode @compressible zstd gzip
 
     @control path /api/*
     handle @control {
@@ -915,22 +929,8 @@ ${CADDY_SITE} {
         reverse_proxy 127.0.0.1:8080
     }
 
-    @viewer_estimate path /internal/viewer_estimate.json
-    handle @viewer_estimate {
-        root * /var/lib/rtmp-server
-        rewrite * /viewer_estimate.json
-        file_server
-    }
-
 ${FAST_JOIN_CADDY_BLOCK}
-    # Playlists carry viewer-specific session metadata and are never shared
-    # cache objects. Bypass Varnish workers for .m3u8 while keeping immutable
-    # .ts segments cached and visible to the playback-session estimator.
-    @hls_playlist path_regexp hls_playlist \.m3u8$
-    handle @hls_playlist {
-        reverse_proxy 127.0.0.1:8080
-    }
-
+    # Both playlists and segments use the local shared cache.
     @hls path /hls/*
     handle @hls {
         reverse_proxy 127.0.0.1:6081
@@ -998,12 +998,6 @@ for _ in $(seq 1 15); do
 done
 [[ "${VARNISH_READY}" == "1" ]] || die "Varnish did not start; check 'journalctl -u varnish.service'."
 
-log "Installing playback-session viewer counter (includes Varnish cache hits)"
-install -m 0755 "${SOURCE_DIR}/deploy/viewer-estimator/viewer_estimator.py" /usr/local/bin/viewer_estimator.py
-install -m 0644 "${SOURCE_DIR}/deploy/viewer-estimator/viewer-estimator.service" /etc/systemd/system/viewer-estimator.service
-systemctl daemon-reload
-systemctl enable --now viewer-estimator.service >/dev/null
-
 systemctl enable --now caddy.service >/dev/null
 systemctl restart caddy.service
 
@@ -1035,7 +1029,7 @@ printf '  Install mode:     %s\n' "$(if [[ "${FRESH_INSTALL}" == "1" ]]; then pr
 printf '  Network device:   %s\n' "${PRIMARY_INTERFACE}"
 printf '  Link bandwidth:   %s Mbps — %s\n' "${BANDWIDTH_MBIT}" "${BANDWIDTH_SOURCE}"
 printf '  Media workers:    %s\n' "${WORKERS}"
-printf '  HLS segment cache: Varnish, %s MB RAM, 127.0.0.1:6081 (.ts cached 1h; playlists use origin)\n' "${VARNISH_CACHE_MB}"
+printf '  HLS shared cache:  Varnish, %s MB RAM, 127.0.0.1:6081 (.ts 1h; media playlists 1s; masters 30s)\n' "${VARNISH_CACHE_MB}"
 if [[ "${ENABLE_FAST_JOIN}" == "1" ]]; then
   printf '  Fast join:         /hls/%s/%s/master.m3u8 -> %s\n' \
     "${FAST_JOIN_APPLICATION}" "${FAST_JOIN_STREAM}" "${FAST_JOIN_RENDITION}"
@@ -1052,12 +1046,12 @@ else
 fi
 if [[ "${ENABLE_FAIR_QUEUE}" == "1" ]]; then
   if (( SHAPE_MBIT <= 10000 )); then
-    printf '  Fair queue:       CAKE at %s Mbps\n' "${SHAPE_MBIT}"
+    printf '  Join reserve:     CAKE fair queue at %s Mbps (%s%% of link)\n' "${SHAPE_MBIT}" "${LINK_UTILIZATION_PERCENT}"
   else
-    printf '  Fair queue:       high-throughput fq pacing (CAKE bypassed above 10 Gbps)\n'
+    printf '  Join reserve:     HTB + fq at %s Mbps (%s%% of link)\n' "${SHAPE_MBIT}" "${LINK_UTILIZATION_PERCENT}"
   fi
 else
-  printf '  Fair queue:       disabled (unshaped egress; opt in with RTMP_ENABLE_FAIR_QUEUE=1)\n'
+  printf '  Join reserve:     disabled by RTMP_ENABLE_FAIR_QUEUE=0\n'
 fi
 if [[ "${CONFIGURE_DNS}" == "1" ]]; then
   printf '  Fallback DNS:     1.1.1.1, 8.8.8.8, 9.9.9.9 (via systemd-resolved)\n'

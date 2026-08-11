@@ -7,9 +7,12 @@
 #include <mutex>
 #include <thread>
 
+#include "rtmp_server/media/aac/adts.hpp"
+#include "rtmp_server/media/h264/avc.hpp"
 #include "rtmp_server/observability/logger.hpp"
 #include "rtmp_server/transcoding/native/hls_playlist.hpp"
 #include "rtmp_server/transcoding/native/paced_segment_publisher.hpp"
+#include "rtmp_server/transcoding/native/rtmp_source_client.hpp"
 
 namespace rtmp_server::transcoding::native {
 
@@ -29,6 +32,26 @@ bool looks_like_raw_ts(std::span<const std::byte> data) {
 constexpr auto kInputProgressTimeout = std::chrono::seconds(45);
 constexpr auto kOutputStartupTimeout = std::chrono::seconds(90);
 constexpr auto kOutputProgressTimeout = std::chrono::seconds(45);
+
+bool is_rtmp_source(std::string_view url) { return url.starts_with("rtmp://"); }
+
+// Expands RTMP's wrapping 32-bit millisecond clock into a monotonic 64-bit
+// timeline. A small backwards jump is treated as broken/discontinuous input,
+// while the characteristic large jump across UINT32_MAX is a real wrap.
+class RtmpTimestampUnwrapper {
+public:
+    std::uint64_t unwrap(std::uint32_t value) {
+        if (last_ && value < *last_ && static_cast<std::uint32_t>(*last_ - value) > 0x80000000u) {
+            epoch_ += (std::uint64_t{1} << 32);
+        }
+        last_ = value;
+        return epoch_ + value;
+    }
+
+private:
+    std::optional<std::uint32_t> last_;
+    std::uint64_t epoch_ = 0;
+};
 } // namespace
 
 HlsSourcePuller::HlsSourcePuller(std::string source_url, std::vector<PullerRendition> renditions,
@@ -87,6 +110,10 @@ bool HlsSourcePuller::resolve_source(HttpClient& http, std::string& media_url_ou
         return false;
     }
     const std::string_view text(reinterpret_cast<const char*>(body.data()), body.size());
+    if (!is_hls_playlist(text)) {
+        detail_out = "HTTP source is neither an HLS playlist nor an MPEG-TS stream";
+        return false;
+    }
     raw_ts_out = false;
     if (!is_master_playlist(text)) {
         // The playlist may have redirected to a different CDN host. Its
@@ -111,7 +138,8 @@ void HlsSourcePuller::run() {
     std::string detail;
     std::string media_url;
     bool raw_ts = false;
-    if (!resolve_source(http, media_url, raw_ts, detail)) {
+    const bool rtmp_source = is_rtmp_source(source_url_);
+    if (!rtmp_source && !resolve_source(http, media_url, raw_ts, detail)) {
         set_detail(detail.empty() ? "could not resolve source" : detail);
         status_.store(PullerStatus::Error);
         running_.store(false);
@@ -197,17 +225,26 @@ void HlsSourcePuller::run() {
     }
 
     media::ts::TsDemuxer demux;
+    std::optional<core::Error> pipeline_error;
     demux.set_video_handler([&](std::span<const std::byte> annexb, std::uint64_t pts,
                                 std::uint64_t dts, bool keyframe) {
-        static_cast<void>(transcoder.on_video(annexb, static_cast<std::int64_t>(pts),
-                                              static_cast<std::int64_t>(dts), keyframe));
+        if (pipeline_error) return;
+        auto result = transcoder.on_video(annexb, static_cast<std::int64_t>(pts),
+                                          static_cast<std::int64_t>(dts), keyframe);
+        if (!result) pipeline_error = result.error();
     });
     demux.set_audio_handler([&](std::span<const std::byte> adts, std::uint64_t pts) {
-        static_cast<void>(transcoder.on_audio(adts, static_cast<std::int64_t>(pts)));
+        if (pipeline_error) return;
+        auto result = transcoder.on_audio(adts, static_cast<std::int64_t>(pts));
+        if (!result) pipeline_error = result.error();
     });
 
-    status_.store(PullerStatus::Running);
-    set_detail("running");
+    if (!rtmp_source) {
+        status_.store(PullerStatus::Running);
+        set_detail("running");
+    } else {
+        set_detail("connecting to RTMP source");
+    }
 
     // A successful playlist request only proves that the control plane is
     // alive. The source can keep returning the same window forever, or the
@@ -279,6 +316,105 @@ void HlsSourcePuller::run() {
     std::condition_variable sleep_cv;
     int consecutive_errors = 0;
 
+    if (rtmp_source) {
+        media::h264::AvcDecoderConfig video_config;
+        std::optional<media::aac::AudioSpecificConfig> audio_config;
+        RtmpTimestampUnwrapper video_clock;
+        RtmpTimestampUnwrapper audio_clock;
+        RtmpSourceClient client(source_url_);
+
+        auto result = client.run(
+            [this] { return running_.load(); },
+            [&](const protocol::chunk::RtmpMessage& message) -> core::Result<void> {
+                using protocol::chunk::MessageTypeId;
+                const auto type = static_cast<MessageTypeId>(message.message_type_id);
+                if (type == MessageTypeId::Video) {
+                    auto tag = media::h264::parse_video_tag(message.payload);
+                    if (!tag) return tag.error();
+                    if (tag.value().avc_packet_type == media::h264::kAvcPacketTypeSequenceHeader) {
+                        auto config = media::h264::parse_decoder_config(tag.value().body);
+                        if (!config) return config.error();
+                        video_config = std::move(config).value();
+                        return {};
+                    }
+                    if (tag.value().avc_packet_type == media::h264::kAvcPacketTypeEndOfSequence) {
+                        return {};
+                    }
+                    if (tag.value().avc_packet_type != media::h264::kAvcPacketTypeNalu) {
+                        return core::Error(core::ErrorCode::MalformedChunk,
+                                           core::ErrorCategory::Protocol,
+                                           "unsupported RTMP AVC packet type");
+                    }
+                    if (!video_config.valid()) {
+                        return core::Error(core::ErrorCode::InvalidStateTransition,
+                                           core::ErrorCategory::Protocol,
+                                           "RTMP video frame arrived before its AVC sequence header");
+                    }
+                    std::vector<std::byte> annexb;
+                    auto converted = media::h264::avcc_to_annexb(
+                        tag.value().body, video_config, tag.value().is_keyframe, annexb);
+                    if (!converted) return converted.error();
+                    const std::uint64_t dts_ms = video_clock.unwrap(message.timestamp);
+                    const std::int64_t dts_90k = static_cast<std::int64_t>(dts_ms * 90);
+                    const std::int64_t pts_90k =
+                        dts_90k + static_cast<std::int64_t>(tag.value().composition_time_ms) * 90;
+                    auto transcoded =
+                        transcoder.on_video(annexb, pts_90k, dts_90k, tag.value().is_keyframe);
+                    if (!transcoded) return transcoded.error();
+                    note_input_progress();
+                } else if (type == MessageTypeId::Audio) {
+                    auto tag = media::aac::parse_audio_tag(message.payload);
+                    if (!tag) return tag.error();
+                    if (tag.value().aac_packet_type == media::aac::kAacPacketTypeSequenceHeader) {
+                        auto config = media::aac::parse_audio_specific_config(tag.value().body);
+                        if (!config) return config.error();
+                        audio_config = std::move(config).value();
+                        return {};
+                    }
+                    if (tag.value().aac_packet_type != media::aac::kAacPacketTypeRaw) {
+                        return core::Error(core::ErrorCode::MalformedChunk,
+                                           core::ErrorCategory::Protocol,
+                                           "unsupported RTMP AAC packet type");
+                    }
+                    if (!audio_config) {
+                        return core::Error(core::ErrorCode::InvalidStateTransition,
+                                           core::ErrorCategory::Protocol,
+                                           "RTMP audio frame arrived before its AAC sequence header");
+                    }
+                    std::vector<std::byte> adts;
+                    adts.reserve(media::aac::kAdtsHeaderSize + tag.value().body.size());
+                    media::aac::append_adts_header(adts, *audio_config, tag.value().body.size());
+                    adts.insert(adts.end(), tag.value().body.begin(), tag.value().body.end());
+                    const auto pts_90k = static_cast<std::int64_t>(audio_clock.unwrap(message.timestamp) * 90);
+                    auto transcoded = transcoder.on_audio(adts, pts_90k);
+                    if (!transcoded) return transcoded.error();
+                    note_input_progress();
+                }
+                if (detect_stall()) {
+                    return core::Error(core::ErrorCode::ConnectionTimedOut,
+                                       core::ErrorCategory::Network, this->detail());
+                }
+                return {};
+            },
+            [this] {
+                status_.store(PullerStatus::Running);
+                set_detail("running (native RTMP pull)");
+            });
+
+        if (!running_.load()) {
+            // Operator-requested stop is clean; never turn it into an
+            // auto-restartable source error.
+            status_.store(PullerStatus::Stopped);
+        } else if (!result) {
+            set_detail(result.error().message());
+            status_.store(PullerStatus::Error);
+        }
+        finish_pipeline();
+        if (status_.load() == PullerStatus::Running) status_.store(PullerStatus::Stopped);
+        running_.store(false);
+        return;
+    }
+
     if (raw_ts) {
         // No playlist, no discrete segments: one open GET streams TS packets
         // indefinitely. Feed the demuxer as chunks arrive and reconnect (with
@@ -292,7 +428,13 @@ void HlsSourcePuller::run() {
                     received_any = true;
                     note_input_progress();
                     set_detail("running");
-                    static_cast<void>(demux.feed(chunk));
+                    auto demuxed = demux.feed(chunk);
+                    if (!demuxed) pipeline_error = demuxed.error();
+                    if (pipeline_error) {
+                        set_detail(pipeline_error->message());
+                        status_.store(PullerStatus::Error);
+                        return false;
+                    }
                     return !detect_stall();
                 });
             if (!running_.load()) break;
@@ -352,10 +494,20 @@ void HlsSourcePuller::run() {
         consecutive_errors = 0;
         const std::string_view text(reinterpret_cast<const char*>(playlist_bytes.data()),
                                     playlist_bytes.size());
+        if (!is_hls_playlist(text)) {
+            set_detail("HLS endpoint stopped returning a valid #EXTM3U playlist");
+            status_.store(PullerStatus::Error);
+            break;
+        }
         // A media-playlist endpoint can itself redirect on every refresh and
         // change hosts/tokens. Resolve each advertised segment against the
         // URL that produced this exact playlist body.
         const auto playlist = parse_media_playlist(text, effective_media_url);
+        if (!playlist.unsupported_feature.empty()) {
+            set_detail(playlist.unsupported_feature);
+            status_.store(PullerStatus::Error);
+            break;
+        }
 
         // Collect every not-yet-pulled segment from this playlist window
         // first, then fetch them all concurrently (one HttpClient per fetch —
@@ -414,10 +566,18 @@ void HlsSourcePuller::run() {
                 transcoder.mark_discontinuity();
                 pending_fetch_gap = false;
             }
-            static_cast<void>(demux.feed(result.value()));
+            auto demuxed = demux.feed(result.value());
+            if (!demuxed) pipeline_error = demuxed.error();
             demux.flush(); // each TS segment is a self-contained unit
+            if (pipeline_error) {
+                set_detail(pipeline_error->message());
+                status_.store(PullerStatus::Error);
+                break;
+            }
             note_input_progress();
         }
+
+        if (status_.load() == PullerStatus::Error) break;
 
         if (detect_stall()) break;
 
