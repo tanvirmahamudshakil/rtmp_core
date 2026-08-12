@@ -153,6 +153,11 @@ void SourceJobManager::start_locked(Job& job) {
             store_config.live_window_segments = window_segments;
             store_config.retention_grace_segments = window_segments;
             store_config.target_duration_seconds = segment_seconds;
+            // Playlist requests keep receiving a loop of the last complete
+            // segment while the upstream source or puller is recovering.
+            // This preserves the same HLS URL and viewer session instead of
+            // letting the playlist stall until players disconnect.
+            store_config.repeat_last_segment_on_stall = true;
             store = std::make_shared<hls::SegmentStore>(store_config);
             job.stores.push_back(store);
             job.output_streams.push_back(spec.output_stream);

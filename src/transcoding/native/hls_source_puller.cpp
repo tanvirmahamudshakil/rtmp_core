@@ -258,7 +258,7 @@ void HlsSourcePuller::run() {
     bool published_output = false;
     std::uint64_t published_segment_count = 0;
     for (const auto& rendition : renditions_) {
-        published_segment_count += rendition.store->stats().segments_added;
+        published_segment_count += rendition.store->stats().real_segments_added;
     }
     published_output = published_segment_count > 0;
 
@@ -270,7 +270,7 @@ void HlsSourcePuller::run() {
         const auto now = std::chrono::steady_clock::now();
         std::uint64_t current_output_count = 0;
         for (const auto& rendition : renditions_) {
-            current_output_count += rendition.store->stats().segments_added;
+            current_output_count += rendition.store->stats().real_segments_added;
         }
         if (current_output_count != published_segment_count) {
             published_segment_count = current_output_count;
@@ -467,15 +467,14 @@ void HlsSourcePuller::run() {
         return;
     }
 
-    std::unordered_set<std::uint64_t> seen; // segment sequence numbers already pulled
-    // Some upstream IPTV/CDN panels list a segment in the playlist slightly
-    // before (or after) it's actually available, so a fetch can 404 even
-    // though we just saw it advertised. That segment's media is simply gone
-    // -- skipping it is correct -- but without flagging it, the next segment
-    // we do land splices onto the previous one with a PTS gap the player was
-    // never told about, which reads as a much worse stall/seek than a
-    // properly marked discontinuity would.
-    bool pending_fetch_gap = false;
+    // A sequence is "seen" only after its bytes have been fetched and fed to
+    // the demuxer. Some IPTV origins advertise the live edge several seconds
+    // before the corresponding object becomes readable and return a transient
+    // 404 in that window. Marking the sequence before the fetch permanently
+    // skipped it on every later poll, starving the output whenever this
+    // happened repeatedly.
+    std::unordered_set<std::uint64_t> seen;
+    std::optional<std::uint64_t> last_ingested_sequence;
 
     while (running_.load()) {
         std::vector<std::byte> playlist_bytes;
@@ -523,7 +522,6 @@ void HlsSourcePuller::run() {
         std::vector<const decltype(playlist.segments)::value_type*> pending;
         for (const auto& segment : playlist.segments) {
             if (seen.contains(segment.sequence)) continue;
-            seen.insert(segment.sequence);
             pending.push_back(&segment);
         }
 
@@ -547,6 +545,12 @@ void HlsSourcePuller::run() {
             }));
         }
 
+        // Preserve playlist order even though downloads run concurrently. If
+        // one segment is not available yet, leave it and every later segment
+        // unseen so the next playlist poll retries a contiguous suffix. Feeding
+        // a later successful download first and then retrying an older one
+        // would move the demuxer timeline backwards.
+        bool retry_contiguous_suffix = false;
         for (std::size_t i = 0; i < pending.size(); ++i) {
             if (!running_.load()) break;
             const auto* segment = pending[i];
@@ -554,17 +558,21 @@ void HlsSourcePuller::run() {
             if (!result) {
                 RTMP_LOG(LogLevel::Warn, "source-transcoder", "segment fetch failed",
                          {{"url", segment->uri}, {"error", result.error().message()}});
-                pending_fetch_gap = true;
+                retry_contiguous_suffix = true;
                 continue;
             }
-            if (segment->discontinuity || pending_fetch_gap) {
+            if (retry_contiguous_suffix) continue;
+
+            const bool sequence_gap =
+                last_ingested_sequence &&
+                segment->sequence != *last_ingested_sequence + 1;
+            if (segment->discontinuity || sequence_gap) {
                 for (auto& feed : feeds) feed->mark_discontinuity();
                 // Also reset the transcoder's own video clock gate -- see
                 // SourceTranscoder::mark_discontinuity()'s comment for why
                 // skipping this left video frozen (while audio kept
                 // playing) after exactly this kind of gap.
                 transcoder.mark_discontinuity();
-                pending_fetch_gap = false;
             }
             auto demuxed = demux.feed(result.value());
             if (!demuxed) pipeline_error = demuxed.error();
@@ -574,6 +582,8 @@ void HlsSourcePuller::run() {
                 status_.store(PullerStatus::Error);
                 break;
             }
+            seen.insert(segment->sequence);
+            last_ingested_sequence = segment->sequence;
             note_input_progress();
         }
 

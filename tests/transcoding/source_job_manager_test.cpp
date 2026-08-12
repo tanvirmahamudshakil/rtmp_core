@@ -73,6 +73,7 @@ TEST(SourceJobManagerTest, ManualRestartPreservesRegisteredStoreAndSequence) {
     ASSERT_TRUE(manager.create(config).ok());
     ASSERT_NE(registered_store, nullptr);
     ASSERT_EQ(registrations, 1u);
+    EXPECT_TRUE(registered_store->config().repeat_last_segment_on_stall);
     registered_store->add_segment(make_segment(17));
 
     ASSERT_TRUE(manager.restart("live", "demo").ok());

@@ -1,19 +1,94 @@
 #include "rtmp_server/hls/segment_store.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <utility>
 
 namespace rtmp_server::hls {
 
+namespace {
+
+std::string name_with_sequence(const Segment& source, std::uint64_t sequence) {
+    const auto old_sequence = std::to_string(source.sequence);
+    const auto position = source.name.rfind(old_sequence);
+    if (position != std::string::npos) {
+        auto name = source.name;
+        name.replace(position, old_sequence.size(), std::to_string(sequence));
+        return name;
+    }
+    return "segment-" + std::to_string(sequence) + ".ts";
+}
+
+SegmentPtr copy_with_sequence(const Segment& source, std::uint64_t sequence,
+                              bool force_discontinuity) {
+    auto copy = std::make_shared<Segment>();
+    copy->sequence = sequence;
+    copy->name = name_with_sequence(source, sequence);
+    copy->data = source.data;
+    copy->duration = source.duration;
+    copy->discontinuity = source.discontinuity || force_discontinuity;
+    return copy;
+}
+
+} // namespace
+
 void SegmentStore::add_segment(SegmentPtr segment) {
     if (!segment) return;
     std::lock_guard lock(mutex_);
+
+    // A source may have assigned sequence numbers before a fallback segment
+    // was inserted. Re-number it at the store boundary so playlist URLs stay
+    // strictly monotonic and can never collide in a browser or CDN cache.
+    if (config_.repeat_last_segment_on_stall && !segments_.empty()) {
+        const auto next = segments_.back()->sequence + 1;
+        if (segment->sequence != next || fallback_active_) {
+            segment = copy_with_sequence(*segment, next, fallback_active_);
+        }
+    }
+
+    append_locked(std::move(segment), /*fallback=*/false);
+}
+
+void SegmentStore::append_locked(SegmentPtr segment, bool fallback) {
     bytes_held_ += segment->size_bytes();
     by_name_.emplace(segment->name, segment);
     segments_.push_back(std::move(segment));
     stats_.segments_added += 1;
+    if (fallback) {
+        stats_.fallback_segments_added += 1;
+    } else {
+        stats_.real_segments_added += 1;
+    }
+    fallback_active_ = fallback;
+    last_segment_added_at_ = std::chrono::steady_clock::now();
     evict_locked();
     stats_.bytes_held = bytes_held_;
+}
+
+void SegmentStore::append_fallback_if_due_locked() {
+    if (!config_.repeat_last_segment_on_stall || ended_ || segments_.empty() ||
+        !last_segment_added_at_) {
+        return;
+    }
+
+    auto interval = segments_.back()->duration;
+    if (interval <= std::chrono::milliseconds::zero()) {
+        interval =
+            std::chrono::seconds(std::max<std::uint32_t>(1, config_.target_duration_seconds));
+    }
+    // Allow a healthy publisher a small scheduling/network margin before
+    // declaring the first stall. Once fallback is active, continue exactly
+    // at the segment cadence so the player's buffer does not drain.
+    const auto initial_grace =
+        fallback_active_ ? std::chrono::milliseconds::zero()
+                         : std::min(interval / 4, std::chrono::milliseconds(500));
+    if (std::chrono::steady_clock::now() - *last_segment_added_at_ < interval + initial_grace) {
+        return;
+    }
+
+    const auto next = segments_.back()->sequence + 1;
+    auto fallback = copy_with_sequence(*segments_.back(), next, /*force_discontinuity=*/true);
+    append_locked(std::move(fallback), /*fallback=*/true);
 }
 
 void SegmentStore::evict_locked() {
@@ -57,6 +132,7 @@ std::string SegmentStore::playlist(const std::string& segment_uri_prefix) {
     {
         std::lock_guard lock(mutex_);
         stats_.playlist_requests += 1;
+        append_fallback_if_due_locked();
 
         // Advertise only the live window; the grace segments are still
         // fetchable by name but are no longer announced.
@@ -98,6 +174,8 @@ void SegmentStore::clear() {
     bytes_held_ = 0;
     discontinuity_sequence_ = 0;
     ended_ = false;
+    fallback_active_ = false;
+    last_segment_added_at_.reset();
     stats_.bytes_held = 0;
 }
 

@@ -14,11 +14,12 @@ using namespace std::chrono_literals;
 namespace {
 
 SegmentPtr make_segment(std::uint64_t sequence, std::size_t bytes = 1024,
-                        bool discontinuity = false) {
+                        bool discontinuity = false,
+                        std::chrono::milliseconds duration = 4000ms) {
     auto segment = std::make_shared<Segment>();
     segment->sequence = sequence;
     segment->name = "segment-" + std::to_string(sequence) + ".ts";
-    segment->duration = 4000ms;
+    segment->duration = duration;
     segment->discontinuity = discontinuity;
     segment->data = core::SharedBuffer::adopt(std::vector<std::byte>(bytes, std::byte{0x47}));
     return segment;
@@ -132,6 +133,62 @@ TEST(SegmentStoreTest, NextSequenceContinuesAfterTheNewestRetainedSegment) {
     // still resumes after the newest retained sequence.
     EXPECT_EQ(store.segment_count(), 3u);
     EXPECT_EQ(store.next_sequence(), 46u);
+}
+
+TEST(SegmentStoreTest, RepeatsLastGoodSegmentWhileAConfiguredSourceIsStalled) {
+    SegmentStoreConfig config;
+    config.repeat_last_segment_on_stall = true;
+    SegmentStore store(config);
+
+    auto original = make_segment(40, 2048, false, 20ms);
+    store.add_segment(original);
+    std::this_thread::sleep_for(35ms);
+
+    const auto playlist = store.playlist();
+    ASSERT_NE(playlist.find("segment-41.ts"), std::string::npos) << playlist;
+    ASSERT_NE(playlist.find("#EXT-X-DISCONTINUITY"), std::string::npos) << playlist;
+
+    const auto fallback = store.find_segment("segment-41.ts");
+    ASSERT_NE(fallback, nullptr);
+    EXPECT_TRUE(fallback->discontinuity);
+    EXPECT_EQ(fallback->data.size(), original->data.size());
+    EXPECT_EQ(fallback->data.view().data(), original->data.view().data());
+    EXPECT_EQ(store.stats().fallback_segments_added, 1u);
+    EXPECT_EQ(store.stats().real_segments_added, 1u);
+}
+
+TEST(SegmentStoreTest, RecoveryContinuesAfterFallbackWithoutReusingAPlaylistUrl) {
+    SegmentStoreConfig config;
+    config.repeat_last_segment_on_stall = true;
+    SegmentStore store(config);
+
+    auto original = make_segment(7, 1024, false, 20ms);
+    store.add_segment(original);
+    std::this_thread::sleep_for(35ms);
+    (void)store.playlist(); // Adds synthetic segment 8.
+
+    // The producer allocated 8 before the fallback appeared. The store must
+    // move it to 9 and signal the timestamp transition back to live media.
+    auto recovered = make_segment(8, 3072, false, 20ms);
+    store.add_segment(recovered);
+
+    EXPECT_EQ(store.next_sequence(), 10u);
+    EXPECT_NE(store.find_segment("segment-8.ts"), nullptr);
+    const auto live = store.find_segment("segment-9.ts");
+    ASSERT_NE(live, nullptr);
+    EXPECT_TRUE(live->discontinuity);
+    EXPECT_EQ(live->data.size(), 3072u);
+}
+
+TEST(SegmentStoreTest, OrdinaryPublishersDoNotRepeatSegmentsByDefault) {
+    SegmentStore store;
+    auto segment = make_segment(0, 1024, false, 20ms);
+    store.add_segment(segment);
+    std::this_thread::sleep_for(35ms);
+
+    (void)store.playlist();
+    EXPECT_EQ(store.segment_count(), 1u);
+    EXPECT_EQ(store.stats().fallback_segments_added, 0u);
 }
 
 TEST(SegmentStoreTest, DiscontinuitySequenceCountsDiscontinuitiesThatLeftTheWindow) {

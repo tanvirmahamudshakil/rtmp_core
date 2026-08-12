@@ -1,5 +1,6 @@
 #pragma once
 
+#include <chrono>
 #include <cstdint>
 #include <deque>
 #include <mutex>
@@ -31,15 +32,26 @@ struct SegmentStoreConfig {
 
     std::uint32_t target_duration_seconds = 4;
     std::uint32_t playlist_version = 3;
+
+    // Keep an established live URL moving through a temporary source
+    // outage by repeating the last complete transport-stream segment. The
+    // synthetic copies carry discontinuities because their media timestamps
+    // restart. Disabled for ordinary publishers; source-transcode jobs opt in.
+    bool repeat_last_segment_on_stall = false;
 };
 
 struct SegmentStoreStats {
     std::uint64_t segments_added = 0;
+    // Producer-originated segments only. Unlike segments_added, this does
+    // not advance when the store synthesizes outage fallback media, so
+    // health monitoring can still detect a wedged transcoder.
+    std::uint64_t real_segments_added = 0;
     std::uint64_t segments_evicted = 0;
     std::uint64_t bytes_held = 0;
     std::uint64_t playlist_requests = 0;
     std::uint64_t segment_hits = 0;
     std::uint64_t segment_misses = 0;
+    std::uint64_t fallback_segments_added = 0;
 };
 
 // Thread-safe, bounded, in-memory store of one stream's HLS segments.
@@ -86,6 +98,8 @@ public:
 
 private:
     // Caller must hold mutex_.
+    void append_locked(SegmentPtr segment, bool fallback);
+    void append_fallback_if_due_locked();
     void evict_locked();
 
     SegmentStoreConfig config_;
@@ -97,6 +111,8 @@ private:
     // EXT-X-DISCONTINUITY-SEQUENCE stays correct for late joiners.
     std::uint64_t discontinuity_sequence_ = 0;
     bool ended_ = false;
+    bool fallback_active_ = false;
+    std::optional<std::chrono::steady_clock::time_point> last_segment_added_at_;
     SegmentStoreStats stats_;
 };
 

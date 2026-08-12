@@ -21,7 +21,7 @@ sub vcl_recv {
     # Playlists carry a per-player session and must reach the origin so each
     # player keeps its own identity. They are tiny; the expensive immutable
     # segment bodies below remain shared by every viewer.
-    if (req.url ~ "\\.m3u8(?:\\?.*)?$") {
+    if (req.url ~ "\.m3u8(?:\?.*)?$") {
         return (pass);
     }
     unset req.http.Cookie;
@@ -33,7 +33,7 @@ sub vcl_hash {
     # Retain the original query in VSL so viewer_estimator can observe the
     # playback session on cache HITs, but deliberately exclude it from the
     # segment cache key. All viewers therefore share one immutable object.
-    hash_data(regsub(req.url, "\\?.*$", ""));
+    hash_data(regsub(req.url, "\?.*$", ""));
     if (req.http.host) {
         hash_data(req.http.host);
     } else {
@@ -48,7 +48,7 @@ sub vcl_backend_fetch {
 }
 
 sub vcl_backend_response {
-    if (bereq.url ~ "\\.ts(?:\\?.*)?$") {
+    if (bereq.url ~ "\.ts(?:\?.*)?$") {
         if (beresp.status == 200) {
             set beresp.ttl = 1h;
             set beresp.grace = 5m;
