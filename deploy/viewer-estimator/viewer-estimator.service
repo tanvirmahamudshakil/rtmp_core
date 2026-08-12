@@ -6,12 +6,13 @@ Requires=varnish.service
 [Service]
 Type=simple
 ExecStart=/usr/bin/python3 /usr/local/bin/viewer_estimator.py
+EnvironmentFile=-/etc/rtmp-server/rtmp-server.env
 Restart=on-failure
 RestartSec=2
 User=root
 NoNewPrivileges=true
 ProtectSystem=strict
-ReadWritePaths=/var/lib/rtmp-server
+ReadWritePaths=/var/www/streamforge/internal
 
 [Install]
 WantedBy=multi-user.target

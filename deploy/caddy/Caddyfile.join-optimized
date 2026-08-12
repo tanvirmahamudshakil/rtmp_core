@@ -17,6 +17,13 @@
         reverse_proxy 127.0.0.1:8080
     }
 
+    @edge_stats path /internal/viewer_estimate.json
+    handle @edge_stats {
+        root * /var/www/streamforge
+        header Cache-Control "no-store"
+        file_server
+    }
+
     @kk_join path /hls/kk/KK/master.m3u8
     handle @kk_join {
         # The public high-scale cache normalizes query strings and all viewers

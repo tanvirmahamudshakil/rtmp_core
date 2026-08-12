@@ -38,10 +38,9 @@ import {
   Zap
 } from "lucide-react";
 import { FormEvent, ReactNode, useCallback, useEffect, useRef, useState } from "react";
-import { Application, ControlClient, Snapshot, SourceTranscodeJob, Stream, TemplateRecord, TranscodingAssignment, TranscodingOutput } from "./api";
+import { Application, ControlClient, Snapshot, SourceTranscodeJob, Stream, TemplateRecord, TranscodingOutput } from "./api";
 
 type Page = "home" | "applications" | "transcode" | "server";
-type ApplicationTab = "playback" | "transcoding" | "source";
 type VideoCodec = "H.263" | "H.264" | "H.265" | "VP8" | "VP9" | "Passthrough" | "Disabled";
 type EncodingImplementation = "Beamr" | "QuickSync" | "NVENC" | "Default";
 type VideoProfile = "baseline" | "main" | "high";
@@ -78,15 +77,10 @@ const EMPTY_SNAPSHOT: Snapshot = { applications: [], streams: [], metrics: {}, h
 const absoluteUrl = (path: string) => new URL(path, window.location.origin).toString();
 const pageTitles: Record<Page, { title: string; subtitle: string }> = {
   home: { title: "Home", subtitle: "Live delivery overview and network activity" },
-  applications: { title: "Application", subtitle: "Manage applications, streams and playback links" },
+  applications: { title: "Application", subtitle: "Manage applications and source transcoding" },
   transcode: { title: "Transcode", subtitle: "Your transcoding workspace" },
   server: { title: "Server", subtitle: "Origin health, resources and delivery capacity" }
 };
-const applicationTabs: { id: ApplicationTab; label: string }[] = [
-  { id: "playback", label: "Playback URLs" },
-  { id: "transcoding", label: "Transcoding" },
-  { id: "source", label: "Source Transcode" }
-];
 const videoCodecs: VideoCodec[] = ["H.263", "H.264", "H.265", "VP8", "VP9", "Passthrough", "Disabled"];
 const encodingImplementations: EncodingImplementation[] = ["Beamr", "QuickSync", "NVENC", "Default"];
 const videoProfiles: VideoProfile[] = ["baseline", "main", "high"];
@@ -504,23 +498,26 @@ function Overview({
     .filter((job) => job.status === "running")
     .reduce((sum, job) => sum + (job.viewer_count ?? 0), 0);
   const sourceEgress = Object.values(sourceBandwidth).reduce((sum, value) => sum + value, 0);
-  const viewers = metric(snapshot, "active_viewers") + sourceViewers;
-  const liveLinks = metric(snapshot, "active_publishers") +
+  const edgeStatsAvailable = metric(snapshot, "edge_delivery_stats_available") > 0;
+  const rtmpViewers = metric(snapshot, "active_viewers");
+  const hlsViewers = edgeStatsAvailable ? metric(snapshot, "hls_active_viewers") : sourceViewers;
+  const viewers = rtmpViewers + hlsViewers;
+  const liveLinks = snapshot.streams.filter((stream) => stream.is_live).length +
     sourceJobs.filter((job) => job.status === "running").length;
   const configuredLinks = snapshot.streams.length + sourceJobs.length;
-  const activeConnections = metric(snapshot, "active_connections") + sourceViewers;
-  const egress = metric(snapshot, "egress_bitrate") + sourceEgress;
+  const hlsEgress = edgeStatsAvailable ? metric(snapshot, "hls_egress_bitrate") : sourceEgress;
+  const egress = metric(snapshot, "egress_bitrate") + hlsEgress;
   const utilization = Math.min((egress / (bandwidth * 1e6)) * 100, 999);
   const links = buildLinkRows(snapshot.streams, sourceJobs, streamBandwidth, sourceBandwidth);
   return (
     <>
       <section className="metric-grid">
         <MetricCard icon={<Users size={20} />} label="Viewers now" value={compact(viewers)}
-          helper={`${compact(activeConnections)} active HLS/RTMP clients`} tone="amber" history={history} />
+          helper={`${compact(rtmpViewers)} RTMP · ${compact(hlsViewers)} HLS`} tone="amber" history={history} />
         <MetricCard icon={<RadioTower size={20} />} label="Live links" value={compact(liveLinks)}
           helper={`${configuredLinks} playback links configured`} tone="teal" />
         <MetricCard icon={<ArrowUpRight size={20} />} label="Bandwidth out" value={bitrate(egress)}
-          helper={`${utilization.toFixed(1)}% of available uplink`} tone="blue" />
+          helper={`${utilization.toFixed(1)}% uplink · ${edgeStatsAvailable ? "cache hits included" : "origin traffic only"}`} tone="blue" />
         <MetricCard icon={<Cpu size={20} />} label="Server load"
           value={`${(metric(snapshot, "worker_cpu_usage") / 1000).toFixed(2)} / ${compact(metric(snapshot, "cpu_cores_available") || 1)} cores`}
           helper={`${bytes(metric(snapshot, "process_memory_bytes"))} resident memory`} tone="purple" />
@@ -575,6 +572,7 @@ function Overview({
             <div><span className="health-icon good"><Database size={18} /></span><p><strong>SQLite control store</strong><small>Readiness check passed</small></p><b>Ready</b></div>
             <div><span className="health-icon good"><HardDrive size={18} /></span><p><strong>Outbound queue</strong><small>{bytes(metric(snapshot, "outbound_queue_bytes"))} pending</small></p><b>Stable</b></div>
             <div><span className={`health-icon ${metric(snapshot, "slow_viewer_evictions") > 10 ? "warn" : "good"}`}><Unplug size={18} /></span><p><strong>Slow viewers</strong><small>Automatic backpressure policy</small></p><b>{compact(metric(snapshot, "slow_viewer_evictions"))} evicted</b></div>
+            <div><span className={`health-icon ${edgeStatsAvailable ? "good" : "warn"}`}><Network size={18} /></span><p><strong>Cache-edge accounting</strong><small>HLS viewers and HIT/MISS delivery bytes</small></p><b>{edgeStatsAvailable ? "Reporting" : "Unavailable"}</b></div>
           </div>
         </article>
       </section>
@@ -759,31 +757,20 @@ function ApplicationsPage({
 
 function ApplicationDetailPage({
   application,
-  streams,
   templates,
   client,
-  activeTab,
-  setActiveTab,
   onBack,
   onNotify,
   onDeleteRequest
 }: {
   application: Application;
-  streams: Stream[];
   templates: TranscodingTemplate[];
   client: ControlClient;
-  activeTab: ApplicationTab;
-  setActiveTab: (tab: ApplicationTab) => void;
   onBack: () => void;
   onNotify: (type: "success" | "error", message: string) => void;
   onDeleteRequest: (application: Application) => void;
 }) {
-  const applicationStreams = streams.filter((stream) => stream.application === application.name);
   const [copiedUrl, setCopiedUrl] = useState<string | null>(null);
-  const [assignments, setAssignments] = useState<TranscodingAssignment[]>([]);
-  const [selectedTemplates, setSelectedTemplates] = useState<Record<string, string>>({});
-  const [assignmentBusy, setAssignmentBusy] = useState<string | null>(null);
-  const [assignmentsLoading, setAssignmentsLoading] = useState(false);
   const [sourceJobs, setSourceJobs] = useState<SourceTranscodeJob[]>([]);
   const [sourceUrl, setSourceUrl] = useState("");
   const [outputName, setOutputName] = useState("");
@@ -792,86 +779,11 @@ function ApplicationDetailPage({
   const [sourceRestartDelay, setSourceRestartDelay] = useState("5");
   const [sourceBusy, setSourceBusy] = useState(false);
   const [pendingDeleteJob, setPendingDeleteJob] = useState<SourceTranscodeJob | null>(null);
-  const renditionStreamNames = new Set(assignments.flatMap((assignment) => assignment.outputs.map((output) => output.stream)));
-  const sourceStreams = applicationStreams.filter((stream) => !renditionStreamNames.has(stream.name));
-
-  const loadAssignments = useCallback(async () => {
-    setAssignmentsLoading(true);
-    try {
-      const items = await client.listTranscodingAssignments(application.name);
-      setAssignments(items);
-      setSelectedTemplates((current) => {
-        const next = { ...current };
-        for (const item of items) {
-          const template = templates.find((candidate) => candidate.name === item.template_name);
-          if (template) next[item.source_stream] = template.id;
-        }
-        return next;
-      });
-    } catch (error) {
-      onNotify("error", error instanceof Error ? error.message : "Could not load transcoding assignments.");
-    } finally {
-      setAssignmentsLoading(false);
-    }
-  }, [application.name, client, onNotify, templates]);
-
-  useEffect(() => {
-    if (activeTab === "transcoding") loadAssignments();
-  }, [activeTab, loadAssignments]);
-
   const copyUrl = async (url: string) => {
     await copyText(url);
     setCopiedUrl(url);
     window.setTimeout(() => setCopiedUrl((current) => current === url ? null : current), 1500);
   };
-  const applyTemplate = async (stream: Stream) => {
-    const template = templates.find((item) => item.id === selectedTemplates[stream.name]);
-    if (!template) {
-      onNotify("error", "Select a transcoding template first.");
-      return;
-    }
-    if (!template.presets.length) {
-      onNotify("error", "This template has no encoding presets.");
-      return;
-    }
-    const unsupported = template.presets.find((preset) =>
-      !["H.264", "Passthrough", "Disabled"].includes(preset.videoCodec) ||
-      !["AAC", "Passthrough", "Disabled"].includes(preset.audioCodec) ||
-      ["Beamr"].includes(preset.implementation)
-    );
-    if (unsupported) {
-      onNotify("error", `${unsupported.name} is not supported by the current RTMP/HLS output pipeline.`);
-      return;
-    }
-    setAssignmentBusy(stream.name);
-    try {
-      const { rules, outputs } = buildTemplateRules(stream, template);
-      const assignment = await client.assignTranscodingTemplate(stream, template.name, rules, outputs);
-      setAssignments((current) => [
-        ...current.filter((item) => item.source_stream !== stream.name),
-        assignment
-      ]);
-      onNotify("success", `${template.name} applied. ${template.presets.length} resolutions now share one adaptive link.`);
-    } catch (error) {
-      onNotify("error", error instanceof Error ? error.message : "Could not apply the transcoding template.");
-    } finally {
-      setAssignmentBusy(null);
-    }
-  };
-  const removeTemplate = async (stream: Stream) => {
-    setAssignmentBusy(stream.name);
-    try {
-      await client.removeTranscodingAssignment(stream);
-      setAssignments((current) => current.filter((item) => item.source_stream !== stream.name));
-      setSelectedTemplates((current) => ({ ...current, [stream.name]: "" }));
-      onNotify("success", `Transcoding removed from ${stream.name}.`);
-    } catch (error) {
-      onNotify("error", error instanceof Error ? error.message : "Could not remove transcoding.");
-    } finally {
-      setAssignmentBusy(null);
-    }
-  };
-
   const loadSourceJobs = useCallback(async () => {
     try {
       setSourceJobs(await client.listSourceTranscodes(application.name));
@@ -881,8 +793,8 @@ function ApplicationDetailPage({
   }, [application.name, client, onNotify]);
 
   useEffect(() => {
-    if (activeTab === "source") loadSourceJobs();
-  }, [activeTab, loadSourceJobs]);
+    loadSourceJobs();
+  }, [loadSourceJobs]);
 
   const startSourceTranscode = async () => {
     const template = templates.find((item) => item.id === sourceTemplateId);
@@ -973,53 +885,12 @@ function ApplicationDetailPage({
     }
   };
 
-  const renderTab = () => {
-    if (activeTab === "playback") {
-      return (
-        <section className="playback-workspace">
-          <div className="playback-heading">
-            <div><span className="eyebrow">AUTOMATICALLY GENERATED · NO TOKEN</span><h2>Playback URLs</h2><p>Every stream gets one direct RTMP URL and one smooth HLS .m3u8 playlist URL.</p></div>
-            <span className="panel-count">{applicationStreams.length} streams</span>
-          </div>
-          <div className="playback-grid">
-            {applicationStreams.map((stream) => {
-              const hlsUrl = absoluteUrl(stream.hls_path);
-              return (
-                <article className="playback-card" key={`${stream.application}:${stream.name}`}>
-                  <div className="playback-card-head">
-                    <span className="stream-avatar"><Video size={17} /></span>
-                    <div><strong>{stream.name}</strong><small>/{stream.application}/{stream.name}</small></div>
-                    <StatusPill live={stream.is_live} />
-                  </div>
-                  <div className="playback-url-row">
-                    <span>RTMP</span><code title={stream.rtmp_url}>{stream.rtmp_url}</code>
-                    <IconButton label="Copy RTMP playback URL" onClick={() => copyUrl(stream.rtmp_url)}>
-                      {copiedUrl === stream.rtmp_url ? <Check size={16} /> : <Copy size={16} />}
-                    </IconButton>
-                  </div>
-                  <div className="playback-url-row recommended">
-                    <span>M3U8</span><code title={hlsUrl}>{hlsUrl}</code>
-                    <IconButton label="Copy HLS m3u8 playback URL" onClick={() => copyUrl(hlsUrl)}>
-                      {copiedUrl === hlsUrl ? <Check size={16} /> : <Copy size={16} />}
-                    </IconButton>
-                  </div>
-                  <div className="playback-card-foot"><Users size={14} /> {compact(stream.viewer_count ?? 0)} viewers <b>HLS recommended</b></div>
-                </article>
-              );
-            })}
-            {!applicationStreams.length && (
-              <div className="empty-state full"><Radio size={28} /><strong>No playback URLs yet</strong><span>Playback links will appear when streams are registered for this application.</span></div>
-            )}
-          </div>
-        </section>
-      );
-    }
-    if (activeTab === "source") {
-      return (
+  const renderSourceTranscode = () => {
+    return (
         <section className="assignment-workspace">
-          <div className="playback-heading">
-            <div><span className="eyebrow">PULL · TRANSCODE · RE-SERVE</span><h2>Transcode from a source URL</h2><p>Point at an RTMP or HTTP(S) HLS/TS source carrying H.264/AAC. The native pipeline detects the source by protocol/content, transcodes the chosen ladder, and serves one adaptive master .m3u8.</p></div>
-            <span className="panel-count">{sourceJobs.length} running</span>
+          <div className="source-workspace-heading">
+            <div><span className="eyebrow">PULL · TRANSCODE · RE-SERVE</span><h2>Source Transcode</h2><p>Point at an RTMP or HTTP(S) HLS/TS source carrying H.264/AAC. The native pipeline detects the source by protocol/content, transcodes the chosen ladder, and serves one adaptive master .m3u8.</p></div>
+            <span className="panel-count">{sourceJobs.length} jobs</span>
           </div>
           <article className="assignment-card source-form">
             <label className="assignment-select">Source URL
@@ -1121,71 +992,6 @@ function ApplicationDetailPage({
           </div>
         </section>
       );
-    }
-    return (
-      <section className="assignment-workspace">
-        <div className="playback-heading">
-          <div><span className="eyebrow">ADAPTIVE BITRATE</span><h2>Assign transcoding templates</h2><p>Choose one template per source. Every preset becomes a resolution inside one master M3U8 link.</p></div>
-          <span className="panel-count">{assignments.length} assigned</span>
-        </div>
-        {assignmentsLoading && <div className="assignment-loading"><RefreshCw className="spin" size={17} /> Loading assignments…</div>}
-        <div className="assignment-grid">
-          {sourceStreams.map((stream) => {
-            const assignment = assignments.find((item) => item.source_stream === stream.name);
-            const masterUrl = assignment ? absoluteUrl(assignment.master_hls_path) : "";
-            return (
-              <article className={`assignment-card ${assignment ? "assigned" : ""}`} key={`${stream.application}:${stream.name}`}>
-                <div className="assignment-card-head">
-                  <span className="stream-avatar"><Workflow size={17} /></span>
-                  <div><strong>{stream.name}</strong><small>{assignment ? assignment.template_name : "No template assigned"}</small></div>
-                  <StatusPill live={stream.is_live} />
-                </div>
-                <label className="assignment-select">Transcoding template
-                  <select
-                    value={selectedTemplates[stream.name] ?? ""}
-                    onChange={(event) => setSelectedTemplates((current) => ({ ...current, [stream.name]: event.target.value }))}
-                  >
-                    <option value="">Select a template</option>
-                    {templates.map((template) => (
-                      <option key={template.id} value={template.id}>{template.name} · {template.presets.length} resolutions</option>
-                    ))}
-                  </select>
-                </label>
-                {assignment ? (
-                  <>
-                    <div className="rendition-list">
-                      {assignment.outputs.map((output) => (
-                        <span key={output.stream}>
-                          <b>{output.width && output.height ? `${output.width}×${output.height}` : output.name}</b>
-                          <small>{bitrate(output.video_bitrate)} · {output.video_codec.toUpperCase()}</small>
-                        </span>
-                      ))}
-                    </div>
-                    <div className="master-url-row">
-                      <span>MASTER M3U8</span><code title={masterUrl}>{masterUrl}</code>
-                      <IconButton label="Copy adaptive master URL" onClick={() => copyUrl(masterUrl)}>
-                        {copiedUrl === masterUrl ? <Check size={16} /> : <Copy size={16} />}
-                      </IconButton>
-                    </div>
-                  </>
-                ) : (
-                  <div className="assignment-empty"><Layers3 size={19} /><span>Select a template to create the adaptive resolution ladder.</span></div>
-                )}
-                <div className="assignment-actions">
-                  {assignment && <button className="secondary-button danger-text" disabled={assignmentBusy === stream.name} onClick={() => removeTemplate(stream)}><Trash2 size={15} /> Remove</button>}
-                  <button className="primary-button" disabled={!selectedTemplates[stream.name] || assignmentBusy === stream.name} onClick={() => applyTemplate(stream)}>
-                    {assignmentBusy === stream.name ? <RefreshCw className="spin" size={16} /> : <Plus size={16} />}
-                    {assignment ? "Update template" : "Add template"}
-                  </button>
-                </div>
-              </article>
-            );
-          })}
-          {!sourceStreams.length && <div className="empty-state full"><Radio size={28} /><strong>No source streams</strong><span>Create a stream before assigning a transcoding template.</span></div>}
-        </div>
-        {!templates.length && <div className="assignment-guidance"><Workflow size={18} /><span>Create a template from the sidebar Transcode page, add its resolution presets, then return here.</span></div>}
-      </section>
-    );
   };
 
   return (
@@ -1200,22 +1006,8 @@ function ApplicationDetailPage({
             <IconButton label="Delete application" danger onClick={() => onDeleteRequest(application)}><Trash2 size={16} /></IconButton>
           </div>
         </div>
-        <div className="application-tabs" role="tablist" aria-label={`${application.name} sections`}>
-          {applicationTabs.map((tab) => (
-            <button
-              type="button"
-              role="tab"
-              aria-selected={activeTab === tab.id}
-              className={activeTab === tab.id ? "active" : ""}
-              key={tab.id}
-              onClick={() => setActiveTab(tab.id)}
-            >
-              {tab.label}
-            </button>
-          ))}
-        </div>
       </section>
-      <div className="application-tab-panel" role="tabpanel">{renderTab()}</div>
+      {renderSourceTranscode()}
       {pendingDeleteJob && (
         <Modal
           title={`Delete ${pendingDeleteJob.name}?`}
@@ -1895,7 +1687,6 @@ function App() {
   const [page, setPage] = useState<Page>("home");
   const [selectedApplication, setSelectedApplication] = useState<Application | null>(null);
   const [pendingDeleteApplication, setPendingDeleteApplication] = useState<Application | null>(null);
-  const [applicationTab, setApplicationTab] = useState<ApplicationTab>("playback");
   const [loading, setLoading] = useState(false);
   const [notice, setNotice] = useState<Notice>(null);
   const [mobileNav, setMobileNav] = useState(false);
@@ -1912,7 +1703,7 @@ function App() {
   const [streamBandwidth, setStreamBandwidth] = useState<Record<string, number>>({});
   const bandwidthSamplesRef = useRef(new Map<string, { bytes: number; time: number }>());
   // Source-transcode jobs across every application, fetched for the homepage
-  // "Top links" table. Per-application tabs still fetch these on demand
+  // "Top links" table. The per-application Source Transcode view fetches these on demand
   // (ApplicationDetailPage.loadSourceJobs); this is a separate copy kept in
   // sync on the same 5s poll as the rest of the home dashboard.
   const [sourceJobs, setSourceJobs] = useState<SourceTranscodeJob[]>([]);
@@ -1979,8 +1770,11 @@ function App() {
         for (const job of jobs) {
           if (job.bytes_total === undefined) continue;
           const key = `job:${job.application}:${job.name}`;
+          if (job.hls_egress_bitrate_bps !== undefined) {
+            nextSourceBandwidth[key] = job.hls_egress_bitrate_bps;
+          }
           const previous = samples.get(key);
-          if (previous && job.bytes_total >= previous.bytes && now > previous.time) {
+          if (job.hls_egress_bitrate_bps === undefined && previous && job.bytes_total >= previous.bytes && now > previous.time) {
             nextSourceBandwidth[key] = ((job.bytes_total - previous.bytes) * 8) / ((now - previous.time) / 1000);
           }
           samples.set(key, { bytes: job.bytes_total, time: now });
@@ -1989,7 +1783,10 @@ function App() {
         const sourceViewers = jobs
           .filter((job) => job.status === "running")
           .reduce((sum, job) => sum + (job.viewer_count ?? 0), 0);
-        setHistory((current) => [...current, metric(next, "active_viewers") + sourceViewers].slice(-24));
+        const hlsViewers = metric(next, "edge_delivery_stats_available") > 0
+          ? metric(next, "hls_active_viewers")
+          : sourceViewers;
+        setHistory((current) => [...current, metric(next, "active_viewers") + hlsViewers].slice(-24));
       } catch {
         // Homepage source-job row list degrades gracefully; the per-application
         // Source Transcode tab surfaces the real error when it fetches directly.
@@ -2075,10 +1872,17 @@ function App() {
     }
   };
 
-  const viewers = metric(snapshot, "active_viewers");
+  const edgeStatsAvailable = metric(snapshot, "edge_delivery_stats_available") > 0;
+  const fallbackSourceViewers = sourceJobs
+    .filter((job) => job.status === "running")
+    .reduce((sum, job) => sum + (job.viewer_count ?? 0), 0);
+  const hlsViewers = edgeStatsAvailable ? metric(snapshot, "hls_active_viewers") : fallbackSourceViewers;
+  const viewers = metric(snapshot, "active_viewers") + hlsViewers;
   const publishers = metric(snapshot, "active_publishers");
   const currentIngress = metric(snapshot, "ingress_bitrate");
-  const currentEgress = metric(snapshot, "egress_bitrate");
+  const fallbackSourceEgress = Object.values(sourceBandwidth).reduce((sum, value) => sum + value, 0);
+  const hlsEgress = edgeStatsAvailable ? metric(snapshot, "hls_egress_bitrate") : fallbackSourceEgress;
+  const currentEgress = metric(snapshot, "egress_bitrate") + hlsEgress;
   const measuredBitrateMbps = viewers > 0 && currentEgress > 0
     ? currentEgress / viewers / 1e6
     : publishers > 0 && currentIngress > 0
@@ -2094,7 +1898,6 @@ function App() {
     setPage(nextPage);
     if (nextPage === "applications") {
       setSelectedApplication(null);
-      setApplicationTab("playback");
     }
   };
 
@@ -2117,17 +1920,11 @@ function App() {
             selectedApplication
               ? <ApplicationDetailPage
                   application={selectedApplication}
-                  streams={snapshot.streams}
                   templates={templates}
                   client={client}
-                  activeTab={applicationTab}
-                  setActiveTab={setApplicationTab}
                   onNotify={notify}
                   onDeleteRequest={setPendingDeleteApplication}
-                  onBack={() => {
-                    setSelectedApplication(null);
-                    setApplicationTab("playback");
-                  }}
+                  onBack={() => setSelectedApplication(null)}
                 />
               : <ApplicationsPage
                   applications={snapshot.applications}
@@ -2135,7 +1932,6 @@ function App() {
                   openCreate={() => setCreateType("application")}
                   onOpen={(application) => {
                     setSelectedApplication(application);
-                    setApplicationTab("playback");
                   }}
                 />
           )}
@@ -2214,7 +2010,6 @@ function App() {
               const application = pendingDeleteApplication;
               setPendingDeleteApplication(null);
               setSelectedApplication(null);
-              setApplicationTab("playback");
               perform(() => client.deleteApplication(application.name), "Application and its streams deleted.");
             }}><Trash2 size={17} /> Delete application</button>
           </div>

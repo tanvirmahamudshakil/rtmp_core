@@ -243,7 +243,8 @@ TEST(ManagementApiTest, StatusUsesInjectedMultiWorkerLiveState) {
 
     api.set_live_state_provider([] {
         return std::vector<rtmp_server::management::LiveState>{
-            {.application = "live", .name = "alpha", .is_live = true, .viewer_count = 42},
+            {.application = "live", .name = "alpha", .is_live = true, .viewer_count = 42,
+             .egress_bytes_total = 123456},
         };
     });
 
@@ -251,6 +252,7 @@ TEST(ManagementApiTest, StatusUsesInjectedMultiWorkerLiveState) {
     EXPECT_EQ(status.status, 200);
     EXPECT_NE(status.body.find(R"("is_live":true)"), std::string::npos);
     EXPECT_NE(status.body.find(R"("viewer_count":42)"), std::string::npos);
+    EXPECT_NE(status.body.find(R"("egress_bytes_total":123456)"), std::string::npos);
 }
 
 TEST(ManagementApiTest, UnknownRouteReturns404) {

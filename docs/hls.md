@@ -190,22 +190,29 @@ media sequence.
 
 ### Maximum-scale public mode
 
-Production defaults `hls_high_scale_mode: true`. In this mode there is no
-per-viewer redirect, session map, playlist query decoration, or delivery-stats
-mutex on the origin request path. Caddy sends all `/hls/*` traffic through the
-same-VPS Varnish instance. Varnish removes query strings, request-collapses a
-hot segment's first fetch, caches media playlists for 1 second, masters for 30
-seconds and immutable segments for 1 hour. Segment sequence numbers start from
-wall-clock milliseconds, so names cannot repeat after publisher reconnect or
-process restart while an older cache object still exists.
+Production defaults `hls_high_scale_mode: true`. Caddy sends all `/hls/*`
+traffic through the same-VPS Varnish instance. Playlists pass through so the
+origin can mint and propagate one opaque playback session per player; they are
+small and never cached. Varnish excludes that query from the segment cache key,
+request-collapses a hot segment's first fetch and caches the complete immutable
+segment for 1 hour. Segment sequence numbers start from wall-clock milliseconds,
+so names cannot repeat after publisher reconnect or process restart while an
+older cache object still exists.
 
-This profile is deliberately for public links. Query-token authorization and
-per-viewer origin counting require `hls_high_scale_mode: false` **and** a proxy
-profile that preserves/bypasses query-bearing playlists; the installer VCL is
-intentionally public and normalizes all HLS queries. Those features cannot be
-combined safely with a fully shared public cache.
+`viewer-estimator.service` consumes Varnish's shared-memory access log (it does
+not persist one access-log line per request). It counts active playback sessions
+over a 20-second window and aggregates body bytes plus a rolling bitrate for
+every link. Because Varnish observes both HIT and MISS responses, the admin
+homepage includes cache-served viewers and traffic rather than reporting only
+origin misses. The origin's own delivery-stats mutex remains disabled in this
+mode.
 
-The cache eliminates proportional origin CPU/memory work, not network egress.
+This profile is deliberately for public links. Query-token authorization still
+requires a private-cache policy; the installer intentionally shares immutable
+segment objects across every viewer.
+
+The cache eliminates proportional segment-generation/origin-body work, not the
+small per-viewer playlist requests and not network egress.
 One VPS still sends one copy to every viewer. Approximate ceiling:
 
 ```text
@@ -226,9 +233,9 @@ all established viewers in the provider's saturated FIFO/policer queue.
 | Resource | Header | Why |
 |---|---|---|
 | Media playlist (library default) | `no-cache, max-age=0` | Safe when no reverse cache profile is selected |
-| Media playlist (production high-scale) | `public, max-age=1, s-maxage=1, stale-while-revalidate=2` | Allows a one-second shared micro-cache without stalling the live window |
+| Media playlist (production high-scale) | `private, no-store` | Preserves a distinct playback session for accurate edge viewer accounting |
 | Segment (200) | `public, max-age=31536000, immutable` | Uniquely named and never rewritten — safe to cache indefinitely |
-| Master playlist | `public, max-age=60` | Changes only when the rendition set changes |
+| Master playlist | `private, no-store` when playback sessions are enabled; otherwise `public, max-age=60` | A fresh open mints a distinct playback session |
 | Segment (404) | `no-store` | An evicted-segment 404 must not be cached, or the CDN keeps serving it after recovery |
 | 403 (bad token) | `no-store` | An authorization result must never be cached across viewers |
 

@@ -123,4 +123,13 @@ std::size_t WorkerPool::subscriber_count(protocol::commands::StreamId stream_id)
     return total;
 }
 
+std::uint64_t WorkerPool::egress_bytes_total(protocol::commands::StreamId stream_id) const {
+    if (!workers_ready_.load(std::memory_order_acquire)) return 0;
+    std::uint64_t total = 0;
+    for (const auto& worker : workers_) {
+        if (worker.loop) total += worker.loop->egress_bytes_total(stream_id);
+    }
+    return total;
+}
+
 } // namespace rtmp_server::io::io_uring

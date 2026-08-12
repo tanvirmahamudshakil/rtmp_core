@@ -870,8 +870,11 @@ void IoUringEventLoop::handle_send_completion(const OperationContext& op, int re
     const std::uint64_t partials_before = connection->partial_send_count();
     connection->on_send_completion(success ? static_cast<std::size_t>(result) : 0, success);
     if (metrics_ != nullptr) {
-        if (success) metrics_->increment(observability::MetricId::EgressBytesTotal,
-                                         static_cast<std::uint64_t>(result));
+        // LiveFanout accounts successful viewer-media delivery once, at the
+        // per-stream dispatch point. Counting the same bytes again when the
+        // encoded RTMP buffer reaches the socket made egress_bitrate roughly
+        // twice the real media delivery rate. Keep send completions for
+        // partial-write observability only.
         const std::uint64_t delta = connection->partial_send_count() - partials_before;
         if (delta > 0) metrics_->increment(observability::MetricId::PartialSendCount, delta);
     }

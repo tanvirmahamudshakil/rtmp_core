@@ -309,20 +309,31 @@ void LiveFanout::subscribe(StreamId stream_id, SubscriberId subscriber_id, Playb
     // Deliver outside the lock: metadata + sequence headers first, then the
     // cached GOP (which always starts at a keyframe by GopCache's
     // invariant), in the order a fresh decoder needs them.
+    std::uint64_t startup_egress_bytes = 0;
     for (const auto& frame : startup_metadata_and_headers) {
+        bool delivered = false;
         if (classify_is_video_sequence_header(frame)) {
-            sink->on_video(frame);
+            delivered = sink->on_video(frame);
         } else if (classify_is_audio_sequence_header(frame)) {
-            sink->on_audio(frame);
+            delivered = sink->on_audio(frame);
         } else {
-            sink->on_metadata(frame);
+            delivered = sink->on_metadata(frame);
         }
+        if (delivered) startup_egress_bytes += frame.payload.size();
     }
     for (const auto& frame : startup_gop) {
+        bool delivered = false;
         if (frame.message_type_id == static_cast<std::uint8_t>(chunk::MessageTypeId::Video)) {
-            sink->on_video(frame);
+            delivered = sink->on_video(frame);
         } else {
-            sink->on_audio(frame);
+            delivered = sink->on_audio(frame);
+        }
+        if (delivered) startup_egress_bytes += frame.payload.size();
+    }
+    if (startup_egress_bytes > 0) {
+        state->egress_bytes_total.fetch_add(startup_egress_bytes, std::memory_order_relaxed);
+        if (metrics_ != nullptr) {
+            metrics_->increment(observability::MetricId::EgressBytesTotal, startup_egress_bytes);
         }
     }
 

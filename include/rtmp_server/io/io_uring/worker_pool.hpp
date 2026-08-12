@@ -53,6 +53,9 @@ public:
 
     [[nodiscard]] std::size_t worker_count() const noexcept { return workers_.size(); }
     [[nodiscard]] std::size_t subscriber_count(protocol::commands::StreamId stream_id) const;
+    // Per-worker fan-outs each own their share of a stream's viewers. Sum the
+    // cumulative payload bytes across them for management/API link stats.
+    [[nodiscard]] std::uint64_t egress_bytes_total(protocol::commands::StreamId stream_id) const;
 
     // Task 2 ("Default worker count based on hardware concurrency, with a
     // configurable upper bound"): 0 means auto-detect via

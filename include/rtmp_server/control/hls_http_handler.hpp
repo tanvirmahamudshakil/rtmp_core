@@ -43,8 +43,9 @@ struct HlsHttpOptions {
     bool track_delivery_stats = true;
 
     // Token/session query values have to be copied into child playlist URIs.
-    // Public high-scale deployments should disable this so arbitrary query
-    // strings cannot fragment an otherwise shared playlist/segment cache.
+    // A reverse cache may still normalize segment cache keys while preserving
+    // this query in its access log; the production Varnish profile does so to
+    // keep per-player accounting accurate on cache hits.
     bool propagate_query_to_playlist_uris = true;
 
     // Cache-Control for the live media playlist. A live playlist changes

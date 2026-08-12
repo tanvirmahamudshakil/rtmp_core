@@ -161,6 +161,30 @@ TEST_F(LiveFanoutTest, OnePublisherMultipleViewersEachReceiveFannedOutMedia) {
     EXPECT_EQ(v3.video, 1);
 }
 
+TEST_F(LiveFanoutTest, PerStreamEgressCountsDeliveredPayloadExactlyOnce) {
+    LiveFanout fanout;
+    CountingSink first, second;
+    fanout.subscribe(stream, SubscriberId::next(), &first);
+    fanout.subscribe(stream, SubscriberId::next(), &second);
+
+    const auto payload = avc_keyframe();
+    fanout.on_video(stream, frame_of(make_video(payload)));
+
+    EXPECT_EQ(fanout.egress_bytes_total(stream), payload.size() * 2);
+}
+
+TEST_F(LiveFanoutTest, PerStreamEgressIncludesCachedStartupDelivery) {
+    LiveFanout fanout;
+    const auto payload = avc_keyframe();
+    fanout.on_video(stream, frame_of(make_video(payload)));
+    EXPECT_EQ(fanout.egress_bytes_total(stream), 0u);
+
+    CountingSink viewer;
+    fanout.subscribe(stream, SubscriberId::next(), &viewer);
+
+    EXPECT_EQ(fanout.egress_bytes_total(stream), payload.size());
+}
+
 TEST_F(LiveFanoutTest, ViewerJoinsBeforeKeyframeReceivesNothingUntilOneArrives) {
     LiveFanout fanout;
     CountingSink viewer;

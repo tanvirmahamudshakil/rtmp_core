@@ -171,11 +171,13 @@ remove_managed_path() {
     /etc/systemd/system/rtmp-server.service.d | \
     /etc/systemd/system/rtmp-network-tune.service | \
     /etc/systemd/system/rtmp-network-tune.service.d | \
+    /etc/systemd/system/viewer-estimator.service | \
     /etc/systemd/journald.conf.d/streamforge.conf | \
     /etc/sysctl.d/60-streamforge.conf | \
     /etc/default/rtmp-network | \
     /etc/logrotate.d/rtmp-server | \
     /usr/local/sbin/rtmp-network-tune | \
+    /usr/local/bin/viewer_estimator.py | \
     /root/streamforge-credentials.txt | \
     /etc/caddy/Caddyfile | \
     /etc/systemd/system/caddy.service.d/streamforge.conf | \
@@ -247,6 +249,7 @@ clean_previous_install() {
   # a hard failure: deleting its executable or data underneath it is unsafe.
   stop_and_disable_unit rtmp-server.service
   stop_and_disable_unit rtmp-network-tune.service
+  stop_and_disable_unit viewer-estimator.service
 
   local caddy_config_is_streamforge=0
   if [[ -r /etc/caddy/Caddyfile ]] &&
@@ -283,11 +286,13 @@ clean_previous_install() {
     /etc/systemd/system/rtmp-server.service.d \
     /etc/systemd/system/rtmp-network-tune.service \
     /etc/systemd/system/rtmp-network-tune.service.d \
+    /etc/systemd/system/viewer-estimator.service \
     /etc/systemd/journald.conf.d/streamforge.conf \
     /etc/sysctl.d/60-streamforge.conf \
     /etc/default/rtmp-network \
     /etc/logrotate.d/rtmp-server \
     /usr/local/sbin/rtmp-network-tune \
+    /usr/local/bin/viewer_estimator.py \
     /root/streamforge-credentials.txt \
     /etc/systemd/system/caddy.service.d/streamforge.conf \
     "${SOURCE_DIR}/build" \
@@ -319,7 +324,7 @@ clean_previous_install() {
   fi
 
   systemctl daemon-reload
-  systemctl reset-failed rtmp-server.service rtmp-network-tune.service varnish.service >/dev/null 2>&1 || true
+  systemctl reset-failed rtmp-server.service rtmp-network-tune.service viewer-estimator.service varnish.service >/dev/null 2>&1 || true
   log "Previous StreamForge installation cleanup complete"
 }
 
@@ -581,6 +586,7 @@ fi
 install -m 0644 -o root -g root "${SOURCE_DIR}/docs/deployment.md" /usr/share/doc/rtmp-server/deployment.md
 install -m 0644 -o root -g root "${SOURCE_DIR}/docs/transcoding.md" /usr/share/doc/rtmp-server/transcoding.md
 cp -a "${SOURCE_DIR}/admin/dist/." /var/www/streamforge/
+install -d -m 0755 -o root -g root /var/www/streamforge/internal
 cat > /var/www/streamforge/runtime-config.json <<EOF
 {
   "bandwidth_mbps": ${BANDWIDTH_MBIT},
@@ -854,12 +860,15 @@ else
   fi
 fi
 
-log "Bounding system logs and disabling per-request Varnish log consumers"
-# At very high viewer counts, reading or persisting every segment request burns
-# CPU and I/O without helping delivery. Cache/origin aggregate counters remain
-# available without putting a process on the request log hot path.
+log "Bounding system logs and configuring cache-edge delivery accounting"
+# Keep the distro access-log writer disabled; the bounded estimator consumes
+# Varnish's shared-memory log directly and writes only a tiny aggregate JSON
+# snapshot, never one disk record per HLS request.
 systemctl disable --now varnishncsa.service >/dev/null 2>&1 || true
-systemctl disable --now viewer-estimator.service >/dev/null 2>&1 || true
+install -m 0755 -o root -g root "${SOURCE_DIR}/deploy/viewer-estimator/viewer_estimator.py" \
+  /usr/local/bin/viewer_estimator.py
+install -m 0644 -o root -g root "${SOURCE_DIR}/deploy/viewer-estimator/viewer-estimator.service" \
+  /etc/systemd/system/viewer-estimator.service
 install -d -m 0755 /etc/systemd/journald.conf.d
 install -m 0644 "${SOURCE_DIR}/deploy/systemd/streamforge-journald.conf" \
   /etc/systemd/journald.conf.d/streamforge.conf
@@ -927,6 +936,13 @@ ${CADDY_SITE} {
     handle @control {
         uri strip_prefix /api
         reverse_proxy 127.0.0.1:8080
+    }
+
+    @edge_stats path /internal/viewer_estimate.json
+    handle @edge_stats {
+        root * /var/www/streamforge
+        header Cache-Control "no-store"
+        file_server
     }
 
 ${FAST_JOIN_CADDY_BLOCK}
@@ -998,6 +1014,9 @@ for _ in $(seq 1 15); do
 done
 [[ "${VARNISH_READY}" == "1" ]] || die "Varnish did not start; check 'journalctl -u varnish.service'."
 
+systemctl enable --now viewer-estimator.service >/dev/null
+systemctl restart viewer-estimator.service
+
 systemctl enable --now caddy.service >/dev/null
 systemctl restart caddy.service
 
@@ -1016,6 +1035,19 @@ if [[ "${READY}" != "1" ]]; then
 fi
 systemctl is-active --quiet caddy.service ||
   { journalctl -u caddy.service -n 40 --no-pager >&2 || true; die "caddy.service is not active."; }
+EDGE_STATS_READY=0
+for _ in $(seq 1 10); do
+  if systemctl is-active --quiet viewer-estimator.service &&
+     [[ -s /var/www/streamforge/internal/viewer_estimate.json ]]; then
+    EDGE_STATS_READY=1
+    break
+  fi
+  sleep 1
+done
+if [[ "${EDGE_STATS_READY}" != "1" ]]; then
+  journalctl -u viewer-estimator.service -n 40 --no-pager >&2 || true
+  die "Cache-edge viewer/bandwidth accounting did not become ready."
+fi
 
 ADMIN_URL="http://${PRIMARY_IP}"
 if [[ -n "${DOMAIN}" ]]; then ADMIN_URL="https://${DOMAIN}"; fi

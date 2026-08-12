@@ -96,6 +96,9 @@ public:
     [[nodiscard]] std::size_t subscriber_count(protocol::commands::StreamId stream_id) const {
         return live_fanout_.subscriber_count(stream_id);
     }
+    [[nodiscard]] std::uint64_t egress_bytes_total(protocol::commands::StreamId stream_id) const {
+        return live_fanout_.egress_bytes_total(stream_id);
+    }
 
     // Called by TcpConnection; not part of any external API.
     void submit_receive(std::shared_ptr<network::TcpConnection> connection);

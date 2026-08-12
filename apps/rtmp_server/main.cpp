@@ -190,12 +190,17 @@ int main(int argc, char** argv) {
     // shares the same segment bytes instead of allocating its own media copy.
     rtmp_server::control::HlsHttpOptions hls_options;
     hls_options.require_playback_token = false;
-    hls_options.enable_playback_sessions = !config.hls_high_scale_mode;
+    // Playback sessions remain enabled behind Varnish. Playlists are passed
+    // through (cheap, small responses) so every player receives its own
+    // opaque session, while immutable segments still share one cache object.
+    // The edge estimator can therefore count viewers and bytes on both HIT
+    // and MISS deliveries without using client IP as identity.
+    hls_options.enable_playback_sessions = true;
     hls_options.track_delivery_stats = !config.hls_high_scale_mode;
-    hls_options.propagate_query_to_playlist_uris = !config.hls_high_scale_mode;
+    hls_options.propagate_query_to_playlist_uris = true;
     if (config.hls_high_scale_mode) {
-        hls_options.playlist_cache_control = "public, max-age=1, s-maxage=1, stale-while-revalidate=2";
-        hls_options.master_cache_control = "public, max-age=30, s-maxage=30, stale-while-revalidate=60";
+        hls_options.playlist_cache_control = "private, no-store";
+        hls_options.master_cache_control = "private, no-store";
     }
     rtmp_server::control::HlsHttpHandler hls_handler(std::move(hls_options));
     // Disabling a stream (or its application) takes its .m3u8 links offline
@@ -635,6 +640,7 @@ int main(int argc, char** argv) {
                 if (state.is_live) {
                     if (auto id = stream_id_registry.find(stream.application, stream.name)) {
                         state.viewer_count = pool.subscriber_count(*id);
+                        state.egress_bytes_total = pool.egress_bytes_total(*id);
                     }
                 }
                 states.push_back(std::move(state));

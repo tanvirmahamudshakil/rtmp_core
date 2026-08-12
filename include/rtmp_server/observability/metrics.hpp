@@ -60,7 +60,7 @@ namespace rtmp_server::observability {
     X(ActiveStreams, "active_streams", Gauge, "Streams with at least one publisher or viewer")                        \
     /* -- byte/bitrate counters ------------------------------------------ */                                        \
     X(IngressBytesTotal, "ingress_bytes_total", Counter, "Total bytes read from publisher sockets")                   \
-    X(EgressBytesTotal, "egress_bytes_total", Counter, "Total bytes written to viewer sockets")                       \
+    X(EgressBytesTotal, "egress_bytes_total", Counter, "Total media payload bytes delivered to viewer transports")   \
     X(IngressBitrate, "ingress_bitrate", Gauge, "Ingress bits/sec over the last refresh_derived() window")            \
     X(EgressBitrate, "egress_bitrate", Gauge, "Egress bits/sec over the last refresh_derived() window")               \
     /* -- backpressure ---------------------------------------------------- */                                       \

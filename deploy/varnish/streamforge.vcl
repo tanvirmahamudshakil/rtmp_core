@@ -18,15 +18,28 @@ sub vcl_recv {
         return (pass);
     }
 
-    # This is the public high-scale profile: query strings are neither auth nor
-    # viewer identity. Normalizing them prevents cache-buster attacks from
-    # creating one object/backend fetch per request.
-    if (req.url ~ "\\?") {
-        set req.url = regsub(req.url, "\\?.*$", "");
+    # Playlists carry a per-player session and must reach the origin so each
+    # player keeps its own identity. They are tiny; the expensive immutable
+    # segment bodies below remain shared by every viewer.
+    if (req.url ~ "\\.m3u8(?:\\?.*)?$") {
+        return (pass);
     }
     unset req.http.Cookie;
     unset req.http.Authorization;
     return (hash);
+}
+
+sub vcl_hash {
+    # Retain the original query in VSL so viewer_estimator can observe the
+    # playback session on cache HITs, but deliberately exclude it from the
+    # segment cache key. All viewers therefore share one immutable object.
+    hash_data(regsub(req.url, "\\?.*$", ""));
+    if (req.http.host) {
+        hash_data(req.http.host);
+    } else {
+        hash_data(server.ip);
+    }
+    return (lookup);
 }
 
 sub vcl_backend_fetch {
@@ -35,31 +48,13 @@ sub vcl_backend_fetch {
 }
 
 sub vcl_backend_response {
-    if (bereq.url ~ "\\.ts$") {
+    if (bereq.url ~ "\\.ts(?:\\?.*)?$") {
         if (beresp.status == 200) {
             set beresp.ttl = 1h;
             set beresp.grace = 5m;
             set beresp.keep = 1h;
             # Coalesce a hot segment's initial burst into one origin fetch.
             set beresp.do_stream = false;
-        } else {
-            set beresp.ttl = 0s;
-            set beresp.uncacheable = true;
-        }
-    } else if (bereq.url ~ "/master\\.m3u8$") {
-        if (beresp.status == 200) {
-            set beresp.ttl = 30s;
-            set beresp.grace = 1m;
-            set beresp.keep = 5m;
-        } else {
-            set beresp.ttl = 0s;
-            set beresp.uncacheable = true;
-        }
-    } else if (bereq.url ~ "\\.m3u8$") {
-        if (beresp.status == 200) {
-            set beresp.ttl = 1s;
-            set beresp.grace = 3s;
-            set beresp.keep = 10s;
         } else {
             set beresp.ttl = 0s;
             set beresp.uncacheable = true;

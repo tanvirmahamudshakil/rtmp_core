@@ -16,6 +16,9 @@ export type Stream = {
   // snapshot. Monotonic while live; the caller derives a per-link bitrate
   // from the delta between two snapshots (see bandwidthFromSamples in App.tsx).
   egress_bytes_total?: number;
+  hls_viewer_count?: number;
+  hls_egress_bytes_total?: number;
+  hls_egress_bitrate_bps?: number;
 };
 
 export type StreamSetup = Stream;
@@ -27,14 +30,6 @@ export type TranscodingOutput = {
   video_bitrate: number;
   width: number;
   height: number;
-};
-
-export type TranscodingAssignment = {
-  application: string;
-  source_stream: string;
-  template_name: string;
-  master_hls_path: string;
-  outputs: TranscodingOutput[];
 };
 
 // A transcode driven from an external source URL (RTMP or HLS/TS carrying
@@ -64,9 +59,10 @@ export type SourceTranscodeJob = {
   // register with the RTMP viewer-tracking path. bytes_total is cumulative;
   // the caller derives a bitrate from the delta between two polls, same as
   // Stream.egress_bytes_total. viewer_count is already a live estimate
-  // (distinct client IPs seen in the last ~20s), not cumulative.
+  // (distinct playback sessions seen in the last ~20s), not cumulative.
   bytes_total?: number;
   viewer_count?: number;
+  hls_egress_bitrate_bps?: number;
 };
 
 // A transcoding template as persisted server-side (SQLite): a name plus its
@@ -87,27 +83,38 @@ export type Snapshot = {
 
 type ListResponse<T> = { items: T[]; total: number };
 
+type EdgeDeliveryStats = {
+  generated_at: number;
+  window_seconds: number;
+  viewers: Record<string, number>;
+  bytes_total: Record<string, number>;
+  bitrate_bps: Record<string, number>;
+};
+
 // Varnish sees every HLS request, including cache hits. The edge estimator
 // republishes active playback-session counts keyed directly by the master
 // link (e.g. "kk/RRR") at /internal/viewer_estimate.json. Session identity,
 // unlike IP identity, counts multiple VLC players behind one NAT separately.
 // Legacy per-rendition keys are still summed during rolling upgrades.
-function realViewerCount(
-  estimate: Record<string, number>,
+function aggregateEdgeValue(
+  values: Record<string, number>,
   application: string,
-  name: string,
-  fallback?: number
-): number | undefined {
+  name: string
+): { matched: boolean; value: number } {
   const prefix = `${application}/${name}`;
   let sum = 0;
   let matched = false;
-  for (const [key, count] of Object.entries(estimate)) {
+  for (const [key, count] of Object.entries(values)) {
     if (key === prefix || key.startsWith(`${prefix}_`)) {
       sum += count;
       matched = true;
     }
   }
-  return matched ? sum : fallback;
+  return { matched, value: sum };
+}
+
+function exactEdgeValue(values: Record<string, number>, application: string, name: string): number {
+  return values[`${application}/${name}`] ?? 0;
 }
 
 export class ApiError extends Error {
@@ -136,7 +143,6 @@ let demoStreams: Stream[] = [
   { application: "backup", name: "disaster-recovery", enabled: false, recording_enabled: false, rtmp_url: demoRtmpUrl("backup", "disaster-recovery"), hls_path: "/hls/backup/disaster-recovery/index.m3u8", is_live: false, viewer_count: 0 }
 ];
 let demoTemplates: TemplateRecord[] = [];
-let demoAssignments: TranscodingAssignment[] = [];
 let demoSourceJobs: SourceTranscodeJob[] = [];
 
 const demoMetrics: Record<string, number> = {
@@ -172,6 +178,8 @@ function parsePrometheus(text: string): Record<string, number> {
 }
 
 export class ControlClient {
+  private edgeStatsCache?: { fetchedAt: number; value: EdgeDeliveryStats | null };
+
   constructor(
     public readonly demo = false,
     private baseUrl = "/api"
@@ -203,15 +211,41 @@ export class ControlClient {
   // Best-effort: served as a static file outside /api, and simply absent
   // until viewer-estimator.service has completed its first write, so a
   // missing/unreachable file falls back silently to the API's own count.
-  private async fetchViewerEstimate(): Promise<Record<string, number>> {
-    if (this.demo) return {};
+  private async fetchEdgeStats(): Promise<EdgeDeliveryStats | null> {
+    if (this.demo) return null;
+    const now = Date.now();
+    if (this.edgeStatsCache && now - this.edgeStatsCache.fetchedAt < 1000) {
+      return this.edgeStatsCache.value;
+    }
     try {
-      const response = await fetch("/internal/viewer_estimate.json", { headers: { Accept: "application/json" } });
-      if (!response.ok) return {};
-      const body = (await response.json()) as { viewers?: Record<string, number> };
-      return body.viewers ?? {};
+      const response = await fetch("/internal/viewer_estimate.json", {
+        cache: "no-store",
+        headers: { Accept: "application/json" }
+      });
+      if (!response.ok) throw new Error("edge stats unavailable");
+      const body = (await response.json()) as Partial<EdgeDeliveryStats>;
+      const maxAgeSeconds = Math.max(30, (body.window_seconds ?? 20) + 10);
+      if (!Number.isFinite(body.generated_at) || Math.abs(Date.now() / 1000 - (body.generated_at ?? 0)) > maxAgeSeconds) {
+        throw new Error("edge stats stale");
+      }
+      const cleanMap = (value: unknown): Record<string, number> => {
+        if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+        return Object.fromEntries(Object.entries(value).filter((entry): entry is [string, number] =>
+          typeof entry[1] === "number" && Number.isFinite(entry[1]) && entry[1] >= 0
+        ));
+      };
+      const stats: EdgeDeliveryStats = {
+        generated_at: body.generated_at as number,
+        window_seconds: Number(body.window_seconds) || 20,
+        viewers: cleanMap(body.viewers),
+        bytes_total: cleanMap(body.bytes_total),
+        bitrate_bps: cleanMap(body.bitrate_bps)
+      };
+      this.edgeStatsCache = { fetchedAt: now, value: stats };
+      return stats;
     } catch {
-      return {};
+      this.edgeStatsCache = { fetchedAt: now, value: null };
+      return null;
     }
   }
 
@@ -239,7 +273,7 @@ export class ControlClient {
       )
     ).flatMap((response) => response.items);
 
-    const viewerEstimate = await this.fetchViewerEstimate();
+    const edgeStats = await this.fetchEdgeStats();
     const withStatus = await Promise.all(
       streams.map(async (stream) => {
         try {
@@ -247,9 +281,31 @@ export class ControlClient {
             `/v1/streams/${encodeURIComponent(`${stream.application}:${stream.name}`)}/status`
           );
           const merged = { ...stream, ...status };
-          return { ...merged, viewer_count: realViewerCount(viewerEstimate, stream.application, stream.name, merged.viewer_count) };
+          const hlsViewers = edgeStats ? exactEdgeValue(edgeStats.viewers, stream.application, stream.name) : 0;
+          const hlsBytes = edgeStats ? exactEdgeValue(edgeStats.bytes_total, stream.application, stream.name) : 0;
+          return {
+            ...merged,
+            viewer_count: (merged.viewer_count ?? 0) + hlsViewers,
+            egress_bytes_total: (merged.egress_bytes_total ?? 0) + hlsBytes,
+            ...(edgeStats ? {
+              hls_viewer_count: hlsViewers,
+              hls_egress_bytes_total: hlsBytes,
+              hls_egress_bitrate_bps: exactEdgeValue(edgeStats.bitrate_bps, stream.application, stream.name)
+            } : {})
+          };
         } catch {
-          return { ...stream, viewer_count: realViewerCount(viewerEstimate, stream.application, stream.name, stream.viewer_count) };
+          const hlsViewers = edgeStats ? exactEdgeValue(edgeStats.viewers, stream.application, stream.name) : 0;
+          const hlsBytes = edgeStats ? exactEdgeValue(edgeStats.bytes_total, stream.application, stream.name) : 0;
+          return {
+            ...stream,
+            viewer_count: (stream.viewer_count ?? 0) + hlsViewers,
+            egress_bytes_total: (stream.egress_bytes_total ?? 0) + hlsBytes,
+            ...(edgeStats ? {
+              hls_viewer_count: hlsViewers,
+              hls_egress_bytes_total: hlsBytes,
+              hls_egress_bitrate_bps: exactEdgeValue(edgeStats.bitrate_bps, stream.application, stream.name)
+            } : {})
+          };
         }
       })
     );
@@ -262,6 +318,15 @@ export class ControlClient {
       if (response.ok) metrics = parsePrometheus(await response.text());
     } catch {
       // A metrics scrape failure degrades charts, not the control plane.
+    }
+
+    if (edgeStats) {
+      metrics.hls_active_viewers = Object.values(edgeStats.viewers).reduce((sum, value) => sum + value, 0);
+      metrics.hls_egress_bytes_total = Object.values(edgeStats.bytes_total).reduce((sum, value) => sum + value, 0);
+      metrics.hls_egress_bitrate = Object.values(edgeStats.bitrate_bps).reduce((sum, value) => sum + value, 0);
+      metrics.edge_delivery_stats_available = 1;
+    } else {
+      metrics.edge_delivery_stats_available = 0;
     }
 
     return { applications: appsResponse.items, streams: withStatus, metrics, health: "online" };
@@ -388,88 +453,28 @@ export class ControlClient {
     );
   }
 
-  async listTranscodingAssignments(application: string): Promise<TranscodingAssignment[]> {
-    if (this.demo) {
-      return demoAssignments.filter((item) => item.application === application).map((item) => ({ ...item, outputs: [...item.outputs] }));
-    }
-    const response = await this.request<{ items: TranscodingAssignment[] }>(
-      `/v1/transcoding/assignments?application=${encodeURIComponent(application)}`
-    );
-    return response.items;
-  }
-
-  async assignTranscodingTemplate(
-    stream: Stream,
-    templateName: string,
-    rules: string,
-    outputs: TranscodingOutput[]
-  ): Promise<TranscodingAssignment> {
-    if (this.demo) {
-      const assignment: TranscodingAssignment = {
-        application: stream.application,
-        source_stream: stream.name,
-        template_name: templateName,
-        master_hls_path: `/hls/${stream.application}/${stream.name}/master.m3u8`,
-        outputs
-      };
-      demoAssignments = [
-        ...demoAssignments.filter((item) => item.application !== stream.application || item.source_stream !== stream.name),
-        assignment
-      ];
-      return assignment;
-    }
-    const response = await fetch(
-      `${this.baseUrl}/v1/transcoding/assignments/${encodeURIComponent(`${stream.application}:${stream.name}`)}`,
-      {
-        method: "PUT",
-        headers: {
-          Accept: "application/json",
-          "Content-Type": "text/plain; charset=utf-8",
-          "X-Template-Name": templateName
-        },
-        body: rules
-      }
-    );
-    if (!response.ok) {
-      let message = `Request failed (${response.status})`;
-      try {
-        const body = (await response.json()) as { message?: string };
-        if (body.message) message = body.message;
-      } catch {
-        // Keep status-based fallback.
-      }
-      throw new ApiError(message, response.status, response.headers.get("X-Request-Id") ?? undefined);
-    }
-    return response.json() as Promise<TranscodingAssignment>;
-  }
-
-  async removeTranscodingAssignment(stream: Stream): Promise<void> {
-    if (this.demo) {
-      demoAssignments = demoAssignments.filter(
-        (item) => item.application !== stream.application || item.source_stream !== stream.name
-      );
-      return;
-    }
-    await this.request<{ deleted: boolean }>(
-      `/v1/transcoding/assignments/${encodeURIComponent(`${stream.application}:${stream.name}`)}`,
-      { method: "DELETE" }
-    );
-  }
-
   async listSourceTranscodes(application: string): Promise<SourceTranscodeJob[]> {
     if (this.demo) {
       return demoSourceJobs.filter((job) => job.application === application).map((job) => ({ ...job, outputs: [...job.outputs] }));
     }
-    const [response, viewerEstimate] = await Promise.all([
+    const [response, edgeStats] = await Promise.all([
       this.request<{ items: SourceTranscodeJob[] }>(
         `/v1/transcoding/source-jobs?application=${encodeURIComponent(application)}`
       ),
-      this.fetchViewerEstimate()
+      this.fetchEdgeStats()
     ]);
-    return response.items.map((job) => ({
-      ...job,
-      viewer_count: realViewerCount(viewerEstimate, job.application, job.name, job.viewer_count)
-    }));
+    return response.items.map((job) => {
+      if (!edgeStats) return job;
+      const viewers = aggregateEdgeValue(edgeStats.viewers, job.application, job.name);
+      const delivered = aggregateEdgeValue(edgeStats.bytes_total, job.application, job.name);
+      const rate = aggregateEdgeValue(edgeStats.bitrate_bps, job.application, job.name);
+      return {
+        ...job,
+        viewer_count: viewers.matched ? viewers.value : job.viewer_count,
+        bytes_total: delivered.matched ? delivered.value : job.bytes_total,
+        hls_egress_bitrate_bps: rate.matched ? rate.value : 0
+      };
+    });
   }
 
   async createSourceTranscode(

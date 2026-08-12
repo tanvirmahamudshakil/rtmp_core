@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Count active HLS playback sessions at the cache edge.
+"""Measure active HLS viewers and delivery traffic at the cache edge.
 
 Every fresh master/index playlist open receives a random ``viewer_session``
 from the origin. The same value is propagated into variant playlists and
 segments. Varnish logs every client request (including cache hits), so one
-recent session heartbeat equals one active player regardless of NAT/shared IP.
+recent session heartbeat equals one active player regardless of NAT/shared IP,
+and response bytes reflect what the cache actually delivered to that player.
 
 Only aggregate counts are persisted; session IDs never leave process memory.
 """
@@ -20,18 +21,37 @@ from urllib.parse import parse_qs, unquote, urlsplit
 
 WINDOW_SECONDS = 20
 WRITE_INTERVAL_SECONDS = 2
-MAX_SESSIONS_PER_STREAM = 50_000
-OUTPUT_PATH = "/var/lib/rtmp-server/viewer_estimate.json"
+BITRATE_WINDOW_SECONDS = 10
+try:
+    MAX_SESSIONS_PER_STREAM = max(
+        1, min(10_000_000, int(os.environ.get("RTMP_SERVER_MAXIMUM_VIEWERS_PER_STREAM", "2000000")))
+    )
+except ValueError:
+    MAX_SESSIONS_PER_STREAM = 2_000_000
+OUTPUT_PATH = "/var/www/streamforge/internal/viewer_estimate.json"
 PATH_RE = re.compile(r"^/hls/([^/]+)/([^/]+)/(index\.m3u8|segment-[^/]+\.ts)$")
 SESSION_RE = re.compile(r"^[0-9a-f]{32}$")
 
 # master stream key ("application/stream") -> {session: last_seen_monotonic}
 seen = defaultdict(dict)
+# Monotonic cache-edge body-byte counters and bounded one-second buckets used
+# for the current bitrate. These include HITs, MISSes and byte-range responses.
+delivered_bytes = defaultdict(int)
+traffic_buckets = defaultdict(dict)
 
 
-def parse_event(raw_url):
-    """Return (master_stream_key, session_id), or None for malformed noise."""
+def parse_event(raw_line):
+    """Return (master_stream_key, session_id, delivered_bytes), or None."""
     try:
+        method, status_text, bytes_text, raw_url = raw_line.split("\t", 3)
+        if method != "GET":
+            return None
+        status = int(status_text)
+        if status not in (200, 206):
+            return None
+        response_bytes = int(bytes_text)
+        if response_bytes < 0:
+            return None
         parsed = urlsplit(raw_url)
         match = PATH_RE.match(parsed.path)
         if not match:
@@ -54,8 +74,8 @@ def parse_event(raw_url):
         application = unquote(match.group(1))
         if not application or len(application) > 256 or "/" in application:
             return None
-        return f"{application}/{master_stream}", session
-    except (TypeError, ValueError, UnicodeError):
+        return f"{application}/{master_stream}", session, response_bytes
+    except (AttributeError, TypeError, ValueError, UnicodeError):
         return None
 
 
@@ -73,23 +93,42 @@ def prune_and_write(now=None):
         else:
             del seen[key]
 
+    current_second = int(now)
+    bitrate_bps = {}
+    for key, buckets in list(traffic_buckets.items()):
+        for second in list(buckets):
+            if second <= current_second - BITRATE_WINDOW_SECONDS:
+                del buckets[second]
+        if buckets:
+            oldest = min(buckets)
+            elapsed = max(1.0, min(float(BITRATE_WINDOW_SECONDS), now - oldest + 1.0))
+            bitrate_bps[key] = round(sum(buckets.values()) * 8 / elapsed)
+        else:
+            bitrate_bps[key] = 0
+
     payload = {
         "generated_at": time.time(),
         "window_seconds": WINDOW_SECONDS,
+        "bitrate_window_seconds": BITRATE_WINDOW_SECONDS,
         "identity": "playback_session",
         "viewers": counts,
+        "bytes_total": dict(delivered_bytes),
+        "bitrate_bps": bitrate_bps,
     }
     tmp_path = OUTPUT_PATH + ".tmp"
     with open(tmp_path, "w", encoding="utf-8") as output:
         json.dump(payload, output, separators=(",", ":"))
+    os.chmod(tmp_path, 0o644)
     os.replace(tmp_path, OUTPUT_PATH)
 
 
 def main():
     os.makedirs(os.path.dirname(OUTPUT_PATH), exist_ok=True)
     # %q is essential: it retains the per-player session on both HIT and MISS.
+    # %b is the response body size delivered by Varnish, so cache hits and
+    # partial content are accounted at the public delivery tier.
     proc = subprocess.Popen(
-        ["varnishncsa", "-c", "-F", "%U%q"],
+        ["varnishncsa", "-c", "-F", "%m\t%s\t%b\t%U%q"],
         stdout=subprocess.PIPE,
         bufsize=0,
     )
@@ -116,12 +155,16 @@ def main():
                     event = parse_event(raw_line.decode("utf-8", errors="replace"))
                     if event is None:
                         continue
-                    stream_key, session = event
+                    stream_key, session, response_bytes = event
                     sessions = seen[stream_key]
                     # Refresh known viewers even at the cap, but bound memory
                     # under a flood of fabricated session query strings.
                     if session in sessions or len(sessions) < MAX_SESSIONS_PER_STREAM:
                         sessions[session] = now
+                    delivered_bytes[stream_key] += response_bytes
+                    second = int(now)
+                    buckets = traffic_buckets[stream_key]
+                    buckets[second] = buckets.get(second, 0) + response_bytes
             # Write on a clock, not only when a request arrives. Otherwise the
             # final viewer could remain visible forever after stopping VLC.
             if now - last_write >= WRITE_INTERVAL_SECONDS:
