@@ -513,7 +513,9 @@ function Overview({
     <>
       <section className="metric-grid">
         <MetricCard icon={<Users size={20} />} label="Viewers now" value={compact(viewers)}
-          helper={`${compact(rtmpViewers)} RTMP · ${compact(hlsViewers)} HLS`} tone="amber" history={history} />
+          helper={edgeStatsAvailable
+            ? `${compact(rtmpViewers)} RTMP · ${compact(hlsViewers)} HLS`
+            : `${compact(rtmpViewers)} RTMP · HLS accounting unavailable`} tone="amber" history={history} />
         <MetricCard icon={<RadioTower size={20} />} label="Live links" value={compact(liveLinks)}
           helper={`${configuredLinks} playback links configured`} tone="teal" />
         <MetricCard icon={<ArrowUpRight size={20} />} label="Bandwidth out" value={bitrate(egress)}
@@ -784,16 +786,20 @@ function ApplicationDetailPage({
     setCopiedUrl(url);
     window.setTimeout(() => setCopiedUrl((current) => current === url ? null : current), 1500);
   };
-  const loadSourceJobs = useCallback(async () => {
+  const loadSourceJobs = useCallback(async (quiet = false) => {
     try {
       setSourceJobs(await client.listSourceTranscodes(application.name));
     } catch (error) {
-      onNotify("error", error instanceof Error ? error.message : "Could not load source transcodes.");
+      if (!quiet) onNotify("error", error instanceof Error ? error.message : "Could not load source transcodes.");
     }
   }, [application.name, client, onNotify]);
 
   useEffect(() => {
     loadSourceJobs();
+    const timer = window.setInterval(() => {
+      if (document.visibilityState === "visible") loadSourceJobs(true);
+    }, 5000);
+    return () => window.clearInterval(timer);
   }, [loadSourceJobs]);
 
   const startSourceTranscode = async () => {
@@ -962,6 +968,20 @@ function ApplicationDetailPage({
                         <small>{bitrate(output.video_bitrate)} · {output.video_codec.toUpperCase()}</small>
                       </span>
                     ))}
+                  </div>
+                  <div className="source-job-metrics">
+                    <div>
+                      <span><Users size={14} /> Viewers now</span>
+                      <strong>{job.delivery_stats_available === false || job.status !== "running" ? "—" : compact(job.viewer_count ?? 0)}</strong>
+                    </div>
+                    <div>
+                      <span><ArrowUpRight size={14} /> Bandwidth now</span>
+                      <strong>{job.delivery_stats_available === false || job.status !== "running" ? "—" : bitrate(job.hls_egress_bitrate_bps ?? 0)}</strong>
+                    </div>
+                    <div>
+                      <span><Database size={14} /> Delivered</span>
+                      <strong>{job.delivery_stats_available === false ? "—" : bytes(job.bytes_total ?? 0)}</strong>
+                    </div>
                   </div>
                   {job.enabled ? (
                     <div className="master-url-row">
@@ -1746,12 +1766,25 @@ function App() {
         const key = `${stream.application}:${stream.name}`;
         const bytes = stream.egress_bytes_total;
         if (bytes === undefined) continue;
-        const previous = samples.get(key);
-        // Only trust a delta between two samples of a still-live stream: a
-        // restart resets the counter, and negative/zero elapsed time can't
-        // give a meaningful rate.
-        if (previous && bytes >= previous.bytes && now > previous.time) {
-          nextBandwidth[key] = ((bytes - previous.bytes) * 8) / ((now - previous.time) / 1000);
+        if (stream.hls_egress_bitrate_bps !== undefined && stream.rtmp_egress_bytes_total !== undefined) {
+          // Cache egress already has an edge-measured rolling rate. Add only
+          // the RTMP byte delta here; deriving a second HLS rate from its
+          // cumulative counter would make cache restarts and poll jitter show
+          // false bandwidth spikes.
+          let rate = stream.hls_egress_bitrate_bps;
+          const rtmpSampleKey = `rtmp:${key}`;
+          const previousRtmp = samples.get(rtmpSampleKey);
+          if (previousRtmp && stream.rtmp_egress_bytes_total >= previousRtmp.bytes && now > previousRtmp.time) {
+            rate += ((stream.rtmp_egress_bytes_total - previousRtmp.bytes) * 8) / ((now - previousRtmp.time) / 1000);
+          }
+          samples.set(rtmpSampleKey, { bytes: stream.rtmp_egress_bytes_total, time: now });
+          nextBandwidth[key] = rate;
+        } else {
+          const previous = samples.get(key);
+          // Only trust a non-resetting counter and positive elapsed time.
+          if (previous && bytes >= previous.bytes && now > previous.time) {
+            nextBandwidth[key] = ((bytes - previous.bytes) * 8) / ((now - previous.time) / 1000);
+          }
         }
         samples.set(key, { bytes, time: now });
       }

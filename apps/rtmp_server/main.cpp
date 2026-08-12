@@ -500,7 +500,7 @@ int main(int argc, char** argv) {
     rtmp_server::transcoding::native::SourceJobManager source_job_manager(std::move(source_hooks),
                                                                           "/hls");
 
-    const auto source_job_json = [&hls_handler](const rtmp_server::transcoding::native::SourceJobSnapshot& job) {
+    const auto source_job_json = [&hls_handler, &config](const rtmp_server::transcoding::native::SourceJobSnapshot& job) {
         auto esc = [](std::string_view v) {
             std::string out;
             for (char c : v) {
@@ -524,7 +524,9 @@ int main(int argc, char** argv) {
            << (job.enabled ? "true" : "false") << R"(,"auto_restart":)"
            << (job.auto_restart ? "true" : "false") << R"(,"restart_delay_seconds":)"
            << job.restart_delay_seconds << R"(,"bytes_total":)" << link_stats.bytes_total
-           << R"(,"viewer_count":)" << link_stats.viewer_count << R"(,"outputs":[)";
+           << R"(,"viewer_count":)" << link_stats.viewer_count
+           << R"(,"delivery_stats_available":)" << (!config.hls_high_scale_mode ? "true" : "false")
+           << R"(,"outputs":[)";
         for (std::size_t i = 0; i < job.renditions.size(); ++i) {
             const auto& r = job.renditions[i];
             if (i) os << ',';

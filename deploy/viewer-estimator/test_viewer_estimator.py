@@ -53,7 +53,41 @@ class ViewerEstimatorTest(unittest.TestCase):
         self.assertEqual(snapshot["viewers"], {"live/demo": 2})
         self.assertEqual(snapshot["bytes_total"], {"live/demo": 3000})
         self.assertGreater(snapshot["bitrate_bps"]["live/demo"], 0)
+        self.assertEqual(snapshot["totals"]["viewers"], 2)
+        self.assertEqual(snapshot["totals"]["bytes_total"], 3000)
+        self.assertEqual(snapshot["totals"]["bitrate_bps"], snapshot["bitrate_bps"]["live/demo"])
         self.assertNotIn("live/expired", snapshot["viewers"])
+
+    def test_global_viewer_total_unions_same_session_across_keys(self):
+        now = 100.5
+        estimator.seen["live/demo"]["shared-session"] = now
+        estimator.seen["live/demo_720p"]["shared-session"] = now
+
+        with tempfile.TemporaryDirectory() as directory:
+            output = os.path.join(directory, "viewer_estimate.json")
+            with mock.patch.object(estimator, "OUTPUT_PATH", output):
+                estimator.prune_and_write(now)
+            with open(output, encoding="utf-8") as snapshot_file:
+                snapshot = json.load(snapshot_file)
+
+        self.assertEqual(sum(snapshot["viewers"].values()), 2)
+        self.assertEqual(snapshot["totals"]["viewers"], 1)
+
+    def test_global_bitrate_uses_one_shared_measurement_window(self):
+        now = 100.5
+        estimator.traffic_buckets["live/established"][91] = 1000
+        estimator.traffic_buckets["live/new"][100] = 1000
+
+        with tempfile.TemporaryDirectory() as directory:
+            output = os.path.join(directory, "viewer_estimate.json")
+            with mock.patch.object(estimator, "OUTPUT_PATH", output):
+                estimator.prune_and_write(now)
+            with open(output, encoding="utf-8") as snapshot_file:
+                snapshot = json.load(snapshot_file)
+
+        expected = round(2000 * 8 / 9.5)
+        self.assertEqual(snapshot["totals"]["bitrate_bps"], expected)
+        self.assertNotEqual(snapshot["totals"]["bitrate_bps"], sum(snapshot["bitrate_bps"].values()))
 
 
 if __name__ == "__main__":

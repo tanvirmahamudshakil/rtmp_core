@@ -1413,6 +1413,24 @@ tbody tr:hover { background: #fcfcfd; }
 .rendition-list b, .rendition-list small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .rendition-list b { color: #167d76; font-size: 10px; }
 .rendition-list small { margin-top: 4px; color: var(--muted); font-size: 8px; }
+.source-job-metrics {
+  margin-top: 10px;
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 7px;
+}
+.source-job-metrics > div {
+  min-width: 0;
+  padding: 10px;
+  background: #fbfcfe;
+  border: 1px solid #e6eaf0;
+  border-radius: 8px;
+}
+.source-job-metrics span,
+.source-job-metrics strong { display: flex; align-items: center; gap: 5px; }
+.source-job-metrics span { color: var(--muted); font-size: 8px; font-weight: 700; }
+.source-job-metrics span svg { flex: none; color: var(--teal); }
+.source-job-metrics strong { margin-top: 6px; color: var(--ink); font-size: 12px; letter-spacing: -.02em; }
 .master-url-row {
   min-width: 0;
   margin-top: 10px;
@@ -1483,6 +1501,7 @@ tbody tr:hover { background: #fcfcfd; }
   .source-workspace-heading { align-items: flex-start; }
   .assignment-grid { padding: 12px; }
   .rendition-list { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .source-job-metrics { grid-template-columns: 1fr; }
   .preset-workspace-heading { align-items: flex-start; flex-direction: column; }
   .preset-workspace-heading .primary-button { width: 100%; }
   .preset-card-stats { grid-template-columns: 1fr; }

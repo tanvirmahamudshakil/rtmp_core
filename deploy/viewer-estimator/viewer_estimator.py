@@ -84,27 +84,41 @@ def prune_and_write(now=None):
         now = time.monotonic()
     cutoff = now - WINDOW_SECONDS
     counts = {}
+    active_sessions = set()
     for key, sessions in list(seen.items()):
         for session, last_seen in list(sessions.items()):
             if last_seen < cutoff:
                 del sessions[session]
         if sessions:
             counts[key] = len(sessions)
+            active_sessions.update(sessions)
         else:
             del seen[key]
 
     current_second = int(now)
     bitrate_bps = {}
+    aggregate_buckets = defaultdict(int)
     for key, buckets in list(traffic_buckets.items()):
         for second in list(buckets):
             if second <= current_second - BITRATE_WINDOW_SECONDS:
                 del buckets[second]
         if buckets:
+            for second, response_bytes in buckets.items():
+                aggregate_buckets[second] += response_bytes
             oldest = min(buckets)
-            elapsed = max(1.0, min(float(BITRATE_WINDOW_SECONDS), now - oldest + 1.0))
+            # `oldest` is the beginning of its one-second bucket. Measure from
+            # that boundary to now; adding a whole extra second systematically
+            # understated the live rate, especially for a newly active link.
+            elapsed = max(1.0, min(float(BITRATE_WINDOW_SECONDS), now - oldest))
             bitrate_bps[key] = round(sum(buckets.values()) * 8 / elapsed)
         else:
             bitrate_bps[key] = 0
+
+    total_bitrate_bps = 0
+    if aggregate_buckets:
+        oldest = min(aggregate_buckets)
+        elapsed = max(1.0, min(float(BITRATE_WINDOW_SECONDS), now - oldest))
+        total_bitrate_bps = round(sum(aggregate_buckets.values()) * 8 / elapsed)
 
     payload = {
         "generated_at": time.time(),
@@ -114,6 +128,14 @@ def prune_and_write(now=None):
         "viewers": counts,
         "bytes_total": dict(delivered_bytes),
         "bitrate_bps": bitrate_bps,
+        # Pre-aggregated totals let consumers avoid summing per-link viewer
+        # counts. A playback session can briefly appear under more than one key
+        # during an ABR switch or rolling upgrade and must still count once.
+        "totals": {
+            "viewers": len(active_sessions),
+            "bytes_total": sum(delivered_bytes.values()),
+            "bitrate_bps": total_bitrate_bps,
+        },
     }
     tmp_path = OUTPUT_PATH + ".tmp"
     with open(tmp_path, "w", encoding="utf-8") as output:

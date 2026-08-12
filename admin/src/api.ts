@@ -16,6 +16,7 @@ export type Stream = {
   // snapshot. Monotonic while live; the caller derives a per-link bitrate
   // from the delta between two snapshots (see bandwidthFromSamples in App.tsx).
   egress_bytes_total?: number;
+  rtmp_egress_bytes_total?: number;
   hls_viewer_count?: number;
   hls_egress_bytes_total?: number;
   hls_egress_bitrate_bps?: number;
@@ -63,6 +64,7 @@ export type SourceTranscodeJob = {
   bytes_total?: number;
   viewer_count?: number;
   hls_egress_bitrate_bps?: number;
+  delivery_stats_available?: boolean;
 };
 
 // A transcoding template as persisted server-side (SQLite): a name plus its
@@ -89,24 +91,34 @@ type EdgeDeliveryStats = {
   viewers: Record<string, number>;
   bytes_total: Record<string, number>;
   bitrate_bps: Record<string, number>;
+  totals: {
+    viewers: number;
+    bytes_total: number;
+    bitrate_bps: number;
+  };
 };
 
 // Varnish sees every HLS request, including cache hits. The edge estimator
 // republishes active playback-session counts keyed directly by the master
 // link (e.g. "kk/RRR") at /internal/viewer_estimate.json. Session identity,
 // unlike IP identity, counts multiple VLC players behind one NAT separately.
-// Legacy per-rendition keys are still summed during rolling upgrades.
-function aggregateEdgeValue(
+// Include the master key emitted by current servers. During a rolling upgrade,
+// older sessions may still be keyed by exact rendition output names; use the
+// job's declared outputs rather than a name prefix so similarly named jobs
+// (for example "news" and "news_backup") can never absorb each other's data.
+function sourceEdgeValue(
   values: Record<string, number>,
   application: string,
-  name: string
+  name: string,
+  outputs: TranscodingOutput[]
 ): { matched: boolean; value: number } {
-  const prefix = `${application}/${name}`;
   let sum = 0;
   let matched = false;
-  for (const [key, count] of Object.entries(values)) {
-    if (key === prefix || key.startsWith(`${prefix}_`)) {
-      sum += count;
+  const streamNames = new Set([name, ...outputs.map((output) => output.stream)]);
+  for (const streamName of streamNames) {
+    const key = `${application}/${streamName}`;
+    if (Object.hasOwn(values, key)) {
+      sum += values[key];
       matched = true;
     }
   }
@@ -239,7 +251,24 @@ export class ControlClient {
         window_seconds: Number(body.window_seconds) || 20,
         viewers: cleanMap(body.viewers),
         bytes_total: cleanMap(body.bytes_total),
-        bitrate_bps: cleanMap(body.bitrate_bps)
+        bitrate_bps: cleanMap(body.bitrate_bps),
+        totals: {
+          viewers: 0,
+          bytes_total: 0,
+          bitrate_bps: 0
+        }
+      };
+      const totals = body.totals;
+      stats.totals = {
+        viewers: typeof totals?.viewers === "number" && Number.isFinite(totals.viewers) && totals.viewers >= 0
+          ? totals.viewers
+          : Object.values(stats.viewers).reduce((sum, value) => sum + value, 0),
+        bytes_total: typeof totals?.bytes_total === "number" && Number.isFinite(totals.bytes_total) && totals.bytes_total >= 0
+          ? totals.bytes_total
+          : Object.values(stats.bytes_total).reduce((sum, value) => sum + value, 0),
+        bitrate_bps: typeof totals?.bitrate_bps === "number" && Number.isFinite(totals.bitrate_bps) && totals.bitrate_bps >= 0
+          ? totals.bitrate_bps
+          : Object.values(stats.bitrate_bps).reduce((sum, value) => sum + value, 0)
       };
       this.edgeStatsCache = { fetchedAt: now, value: stats };
       return stats;
@@ -281,12 +310,14 @@ export class ControlClient {
             `/v1/streams/${encodeURIComponent(`${stream.application}:${stream.name}`)}/status`
           );
           const merged = { ...stream, ...status };
+          const rtmpBytes = merged.egress_bytes_total ?? 0;
           const hlsViewers = edgeStats ? exactEdgeValue(edgeStats.viewers, stream.application, stream.name) : 0;
           const hlsBytes = edgeStats ? exactEdgeValue(edgeStats.bytes_total, stream.application, stream.name) : 0;
           return {
             ...merged,
             viewer_count: (merged.viewer_count ?? 0) + hlsViewers,
-            egress_bytes_total: (merged.egress_bytes_total ?? 0) + hlsBytes,
+            egress_bytes_total: rtmpBytes + hlsBytes,
+            rtmp_egress_bytes_total: rtmpBytes,
             ...(edgeStats ? {
               hls_viewer_count: hlsViewers,
               hls_egress_bytes_total: hlsBytes,
@@ -296,10 +327,12 @@ export class ControlClient {
         } catch {
           const hlsViewers = edgeStats ? exactEdgeValue(edgeStats.viewers, stream.application, stream.name) : 0;
           const hlsBytes = edgeStats ? exactEdgeValue(edgeStats.bytes_total, stream.application, stream.name) : 0;
+          const rtmpBytes = stream.egress_bytes_total ?? 0;
           return {
             ...stream,
             viewer_count: (stream.viewer_count ?? 0) + hlsViewers,
-            egress_bytes_total: (stream.egress_bytes_total ?? 0) + hlsBytes,
+            egress_bytes_total: rtmpBytes + hlsBytes,
+            rtmp_egress_bytes_total: rtmpBytes,
             ...(edgeStats ? {
               hls_viewer_count: hlsViewers,
               hls_egress_bytes_total: hlsBytes,
@@ -321,9 +354,9 @@ export class ControlClient {
     }
 
     if (edgeStats) {
-      metrics.hls_active_viewers = Object.values(edgeStats.viewers).reduce((sum, value) => sum + value, 0);
-      metrics.hls_egress_bytes_total = Object.values(edgeStats.bytes_total).reduce((sum, value) => sum + value, 0);
-      metrics.hls_egress_bitrate = Object.values(edgeStats.bitrate_bps).reduce((sum, value) => sum + value, 0);
+      metrics.hls_active_viewers = edgeStats.totals.viewers;
+      metrics.hls_egress_bytes_total = edgeStats.totals.bytes_total;
+      metrics.hls_egress_bitrate = edgeStats.totals.bitrate_bps;
       metrics.edge_delivery_stats_available = 1;
     } else {
       metrics.edge_delivery_stats_available = 0;
@@ -465,14 +498,15 @@ export class ControlClient {
     ]);
     return response.items.map((job) => {
       if (!edgeStats) return job;
-      const viewers = aggregateEdgeValue(edgeStats.viewers, job.application, job.name);
-      const delivered = aggregateEdgeValue(edgeStats.bytes_total, job.application, job.name);
-      const rate = aggregateEdgeValue(edgeStats.bitrate_bps, job.application, job.name);
+      const viewers = sourceEdgeValue(edgeStats.viewers, job.application, job.name, job.outputs);
+      const delivered = sourceEdgeValue(edgeStats.bytes_total, job.application, job.name, job.outputs);
+      const rate = sourceEdgeValue(edgeStats.bitrate_bps, job.application, job.name, job.outputs);
       return {
         ...job,
         viewer_count: viewers.matched ? viewers.value : job.viewer_count,
         bytes_total: delivered.matched ? delivered.value : job.bytes_total,
-        hls_egress_bitrate_bps: rate.matched ? rate.value : 0
+        hls_egress_bitrate_bps: rate.matched ? rate.value : 0,
+        delivery_stats_available: true
       };
     });
   }
