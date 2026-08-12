@@ -23,11 +23,12 @@ std::string session_query(std::string_view session, std::string_view master = "d
     return "viewer_session=" + std::string(session) + "&viewer_stream=" + std::string(master);
 }
 
-hls::SegmentPtr make_segment(std::uint64_t sequence, std::size_t bytes = 1024) {
+hls::SegmentPtr make_segment(std::uint64_t sequence, std::size_t bytes = 1024,
+                             std::chrono::milliseconds duration = 4000ms) {
     auto segment = std::make_shared<hls::Segment>();
     segment->sequence = sequence;
     segment->name = "segment-" + std::to_string(sequence) + ".ts";
-    segment->duration = 4000ms;
+    segment->duration = duration;
     segment->data = core::SharedBuffer::adopt(std::vector<std::byte>(bytes, std::byte{0x47}));
     return segment;
 }
@@ -606,6 +607,46 @@ TEST(HlsHttpTest, SegmentDeliveryAlsoCountsTowardsLinkStats) {
     const auto stats = handler.link_stats("live", "demo");
     EXPECT_EQ(stats.bytes_total, segment.payload_size());
     EXPECT_EQ(stats.viewer_count, 1u);
+}
+
+TEST(HlsHttpTest, SourceOutageKeepsTheSameViewerSessionAndRecoveryResumesIt) {
+    HlsHttpOptions options;
+    options.enable_playback_sessions = true;
+    HlsHttpHandler handler{options};
+
+    hls::SegmentStoreConfig store_config;
+    store_config.repeat_last_segment_on_stall = true;
+    auto store = std::make_shared<hls::SegmentStore>(store_config);
+    store->add_segment(make_segment(100, 1024, 20ms));
+    handler.register_stream("live", "demo", store);
+
+    const auto query = session_query(kSessionA);
+    ASSERT_EQ(handler.handle(get("/hls/live/demo/index.m3u8", query)).status, 200);
+    ASSERT_EQ(handler.link_stats("live", "demo").viewer_count, 1u);
+
+    // No producer media arrives: the same playlist request creates a fresh
+    // URL for the last good bytes, so neither the player nor its session sees
+    // a 404 while source recovery is running.
+    std::this_thread::sleep_for(35ms);
+    const auto outage_playlist = handler.handle(get("/hls/live/demo/index.m3u8", query));
+    ASSERT_EQ(outage_playlist.status, 200);
+    EXPECT_NE(outage_playlist.body.find("segment-101.ts?" + query), std::string::npos)
+        << outage_playlist.body;
+    const auto fallback = handler.handle(get("/hls/live/demo/segment-101.ts", query));
+    ASSERT_EQ(fallback.status, 200);
+    EXPECT_EQ(handler.link_stats("live", "demo").viewer_count, 1u);
+
+    // The producer allocated sequence 101 before fallback did. Recovery is
+    // re-numbered to 102 and delivered to the original session, not a new one.
+    store->add_segment(make_segment(101, 2048, 20ms));
+    const auto recovered_playlist = handler.handle(get("/hls/live/demo/index.m3u8", query));
+    ASSERT_EQ(recovered_playlist.status, 200);
+    EXPECT_NE(recovered_playlist.body.find("segment-102.ts?" + query), std::string::npos)
+        << recovered_playlist.body;
+    const auto recovered = handler.handle(get("/hls/live/demo/segment-102.ts", query));
+    ASSERT_EQ(recovered.status, 200);
+    EXPECT_EQ(recovered.payload_size(), 2048u);
+    EXPECT_EQ(handler.link_stats("live", "demo").viewer_count, 1u);
 }
 
 TEST(HlsHttpTest, MasterPlaylistRequestsDoNotCountTowardsLinkStats) {
