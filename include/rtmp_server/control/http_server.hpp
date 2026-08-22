@@ -60,7 +60,7 @@ using HttpHandler = std::function<HttpResponse(const HttpRequest&)>;
 // (docs/v2_promot.md section 3.5): connection backlog, header/body size,
 // and the number of requests allowed to be queued waiting for a worker
 // thread. A client that would exceed these gets a fast, bounded rejection
-// (a closed connection or a 4xx/503) instead of unbounded memory growth or
+// (a 4xx/503 response) instead of unbounded memory growth or
 // an unbounded thread count.
 struct HttpServerOptions {
     std::string bind_address = "127.0.0.1";
@@ -94,8 +94,8 @@ struct HttpServerOptions {
 // threads — never on an RTMP/io_uring event-loop thread — so a slow
 // handler (e.g. one that ends up doing a database lookup) can never block
 // media processing (docs/v2_promot.md section 3.6). The queue between
-// accept and workers is bounded: once full, new connections are closed
-// immediately rather than queued without limit (section 3.5).
+// accept and workers is bounded: once full, new connections receive 503
+// immediately rather than being queued without limit (section 3.5).
 class HttpServer {
 public:
     explicit HttpServer(HttpServerOptions options);

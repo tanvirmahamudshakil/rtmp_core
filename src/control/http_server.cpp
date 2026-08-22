@@ -299,15 +299,31 @@ void HttpServer::accept_loop() {
         char ip_buf[INET_ADDRSTRLEN] = {};
         ::inet_ntop(AF_INET, &peer.sin_addr, ip_buf, sizeof(ip_buf));
 
-        std::lock_guard<std::mutex> lock(queue_mutex_);
-        if (shutting_down_ || pending_.size() >= options_.max_pending_requests) {
-            // Bounded queue (docs/v2_promot.md section 3.5 "Pending
-            // management requests"): reject rather than grow unbounded.
-            ::close(client_fd);
-            continue;
+        bool overloaded = false;
+        {
+            std::lock_guard<std::mutex> lock(queue_mutex_);
+            if (shutting_down_) {
+                ::close(client_fd);
+                continue;
+            }
+            if (pending_.size() >= options_.max_pending_requests) {
+                overloaded = true;
+            } else {
+                pending_.push_back(PendingConnection{client_fd, std::string(ip_buf)});
+                queue_cv_.notify_one();
+            }
         }
-        pending_.push_back(PendingConnection{client_fd, std::string(ip_buf)});
-        queue_cv_.notify_one();
+        if (overloaded) {
+            // Give reverse proxies and players an explicit retryable response
+            // instead of an empty reply/reset that can surface as an unrelated
+            // media/decode failure. Keep this best-effort and outside the queue
+            // lock so a slow peer cannot block workers from draining requests.
+            HttpResponse response = HttpResponse::json(503, R"({"error":"server_overloaded"})");
+            response.headers["Cache-Control"] = "no-store";
+            response.headers["Retry-After"] = "1";
+            write_response(client_fd, response, false);
+            ::close(client_fd);
+        }
     }
 }
 

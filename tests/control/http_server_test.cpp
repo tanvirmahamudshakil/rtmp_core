@@ -77,7 +77,7 @@ TEST(HttpServerTest, RejectsBodyLargerThanConfiguredLimit) {
     server.stop();
 }
 
-TEST(HttpServerTest, ConnectionsBeyondPendingQueueAreRejectedNotQueuedForever) {
+TEST(HttpServerTest, ConnectionsBeyondPendingQueueReceiveRetryable503) {
     HttpServerOptions options;
     options.port = 0;
     options.worker_threads = 1;
@@ -92,18 +92,21 @@ TEST(HttpServerTest, ConnectionsBeyondPendingQueueAreRejectedNotQueuedForever) {
     ASSERT_TRUE(server.start());
 
     // Fire several connections concurrently; with only one worker and a
-    // pending-queue depth of one, at least one must be closed (not served)
-    // rather than left to queue without bound.
+    // pending-queue depth of one, at least one must receive an explicit 503
+    // rather than an empty reply or being left queued without bound.
     std::vector<std::thread> clients;
-    std::atomic<int> closed_count{0};
+    std::atomic<int> overloaded_count{0};
     for (int i = 0; i < 6; ++i) {
         clients.emplace_back([&] {
             auto resp = do_request(server.bound_port(), "GET /slow HTTP/1.1\r\nHost: x\r\n\r\n");
-            if (resp.empty()) ++closed_count;
+            if (resp.find("503 Service Unavailable") != std::string::npos &&
+                resp.find("Retry-After: 1") != std::string::npos) {
+                ++overloaded_count;
+            }
         });
     }
     for (auto& t : clients) t.join();
 
-    EXPECT_GT(closed_count.load(), 0);
+    EXPECT_GT(overloaded_count.load(), 0);
     server.stop();
 }

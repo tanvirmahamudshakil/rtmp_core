@@ -69,7 +69,8 @@ transcoding_max_outputs_per_job: 16
 transcoding_max_restart_attempts: 5
 
 # Public cached HLS mode. Every viewer gets a lightweight playback session for
-# edge counting, while all viewers share the same immutable Varnish segment
+# edge counting. Session-bearing media playlists are micro-cached with no
+# viewer state in their body, and all viewers share immutable Varnish segment
 # objects. Origin delivery-stat locking stays disabled; viewer and bandwidth
 # totals come from viewer-estimator.service at the cache edge.
 hls_high_scale_mode: true

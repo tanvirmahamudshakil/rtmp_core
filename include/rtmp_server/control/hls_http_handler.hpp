@@ -30,22 +30,31 @@ struct HlsHttpOptions {
     std::string token_signing_secret;
 
     // Give every fresh playlist open a distinct, opaque playback session.
-    // The session travels in playlist/segment query strings, allowing an
-    // edge cache to count two VLC instances behind the same NAT separately.
+    // It normally travels in playlist/segment query strings. Shared-playlist
+    // mode keeps it on the recurring playlist URL instead, still allowing the
+    // edge to count two VLC instances behind the same NAT separately.
     bool enable_playback_sessions = false;
     // Injectable only so tests can make redirects deterministic. Empty uses
     // core::generate_secure_token(16), i.e. 128 bits from OpenSSL RAND_bytes.
     std::function<std::string()> playback_session_id_factory;
+
+    // Keep the per-player redirect/session identity, but make the resulting
+    // playlist body safe for a shared reverse-cache object. The redirect adds
+    // `viewer_cache=1`; the production VCL only caches playlist requests that
+    // carry that marker. Child playlist/segment URIs are deliberately left
+    // undecorated, so one viewer's session can never leak through a cached
+    // response body. The edge still counts recurring playlist requests by
+    // their session-bearing public URL.
+    bool enable_shared_playlist_cache = false;
 
     // Delivery accounting takes the handler's shared registry mutex on every
     // cache miss. Disable it when a shared reverse cache is the viewer-facing
     // delivery tier; edge/cache metrics should be used at that scale instead.
     bool track_delivery_stats = true;
 
-    // Token/session query values have to be copied into child playlist URIs.
-    // A reverse cache may still normalize segment cache keys while preserving
-    // this query in its access log; the production Varnish profile does so to
-    // keep per-player accounting accurate on cache hits.
+    // Token/session query values normally have to be copied into child
+    // playlist URIs. Shared-playlist mode overrides this to false because a
+    // cached body must contain no viewer-specific state.
     bool propagate_query_to_playlist_uris = true;
 
     // Cache-Control for the live media playlist. A live playlist changes

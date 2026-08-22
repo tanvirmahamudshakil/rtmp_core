@@ -33,6 +33,7 @@ std::unordered_map<std::string, std::string> parse_query(std::string_view query)
 
 constexpr std::string_view kPlaybackSessionParam = "viewer_session";
 constexpr std::string_view kPlaybackStreamParam = "viewer_stream";
+constexpr std::string_view kSharedCacheParam = "viewer_cache";
 
 bool is_playback_session(std::string_view value) {
     if (value.size() != 32) return false;
@@ -73,7 +74,8 @@ std::string query_without_session_params(std::string_view query) {
         const auto pair = query.substr(pos, amp == std::string_view::npos ? std::string_view::npos : amp - pos);
         const auto eq = pair.find('=');
         const auto key = pair.substr(0, eq);
-        if (!pair.empty() && key != kPlaybackSessionParam && key != kPlaybackStreamParam) {
+        if (!pair.empty() && key != kPlaybackSessionParam && key != kPlaybackStreamParam &&
+            key != kSharedCacheParam) {
             if (!out.empty()) out.push_back('&');
             out.append(pair);
         }
@@ -185,7 +187,14 @@ bool parse_range(std::string_view header, std::size_t size, std::size_t& start, 
 
 } // namespace
 
-HlsHttpHandler::HlsHttpHandler(HlsHttpOptions options) : options_(std::move(options)) {}
+HlsHttpHandler::HlsHttpHandler(HlsHttpOptions options) : options_(std::move(options)) {
+    // A shared playlist object must be identical for every viewer. Enforce the
+    // invariant here as well as in production wiring so a future caller cannot
+    // accidentally cache one session's query inside another viewer's body.
+    if (options_.enable_shared_playlist_cache) {
+        options_.propagate_query_to_playlist_uris = false;
+    }
+}
 
 void HlsHttpHandler::register_stream(const std::string& application, const std::string& stream,
                                      std::shared_ptr<hls::SegmentStore> store) {
@@ -376,7 +385,10 @@ HttpResponse HlsHttpHandler::serve_master_playlist(const HttpRequest& request, c
     if (options_.propagate_query_to_playlist_uris) {
         append_query_to_playlist_uris(response.body, request.query);
     }
-    decorate(response, options_.enable_playback_sessions ? "private, no-store" : options_.master_cache_control);
+    decorate(response,
+             options_.enable_playback_sessions && !options_.enable_shared_playlist_cache
+                 ? "private, no-store"
+                 : options_.master_cache_control);
     return response;
 }
 
@@ -500,17 +512,20 @@ HttpResponse HlsHttpHandler::handle(const HttpRequest& request) {
     }
 
     // A public, stable HLS URL starts a fresh playback session on each open.
-    // VLC and every standards-compliant HTTP client follow this redirect,
-    // then copy the query carried by master -> media -> segment playlists.
-    // Segment cache identity is normalised at Varnish, independently of this
-    // per-player query, so session counting never sacrifices cache sharing.
+    // Normal/private mode propagates that query through child URIs. Shared
+    // mode adds viewer_cache=1 to the redirect but keeps playlist bodies
+    // query-free; Varnish logs the session-bearing playlist URL while safely
+    // serving the same body object to every viewer.
     if (options_.enable_playback_sessions && ends_with(resource, ".m3u8")) {
         const auto params = parse_query(request.query);
         const auto session_it = params.find(std::string(kPlaybackSessionParam));
         const auto stream_it = params.find(std::string(kPlaybackStreamParam));
+        const auto shared_cache_it = params.find(std::string(kSharedCacheParam));
         const bool valid_session = session_it != params.end() && is_playback_session(session_it->second);
         const bool valid_stream = stream_it != params.end() && !stream_it->second.empty();
-        if (!valid_session || !valid_stream) {
+        const bool valid_cache_route = !options_.enable_shared_playlist_cache ||
+                                       (shared_cache_it != params.end() && shared_cache_it->second == "1");
+        if (!valid_session || !valid_stream || !valid_cache_route) {
             const std::string session = options_.playback_session_id_factory
                 ? options_.playback_session_id_factory()
                 : core::generate_secure_token(16);
@@ -523,6 +538,9 @@ HttpResponse HlsHttpHandler::handle(const HttpRequest& request) {
             if (!query.empty()) query.push_back('&');
             query += std::string(kPlaybackSessionParam) + "=" + session;
             query += "&" + std::string(kPlaybackStreamParam) + "=" + percent_encode(stream);
+            if (options_.enable_shared_playlist_cache) {
+                query += "&" + std::string(kSharedCacheParam) + "=1";
+            }
             HttpResponse redirect;
             redirect.status = 302;
             redirect.content_type = "text/plain";

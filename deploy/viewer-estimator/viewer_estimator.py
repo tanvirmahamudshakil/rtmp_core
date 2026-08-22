@@ -2,10 +2,11 @@
 """Measure active HLS viewers and delivery traffic at the cache edge.
 
 Every fresh master/index playlist open receives a random ``viewer_session``
-from the origin. The same value is propagated into variant playlists and
-segments. Varnish logs every client request (including cache hits), so one
-recent session heartbeat equals one active player regardless of NAT/shared IP,
-and response bytes reflect what the cache actually delivered to that player.
+from the origin. Session-bearing media-playlist polls are visible on Varnish
+cache hits, so one recent session heartbeat equals one active player regardless
+of NAT/shared IP. Shared playlist bodies deliberately omit that session from
+segment URIs; segment bytes are therefore attributed by their path instead.
+Both HIT and MISS body bytes still reflect what the edge actually delivered.
 
 Only aggregate counts are persisted; session IDs never leave process memory.
 """
@@ -40,8 +41,17 @@ delivered_bytes = defaultdict(int)
 traffic_buckets = defaultdict(dict)
 
 
+def is_safe_component(value):
+    return (
+        value not in ("", ".", "..")
+        and len(value) <= 256
+        and "/" not in value
+        and not any(ord(char) < 0x20 or ord(char) == 0x7F for char in value)
+    )
+
+
 def parse_event(raw_line):
-    """Return (master_stream_key, session_id, delivered_bytes), or None."""
+    """Return (stream_key, optional_session_id, delivered_bytes), or None."""
     try:
         method, status_text, bytes_text, raw_url = raw_line.split("\t", 3)
         if method != "GET":
@@ -56,25 +66,33 @@ def parse_event(raw_line):
         match = PATH_RE.match(parsed.path)
         if not match:
             return None
-        params = parse_qs(parsed.query, keep_blank_values=True, strict_parsing=False)
-        sessions = params.get("viewer_session", [])
-        master_streams = params.get("viewer_stream", [])
-        if len(sessions) != 1 or len(master_streams) != 1:
-            return None
-        session = sessions[0]
-        master_stream = master_streams[0]
-        if not SESSION_RE.fullmatch(session):
-            return None
-        # The value was minted from a path component by the origin. Keep the
-        # edge parser bounded and reject anything that could alter our key.
-        if not master_stream or len(master_stream) > 256 or "/" in master_stream or any(
-            ord(char) < 0x20 or ord(char) == 0x7F for char in master_stream
-        ):
-            return None
         application = unquote(match.group(1))
-        if not application or len(application) > 256 or "/" in application:
+        if not is_safe_component(application):
             return None
-        return f"{application}/{master_stream}", session, response_bytes
+        resource = match.group(3)
+        if resource == "index.m3u8":
+            params = parse_qs(parsed.query, keep_blank_values=True, strict_parsing=False)
+            sessions = params.get("viewer_session", [])
+            master_streams = params.get("viewer_stream", [])
+            if len(sessions) != 1 or len(master_streams) != 1:
+                return None
+            session = sessions[0]
+            master_stream = master_streams[0]
+            if not SESSION_RE.fullmatch(session):
+                return None
+            # The value was minted from a path component by the origin. Keep
+            # the edge parser bounded and reject anything that can alter a key.
+            if not is_safe_component(master_stream):
+                return None
+            return f"{application}/{master_stream}", session, response_bytes
+
+        # Shared playlist bodies contain plain segment URIs. Attribute media
+        # bytes to the concrete rendition path; the admin API already sums a
+        # source job's declared rendition keys without prefix guessing.
+        stream = unquote(match.group(2))
+        if not is_safe_component(stream):
+            return None
+        return f"{application}/{stream}", None, response_bytes
     except (AttributeError, TypeError, ValueError, UnicodeError):
         return None
 
@@ -178,11 +196,12 @@ def main():
                     if event is None:
                         continue
                     stream_key, session, response_bytes = event
-                    sessions = seen[stream_key]
-                    # Refresh known viewers even at the cap, but bound memory
-                    # under a flood of fabricated session query strings.
-                    if session in sessions or len(sessions) < MAX_SESSIONS_PER_STREAM:
-                        sessions[session] = now
+                    if session is not None:
+                        sessions = seen[stream_key]
+                        # Refresh known viewers even at the cap, but bound
+                        # memory under fabricated session query strings.
+                        if session in sessions or len(sessions) < MAX_SESSIONS_PER_STREAM:
+                            sessions[session] = now
                     delivered_bytes[stream_key] += response_bytes
                     second = int(now)
                     buckets = traffic_buckets[stream_key]

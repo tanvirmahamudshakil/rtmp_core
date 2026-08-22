@@ -273,9 +273,12 @@ TEST(HlsHttpTest, LivePlaylistIsNotCacheableButSegmentsAreImmutable) {
 
 TEST(HlsHttpTest, HighScaleModeProducesSharedCacheablePlaylistsWithoutViewerState) {
     HlsHttpOptions options;
-    options.enable_playback_sessions = false;
+    options.enable_playback_sessions = true;
+    options.enable_shared_playlist_cache = true;
+    options.playback_session_id_factory = [] { return std::string(kSessionA); };
     options.track_delivery_stats = false;
-    options.propagate_query_to_playlist_uris = false;
+    // The constructor must force this off when shared caching is enabled.
+    options.propagate_query_to_playlist_uris = true;
     options.playlist_cache_control = "public, max-age=1, s-maxage=1, stale-while-revalidate=2";
     options.master_cache_control = "public, max-age=30, s-maxage=30, stale-while-revalidate=60";
     HlsHttpHandler handler{options};
@@ -284,16 +287,31 @@ TEST(HlsHttpTest, HighScaleModeProducesSharedCacheablePlaylistsWithoutViewerStat
     rendition.uri = "index.m3u8";
     handler.set_renditions("live", "demo", {rendition});
 
-    const auto master = handler.handle(get("/hls/live/demo/master.m3u8", "cache_buster=one"));
+    const auto first = handler.handle(get("/hls/live/demo/master.m3u8", "cache_buster=one"));
+    ASSERT_EQ(first.status, 302);
+    EXPECT_EQ(header_of(first, "Location"),
+              "/hls/live/demo/master.m3u8?cache_buster=one&" + session_query(kSessionA) +
+                  "&viewer_cache=1");
+
+    const auto shared_query = "cache_buster=one&" + session_query(kSessionA) + "&viewer_cache=1";
+    const auto master = handler.handle(get("/hls/live/demo/master.m3u8", shared_query));
     ASSERT_EQ(master.status, 200);
     EXPECT_EQ(header_of(master, "Cache-Control"), options.master_cache_control);
     EXPECT_EQ(master.body.find("cache_buster"), std::string::npos);
 
-    const auto media = handler.handle(get("/hls/live/demo/index.m3u8", "cache_buster=two"));
+    const auto media = handler.handle(get("/hls/live/demo/index.m3u8", shared_query));
     ASSERT_EQ(media.status, 200);
     EXPECT_EQ(header_of(media, "Cache-Control"), options.playlist_cache_control);
     EXPECT_EQ(media.body.find("cache_buster"), std::string::npos);
+    EXPECT_EQ(media.body.find("viewer_session"), std::string::npos);
     EXPECT_EQ(media.body.find("segment-0.ts?"), std::string::npos);
+
+    const auto second_viewer_query = session_query(kSessionB) + "&viewer_cache=1";
+    const auto second_viewer = handler.handle(get("/hls/live/demo/index.m3u8", second_viewer_query));
+    ASSERT_EQ(second_viewer.status, 200);
+    EXPECT_EQ(second_viewer.body, media.body);
+    EXPECT_EQ(second_viewer.body.find(kSessionA), std::string::npos);
+    EXPECT_EQ(second_viewer.body.find(kSessionB), std::string::npos);
 
     const auto segment = handler.handle(get("/hls/live/demo/segment-0.ts", "cache_buster=three"));
     ASSERT_EQ(segment.status, 200);

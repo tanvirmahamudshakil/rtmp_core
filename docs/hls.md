@@ -191,28 +191,29 @@ media sequence.
 ### Maximum-scale public mode
 
 Production defaults `hls_high_scale_mode: true`. Caddy sends all `/hls/*`
-traffic through the same-VPS Varnish instance. Playlists pass through so the
-origin can mint and propagate one opaque playback session per player; they are
-small and never cached. Varnish excludes that query from the segment cache key,
-request-collapses a hot segment's first fetch and caches the complete immutable
-segment for 1 hour. Segment sequence numbers start from wall-clock milliseconds,
-so names cannot repeat after publisher reconnect or process restart while an
-older cache object still exists.
+traffic through the same-VPS Varnish instance. A fresh playlist open passes to
+the origin once for a private opaque-session redirect. Redirected media
+playlists are shared for 1 second and masters for 30 seconds; their bodies omit
+viewer-specific query values, so request collapse cannot leak one player's
+session to another. Varnish also request-collapses a hot segment's first fetch
+and caches the complete immutable segment for 1 hour. Segment sequence numbers
+start from wall-clock milliseconds, so names cannot repeat after publisher
+reconnect or process restart while an older cache object still exists.
 
 `viewer-estimator.service` consumes Varnish's shared-memory access log (it does
-not persist one access-log line per request). It counts active playback sessions
-over a 20-second window and aggregates body bytes plus a rolling bitrate for
-every link. Because Varnish observes both HIT and MISS responses, the admin
-homepage includes cache-served viewers and traffic rather than reporting only
-origin misses. The origin's own delivery-stats mutex remains disabled in this
-mode.
+not persist one access-log line per request). It counts sessions from recurring
+media-playlist URLs over a 20-second window, and attributes query-free segment
+bytes by their concrete stream/rendition path. Because Varnish observes both
+HIT and MISS responses, the admin homepage includes cache-served viewers and
+traffic rather than reporting only origin misses. The origin's own
+delivery-stats mutex remains disabled in this mode.
 
 This profile is deliberately for public links. Query-token authorization still
 requires a private-cache policy; the installer intentionally shares immutable
 segment objects across every viewer.
 
-The cache eliminates proportional segment-generation/origin-body work, not the
-small per-viewer playlist requests and not network egress.
+After the one-time session redirect, the cache eliminates proportional
+playlist generation and segment-origin body work, but not network egress.
 One VPS still sends one copy to every viewer. Approximate ceiling:
 
 ```text
@@ -233,9 +234,10 @@ all established viewers in the provider's saturated FIFO/policer queue.
 | Resource | Header | Why |
 |---|---|---|
 | Media playlist (library default) | `no-cache, max-age=0` | Safe when no reverse cache profile is selected |
-| Media playlist (production high-scale) | `private, no-store` | Preserves a distinct playback session for accurate edge viewer accounting |
+| Initial playlist redirect (production high-scale) | `private, no-store` | Mints a distinct playback session without caching the redirect |
+| Media playlist (production high-scale) | `public, max-age=1, s-maxage=1` | Collapses synchronized polls; body contains no viewer state |
 | Segment (200) | `public, max-age=31536000, immutable` | Uniquely named and never rewritten — safe to cache indefinitely |
-| Master playlist | `private, no-store` when playback sessions are enabled; otherwise `public, max-age=60` | A fresh open mints a distinct playback session |
+| Master playlist (production high-scale) | `public, max-age=30, s-maxage=30` after the private redirect | Rendition set changes rarely; body contains no viewer state |
 | Segment (404) | `no-store` | An evicted-segment 404 must not be cached, or the CDN keeps serving it after recovery |
 | 403 (bad token) | `no-store` | An authorization result must never be cached across viewers |
 

@@ -13,12 +13,16 @@ class ViewerEstimatorTest(unittest.TestCase):
         estimator.delivered_bytes.clear()
         estimator.traffic_buckets.clear()
 
-    def test_successful_cache_delivery_has_session_bytes_and_master_key(self):
+    def test_media_playlist_delivery_has_session_and_master_key(self):
         event = estimator.parse_event(
-            "GET\t200\t188000\t/hls/live/demo_720p/segment-42.ts"
+            "GET\t200\t804\t/hls/live/demo_720p/index.m3u8"
             "?viewer_session=0123456789abcdef0123456789abcdef&viewer_stream=demo"
         )
-        self.assertEqual(event, ("live/demo", "0123456789abcdef0123456789abcdef", 188000))
+        self.assertEqual(event, ("live/demo", "0123456789abcdef0123456789abcdef", 804))
+
+    def test_shared_segment_delivery_needs_no_session_and_uses_path_key(self):
+        event = estimator.parse_event("GET\t200\t188000\t/hls/live/demo_720p/segment-42.ts")
+        self.assertEqual(event, ("live/demo_720p", None, 188000))
 
     def test_non_delivery_and_malformed_sessions_are_ignored(self):
         self.assertIsNone(estimator.parse_event("GET\t404\t12\t/hls/live/demo/segment-1.ts"))
@@ -28,11 +32,7 @@ class ViewerEstimatorTest(unittest.TestCase):
                 "?viewer_session=0123456789abcdef0123456789abcdef&viewer_stream=demo"
             )
         )
-        self.assertIsNone(
-            estimator.parse_event(
-                "GET\t200\t188000\t/hls/live/demo/segment-1.ts?viewer_session=bad&viewer_stream=demo"
-            )
-        )
+        self.assertIsNone(estimator.parse_event("GET\t200\t188000\t/hls/live/../segment-1.ts"))
 
     def test_snapshot_deduplicates_viewers_and_reports_cache_bandwidth(self):
         now = 100.5
