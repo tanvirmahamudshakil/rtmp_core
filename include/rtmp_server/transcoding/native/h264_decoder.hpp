@@ -3,11 +3,22 @@
 #include <cstdint>
 #include <memory>
 #include <span>
+#include <string>
 
 #include "rtmp_server/core/result.hpp"
 #include "rtmp_server/transcoding/native/frame.hpp"
 
 namespace rtmp_server::transcoding::native {
+
+namespace detail {
+
+// OpenH264 returns DECODING_STATE as a bitmask. Keep the policy independent
+// of the third-party enum type so it can be unit-tested without exposing a
+// codec header through H264Decoder's public API.
+[[nodiscard]] bool openh264_decode_state_is_fatal(std::uint32_t state) noexcept;
+[[nodiscard]] std::string openh264_decode_state_description(std::uint32_t state);
+
+} // namespace detail
 
 // Wraps an openh264 decoder. Input is Annex B (start-code prefixed) H.264 —
 // convert AVCC samples with media::h264::avcc_to_annexb first. Output is I420,

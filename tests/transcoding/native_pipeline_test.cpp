@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <array>
 
 #include "rtmp_server/transcoding/native/aac_params.hpp"
 #include "rtmp_server/transcoding/native/geometry.hpp"
@@ -8,10 +9,12 @@
 #include "rtmp_server/transcoding/preset.hpp"
 #ifdef RTMP_NATIVE_TRANSCODE
 #include <cmath>
+#include <wels/codec_app_def.h>
 
 #include "rtmp_server/transcoding/native/aac_decoder.hpp"
 #include "rtmp_server/transcoding/native/aac_encoder.hpp"
 #include "rtmp_server/transcoding/native/frame.hpp"
+#include "rtmp_server/transcoding/native/h264_decoder.hpp"
 #include "rtmp_server/transcoding/native/h264_encoder.hpp"
 #include "rtmp_server/transcoding/native/hevc_encoder.hpp"
 #include "rtmp_server/transcoding/native/scaler.hpp"
@@ -281,6 +284,43 @@ TEST(NativeH264Encoder, MultiSliceOutputRemainsDecodable) {
     EXPECT_TRUE(decoded_picture);
     EXPECT_EQ(decoded.width, 640U);
     EXPECT_EQ(decoded.height, 360U);
+}
+
+TEST(NativeH264Decoder, ClassifiesBitstreamStatesAsRecoverableAndLogicStatesAsFatal) {
+    using detail::openh264_decode_state_description;
+    using detail::openh264_decode_state_is_fatal;
+
+    EXPECT_FALSE(openh264_decode_state_is_fatal(dsErrorFree));
+    EXPECT_FALSE(openh264_decode_state_is_fatal(dsFramePending));
+    EXPECT_FALSE(openh264_decode_state_is_fatal(dsRefLost | dsBitstreamError));
+    EXPECT_FALSE(openh264_decode_state_is_fatal(dsNoParamSets | dsDataErrorConcealed));
+
+    EXPECT_TRUE(openh264_decode_state_is_fatal(dsInvalidArgument));
+    EXPECT_TRUE(openh264_decode_state_is_fatal(dsOutOfMemory));
+    EXPECT_TRUE(openh264_decode_state_is_fatal(0x80000000U));
+
+    EXPECT_EQ(openh264_decode_state_description(dsFramePending | dsDataErrorConcealed),
+              "frame-pending|data-error-concealed");
+    EXPECT_EQ(openh264_decode_state_description(0x80000000U), "unknown-0x80000000");
+}
+
+TEST(NativeH264Decoder, MissingParameterSetsDoNotKillTheLiveDecoder) {
+    H264Decoder decoder;
+    ASSERT_TRUE(decoder.initialize().ok());
+
+    // An IDR slice without the SPS/PPS it references is representative of a
+    // live HLS pull beginning in the middle of a GOP. OpenH264 reports a
+    // bitstream-level state; the wrapper must drop it and await a decodable
+    // access unit instead of failing the entire source job.
+    const std::array malformed = {
+        std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0x01},
+        std::byte{0x65}, std::byte{0x88}, std::byte{0x80},
+    };
+    YuvFrame decoded;
+    bool produced = true;
+    auto result = decoder.decode(malformed, 0, decoded, produced);
+    EXPECT_TRUE(result.ok()) << (result.ok() ? "" : result.error().message());
+    EXPECT_FALSE(produced);
 }
 
 PcmBlock make_sine_block(std::uint32_t sample_rate, std::uint32_t channels, std::uint32_t frames,
