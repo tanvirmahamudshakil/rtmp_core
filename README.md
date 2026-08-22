@@ -40,6 +40,14 @@ every segment hit is itself expensive at large audience sizes; aggregate
 cache/origin metrics remain available. System journals are capped at 128 MiB
 with 1 GiB reserved on the root filesystem.
 
+The installer also enables `streamforge-disk-guard.timer`. Every five minutes
+it checks `/var/lib/rtmp-server`'s filesystem. At 80% usage or below 4 GiB
+free, it vacuums rebuildable caches and stale recording parts, then—only if
+pressure remains—removes the oldest backups/completed recordings while keeping
+at least three of each. It never scans the live SQLite database, credentials or
+configuration. A successful install removes its production build tree and
+`node_modules`; set `RTMP_CLEAN_BUILD_ARTIFACTS=0` only on a development host.
+
 Fresh opens of the production HLS master link use the smaller startup
 rendition by default (`kk/KK` starts on `KK_480p`). Existing viewers keep the
 rendition URL already loaded. Both playlists and `.ts` segments go through the

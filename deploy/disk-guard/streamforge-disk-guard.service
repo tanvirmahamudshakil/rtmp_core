@@ -1,0 +1,21 @@
+[Unit]
+Description=StreamForge disk pressure cleanup
+Documentation=file:///usr/share/doc/rtmp-server/deployment.md
+After=local-fs.target systemd-journald.service
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/etc/default/streamforge-disk-guard
+ExecStart=/usr/local/sbin/streamforge-disk-guard
+User=root
+Group=root
+Nice=19
+IOSchedulingClass=idle
+IOSchedulingPriority=7
+PrivateTmp=false
+ProtectHome=true
+ProtectSystem=false
+NoNewPrivileges=true
+LockPersonality=true
+RestrictSUIDSGID=true
+

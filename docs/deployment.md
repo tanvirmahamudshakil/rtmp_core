@@ -563,10 +563,42 @@ rclone sync /var/lib/rtmp-server/recordings remote:rtmp-recordings \
     --exclude '*.part' --min-age 1h
 ```
 
-`recording::retention` prunes old recordings by count/age. **Disk capacity is
-the constraint that bites**: one 5 Mb/s stream is ~2.2 GB/hour, so 10
-concurrent 24-hour recordings is ~528 GB/day. Alert on disk usage well before
-full — a full disk fails recordings *and* the SQLite database.
+`recording::retention` can prune old recordings by count/age. Production also
+installs `streamforge-disk-guard.timer`, which checks disk pressure every five
+minutes. **Disk capacity is the constraint that bites**: one 5 Mb/s stream is
+~2.2 GB/hour, so 10 concurrent 24-hour recordings is ~528 GB/day.
+
+The guard starts at either 80% filesystem usage or less than 4 GiB free. It
+first rotates/vacuums the journal, clears the apt cache and applies system
+tmpfiles cleanup. It removes a `.part` crash artifact only after 24 hours and
+only after proving the running server has no open descriptor for it. If
+pressure remains, it removes oldest `rtmp-*.db[.gz]` backups and completed
+`.flv` recordings until usage reaches 70% and the free-space reserve is met,
+while preserving at least three backups and three recordings. It never scans
+or removes `/var/lib/rtmp-server/rtmp.db`, credentials, configuration, or a
+recent/in-progress `.part` file.
+
+Installer controls:
+
+```sh
+RTMP_ENABLE_DISK_GUARD=1
+RTMP_DISK_TRIGGER_PERCENT=80
+RTMP_DISK_TARGET_PERCENT=70
+RTMP_DISK_MIN_FREE_MB=4096
+RTMP_CLEAN_BUILD_ARTIFACTS=1
+```
+
+Inspect or force a check with:
+
+```sh
+systemctl list-timers streamforge-disk-guard.timer
+/usr/local/sbin/streamforge-disk-guard --status
+sudo systemctl start streamforge-disk-guard.service
+journalctl -u streamforge-disk-guard.service -n 50 --no-pager
+```
+
+The guard is a last line of defence, not archival storage. Sync recordings and
+backups off-host and alert before the cleanup threshold.
 
 ### 3. Configuration
 

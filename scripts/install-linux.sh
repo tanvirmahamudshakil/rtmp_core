@@ -48,6 +48,12 @@
 #   RTMP_FAST_JOIN_APPLICATION   Application for the optimized link (default kk).
 #   RTMP_FAST_JOIN_STREAM        Public/base stream name (default KK).
 #   RTMP_FAST_JOIN_RENDITION     Startup rendition stream (default KK_480p).
+#   RTMP_ENABLE_DISK_GUARD       1 (default) checks disk pressure every 5m.
+#   RTMP_DISK_TRIGGER_PERCENT    Start cleanup at this usage (default 80).
+#   RTMP_DISK_TARGET_PERCENT     Stop cleanup at this usage (default 70).
+#   RTMP_DISK_MIN_FREE_MB        Absolute free-space reserve (default 4096).
+#   RTMP_CLEAN_BUILD_ARTIFACTS   1 (default) removes rebuildable build and
+#                                node_modules trees after a successful install.
 #
 set -Eeuo pipefail
 IFS=$'\n\t'
@@ -105,6 +111,11 @@ ENABLE_FAST_JOIN="${RTMP_ENABLE_FAST_JOIN:-1}"
 FAST_JOIN_APPLICATION="${RTMP_FAST_JOIN_APPLICATION:-kk}"
 FAST_JOIN_STREAM="${RTMP_FAST_JOIN_STREAM:-KK}"
 FAST_JOIN_RENDITION="${RTMP_FAST_JOIN_RENDITION:-KK_480p}"
+ENABLE_DISK_GUARD="${RTMP_ENABLE_DISK_GUARD:-1}"
+DISK_TRIGGER_PERCENT="${RTMP_DISK_TRIGGER_PERCENT:-80}"
+DISK_TARGET_PERCENT="${RTMP_DISK_TARGET_PERCENT:-70}"
+DISK_MIN_FREE_MB="${RTMP_DISK_MIN_FREE_MB:-4096}"
+CLEAN_BUILD_ARTIFACTS="${RTMP_CLEAN_BUILD_ARTIFACTS:-1}"
 
 if [[ "${BANDWIDTH_MBIT}" != "auto" ]]; then
   [[ "${BANDWIDTH_MBIT}" =~ ^[1-9][0-9]*$ ]] ||
@@ -139,6 +150,16 @@ if [[ "${RTMP_ENABLE_TRANSCODING:-0}" != "0" ]]; then
   die "RTMP_ENABLE_TRANSCODING is not supported: production source transcoding is FFmpeg-free and native."
 fi
 [[ "${ENABLE_FAST_JOIN}" =~ ^[01]$ ]] || die "RTMP_ENABLE_FAST_JOIN must be 0 or 1."
+[[ "${ENABLE_DISK_GUARD}" =~ ^[01]$ ]] || die "RTMP_ENABLE_DISK_GUARD must be 0 or 1."
+[[ "${CLEAN_BUILD_ARTIFACTS}" =~ ^[01]$ ]] || die "RTMP_CLEAN_BUILD_ARTIFACTS must be 0 or 1."
+[[ "${DISK_TRIGGER_PERCENT}" =~ ^[0-9]+$ ]] &&
+  (( DISK_TRIGGER_PERCENT >= 50 && DISK_TRIGGER_PERCENT <= 98 )) ||
+  die "RTMP_DISK_TRIGGER_PERCENT must be between 50 and 98."
+[[ "${DISK_TARGET_PERCENT}" =~ ^[0-9]+$ ]] &&
+  (( DISK_TARGET_PERCENT >= 40 && DISK_TARGET_PERCENT < DISK_TRIGGER_PERCENT )) ||
+  die "RTMP_DISK_TARGET_PERCENT must be between 40 and trigger-1."
+[[ "${DISK_MIN_FREE_MB}" =~ ^[0-9]+$ ]] && (( DISK_MIN_FREE_MB >= 512 )) ||
+  die "RTMP_DISK_MIN_FREE_MB must be at least 512."
 if [[ "${ENABLE_FAST_JOIN}" == "1" ]]; then
   for fast_join_value in "${FAST_JOIN_APPLICATION}" "${FAST_JOIN_STREAM}" "${FAST_JOIN_RENDITION}"; do
     [[ "${fast_join_value}" =~ ^[A-Za-z0-9][A-Za-z0-9_-]*$ ]] ||
@@ -172,11 +193,15 @@ remove_managed_path() {
     /etc/systemd/system/rtmp-network-tune.service | \
     /etc/systemd/system/rtmp-network-tune.service.d | \
     /etc/systemd/system/viewer-estimator.service | \
+    /etc/systemd/system/streamforge-disk-guard.service | \
+    /etc/systemd/system/streamforge-disk-guard.timer | \
     /etc/systemd/journald.conf.d/streamforge.conf | \
     /etc/sysctl.d/60-streamforge.conf | \
     /etc/default/rtmp-network | \
+    /etc/default/streamforge-disk-guard | \
     /etc/logrotate.d/rtmp-server | \
     /usr/local/sbin/rtmp-network-tune | \
+    /usr/local/sbin/streamforge-disk-guard | \
     /usr/local/bin/viewer_estimator.py | \
     /root/streamforge-credentials.txt | \
     /etc/caddy/Caddyfile | \
@@ -250,6 +275,8 @@ clean_previous_install() {
   stop_and_disable_unit rtmp-server.service
   stop_and_disable_unit rtmp-network-tune.service
   stop_and_disable_unit viewer-estimator.service
+  stop_and_disable_unit streamforge-disk-guard.timer
+  stop_and_disable_unit streamforge-disk-guard.service
 
   local caddy_config_is_streamforge=0
   if [[ -r /etc/caddy/Caddyfile ]] &&
@@ -287,11 +314,15 @@ clean_previous_install() {
     /etc/systemd/system/rtmp-network-tune.service \
     /etc/systemd/system/rtmp-network-tune.service.d \
     /etc/systemd/system/viewer-estimator.service \
+    /etc/systemd/system/streamforge-disk-guard.service \
+    /etc/systemd/system/streamforge-disk-guard.timer \
     /etc/systemd/journald.conf.d/streamforge.conf \
     /etc/sysctl.d/60-streamforge.conf \
     /etc/default/rtmp-network \
+    /etc/default/streamforge-disk-guard \
     /etc/logrotate.d/rtmp-server \
     /usr/local/sbin/rtmp-network-tune \
+    /usr/local/sbin/streamforge-disk-guard \
     /usr/local/bin/viewer_estimator.py \
     /root/streamforge-credentials.txt \
     /etc/systemd/system/caddy.service.d/streamforge.conf \
@@ -324,7 +355,8 @@ clean_previous_install() {
   fi
 
   systemctl daemon-reload
-  systemctl reset-failed rtmp-server.service rtmp-network-tune.service viewer-estimator.service varnish.service >/dev/null 2>&1 || true
+  systemctl reset-failed rtmp-server.service rtmp-network-tune.service viewer-estimator.service \
+    streamforge-disk-guard.service varnish.service >/dev/null 2>&1 || true
   log "Previous StreamForge installation cleanup complete"
 }
 
@@ -874,6 +906,31 @@ install -m 0644 "${SOURCE_DIR}/deploy/systemd/streamforge-journald.conf" \
   /etc/systemd/journald.conf.d/streamforge.conf
 systemctl restart systemd-journald.service
 
+if [[ "${ENABLE_DISK_GUARD}" == "1" ]]; then
+  log "Installing pressure-triggered disk guard"
+  install -m 0755 -o root -g root \
+    "${SOURCE_DIR}/deploy/disk-guard/streamforge-disk-guard.sh" \
+    /usr/local/sbin/streamforge-disk-guard
+  install -m 0644 -o root -g root \
+    "${SOURCE_DIR}/deploy/disk-guard/streamforge-disk-guard.service" \
+    /etc/systemd/system/streamforge-disk-guard.service
+  install -m 0644 -o root -g root \
+    "${SOURCE_DIR}/deploy/disk-guard/streamforge-disk-guard.timer" \
+    /etc/systemd/system/streamforge-disk-guard.timer
+  cat > /etc/default/streamforge-disk-guard <<EOF
+STREAMFORGE_DISK_TRIGGER_PERCENT=${DISK_TRIGGER_PERCENT}
+STREAMFORGE_DISK_TARGET_PERCENT=${DISK_TARGET_PERCENT}
+STREAMFORGE_DISK_MIN_FREE_MB=${DISK_MIN_FREE_MB}
+STREAMFORGE_DISK_MIN_RECORDINGS=3
+STREAMFORGE_DISK_MIN_BACKUPS=3
+STREAMFORGE_STALE_PART_MINUTES=1440
+EOF
+  chown root:root /etc/default/streamforge-disk-guard
+  chmod 0644 /etc/default/streamforge-disk-guard
+else
+  systemctl disable --now streamforge-disk-guard.timer >/dev/null 2>&1 || true
+fi
+
 log "Configuring Varnish shared HLS cache"
 # Varnish sits between Caddy and the origin (127.0.0.1:8080) for /hls/*
 # traffic only. Public playlists are micro-cached and immutable .ts segments
@@ -1049,6 +1106,19 @@ if [[ "${EDGE_STATS_READY}" != "1" ]]; then
   die "Cache-edge viewer/bandwidth accounting did not become ready."
 fi
 
+if [[ "${CLEAN_BUILD_ARTIFACTS}" == "1" ]]; then
+  log "Removing rebuildable production build artifacts"
+  remove_managed_path "${SOURCE_DIR}/build"
+  remove_managed_path "${SOURCE_DIR}/admin/node_modules"
+fi
+if [[ "${ENABLE_DISK_GUARD}" == "1" ]]; then
+  systemctl enable --now streamforge-disk-guard.timer >/dev/null
+  # Run after rebuildable artifacts are gone so pressure cleanup never removes
+  # a backup or recording merely to preserve a disposable compiler tree.
+  systemctl start streamforge-disk-guard.service >/dev/null 2>&1 ||
+    log "Disk guard could not reach its reserve; inspect journalctl -u streamforge-disk-guard.service"
+fi
+
 ADMIN_URL="http://${PRIMARY_IP}"
 if [[ -n "${DOMAIN}" ]]; then ADMIN_URL="https://${DOMAIN}"; fi
 
@@ -1062,6 +1132,12 @@ printf '  Network device:   %s\n' "${PRIMARY_INTERFACE}"
 printf '  Link bandwidth:   %s Mbps — %s\n' "${BANDWIDTH_MBIT}" "${BANDWIDTH_SOURCE}"
 printf '  Media workers:    %s\n' "${WORKERS}"
 printf '  HLS shared cache:  Varnish, %s MB RAM, 127.0.0.1:6081 (.ts 1h; media playlists 1s; masters 30s)\n' "${VARNISH_CACHE_MB}"
+if [[ "${ENABLE_DISK_GUARD}" == "1" ]]; then
+  printf '  Disk guard:        every 5m; cleanup at %s%% or <%s MB free, target %s%%\n' \
+    "${DISK_TRIGGER_PERCENT}" "${DISK_MIN_FREE_MB}" "${DISK_TARGET_PERCENT}"
+else
+  printf '  Disk guard:        disabled by RTMP_ENABLE_DISK_GUARD=0\n'
+fi
 if [[ "${ENABLE_FAST_JOIN}" == "1" ]]; then
   printf '  Fast join:         /hls/%s/%s/master.m3u8 -> %s\n' \
     "${FAST_JOIN_APPLICATION}" "${FAST_JOIN_STREAM}" "${FAST_JOIN_RENDITION}"
