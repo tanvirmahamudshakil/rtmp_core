@@ -1,10 +1,17 @@
 #include "rtmp_server/transcoding/native/source_job_manager.hpp"
 
+#include <csignal>
+#include <spawn.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
 #include <algorithm>
 #include <limits>
 
 #include "rtmp_server/core/error.hpp"
-#include "rtmp_server/transcoding/native/rtmp_source_client.hpp"
+#include "rtmp_server/transcoding/ffmpeg_args.hpp"
+
+extern char** environ;
 
 namespace rtmp_server::transcoding::native {
 
@@ -16,23 +23,10 @@ core::Error job_error(std::string message) {
 }
 
 core::Result<void> validate_source_url(std::string_view url) {
-    if (url.starts_with("rtmp://")) {
-        auto parsed = parse_rtmp_source_url(url);
-        if (!parsed) return parsed.error();
+    if (url.starts_with("rtmp://") || url.starts_with("http://") || url.starts_with("https://")) {
         return {};
     }
-    if (url.starts_with("http://") || url.starts_with("https://")) return {};
     return job_error("source URL must use rtmp://, http:// or https://");
-}
-
-std::string status_text(PullerStatus status) {
-    switch (status) {
-        case PullerStatus::Starting: return "starting";
-        case PullerStatus::Running: return "running";
-        case PullerStatus::Error: return "error";
-        case PullerStatus::Stopped: return "stopped";
-    }
-    return "unknown";
 }
 
 std::string key_of(const std::string& application, const std::string& name) {
@@ -50,10 +44,34 @@ std::uint64_t peak_hls_bandwidth(std::uint64_t average) {
     return (average * kPeakPercent + 99) / 100;
 }
 
+// The management API only ever hands source jobs H.264/AAC renditions on the
+// software backend (see apps/rtmp_server/main.cpp's assignment validation);
+// RenditionSpec itself carries no codec/backend fields, so that pairing is
+// implicit here, same as it was in the native FFmpeg-free pipeline.
+Preset preset_from_rendition(const RenditionSpec& spec) {
+    Preset preset;
+    preset.name = spec.name;
+    preset.outgoing_stream_name = spec.output_stream;
+    preset.backend = BackendKind::Software;
+    preset.video_codec = VideoCodec::H264;
+    preset.video_bitrate = spec.video_bitrate;
+    preset.keyframe_interval = spec.gop;
+    if (spec.width > 0) preset.width = spec.width;
+    if (spec.height > 0) preset.height = spec.height;
+    preset.fit_mode = spec.fit_mode;
+    preset.audio_codec = AudioCodec::Aac;
+    preset.audio_bitrate = spec.audio_bitrate;
+    return preset;
+}
+
 } // namespace
 
-SourceJobManager::SourceJobManager(Hooks hooks, std::string hls_route_prefix)
-    : hooks_(std::move(hooks)), route_prefix_(std::move(hls_route_prefix)) {
+SourceJobManager::SourceJobManager(Hooks hooks, SourceJobManagerOptions options,
+                                   std::string hls_route_prefix)
+    : hooks_(std::move(hooks)),
+      options_(std::move(options)),
+      backends_(options_.ffmpeg_path),
+      route_prefix_(std::move(hls_route_prefix)) {
     monitor_running_.store(true);
     monitor_thread_ = std::thread([this] { monitor_loop(); });
 }
@@ -67,39 +85,28 @@ SourceJobManager::~SourceJobManager() {
 }
 
 void SourceJobManager::monitor_loop() {
-    // Polls every job's puller once a second; a dead one whose config opts
-    // into auto_restart gets torn down and rebuilt once it's been in Error
-    // for at least restart_delay_seconds, so a flaky source recovers without
-    // an operator having to toggle it off and on again.
+    // Polls every job's ffmpeg child roughly 5x/s: reaps exited children,
+    // enforces SIGTERM->SIGKILL stop deadlines, and respawns a job whose
+    // restart_at has passed (scheduled by reap_locked() when auto_restart is
+    // set), mirroring TranscoderSupervisor::run()/reap_children().
     while (monitor_running_.load()) {
         {
             std::unique_lock lock(monitor_wake_mutex_);
-            monitor_wake_cv_.wait_for(lock, std::chrono::seconds(1),
+            monitor_wake_cv_.wait_for(lock, std::chrono::milliseconds(200),
                                       [this] { return !monitor_running_.load(); });
         }
         if (!monitor_running_.load()) break;
 
         std::lock_guard lock(mutex_);
+        reap_locked();
+        enforce_stop_deadlines_locked();
         const auto now = std::chrono::steady_clock::now();
         for (auto& [key, job] : jobs_) {
-            if (!job.enabled || !job.puller || job.puller->status() != PullerStatus::Error) {
-                job.error_since = {};
-                continue;
-            }
-            if (job.error_since == std::chrono::steady_clock::time_point{}) {
-                job.error_since = now;
-                continue;
-            }
-            if (!job.config.auto_restart) continue;
-            const auto delay = std::chrono::seconds(job.config.restart_delay_seconds);
-            if (now - job.error_since >= delay) {
-                // Preserve the registered stores during an automatic
-                // recovery. Existing players keep receiving the last live
-                // window with the same viewer_session instead of seeing a
-                // 404, and the replacement pipeline resumes its sequence.
-                teardown_locked(job, /*preserve_delivery_state=*/true);
-                start_locked(job); // resets error_since via the fresh puller's status
-                job.error_since = {};
+            (void)key;
+            if (job.enabled && !job.stop_requested && job.pid < 0 &&
+                job.restart_at != std::chrono::steady_clock::time_point{} && now >= job.restart_at &&
+                job.restart_attempts <= options_.max_restart_attempts) {
+                spawn_locked(job);
             }
         }
     }
@@ -110,65 +117,39 @@ std::string SourceJobManager::master_path(const std::string& application,
     return route_prefix_ + "/" + application + "/" + name + "/master.m3u8";
 }
 
-void SourceJobManager::teardown_locked(Job& job, bool preserve_delivery_state) {
-    if (job.puller) {
-        job.puller->stop();
-        job.puller.reset();
+core::Result<std::vector<std::string>> SourceJobManager::build_argv(const SourceJobConfig& config) const {
+    std::vector<std::string> args{
+        options_.ffmpeg_path,
+        "-nostdin",
+        "-hide_banner",
+        "-loglevel",
+        "warning",
+        "-fflags",
+        "+genpts+discardcorrupt",
+        "-rw_timeout",
+        "15000000",
+        "-i",
+        config.source_url,
+    };
+
+    const std::size_t concurrent_encoders = std::max<std::size_t>(1, config.renditions.size());
+    for (const auto& spec : config.renditions) {
+        const auto preset = preset_from_rendition(spec);
+        const std::string destination = "rtmp://" + options_.loopback_host + ":" +
+                                        std::to_string(options_.rtmp_port) + "/" + config.application +
+                                        "/" + spec.output_stream;
+        auto appended =
+            ffmpeg_append_rendition_output(args, backends_, preset, concurrent_encoders, destination);
+        if (!appended) return appended.error();
     }
-    if (preserve_delivery_state) return;
-    if (hooks_.unregister_store) {
-        for (const auto& stream : job.output_streams) {
-            hooks_.unregister_store(job.config.application, stream);
-        }
-    }
-    job.output_streams.clear();
-    job.stores.clear();
+    return args;
 }
 
-void SourceJobManager::start_locked(Job& job) {
-    const auto& config = job.config;
-    std::vector<PullerRendition> puller_renditions;
+void SourceJobManager::publish_master_locked(const SourceJobConfig& config) {
     std::vector<hls::Rendition> master_renditions;
-    puller_renditions.reserve(config.renditions.size());
-    const bool first_start = job.stores.empty();
-    if (first_start) {
-        job.stores.reserve(config.renditions.size());
-        job.output_streams.reserve(config.renditions.size());
-    }
-    for (std::size_t index = 0; index < config.renditions.size(); ++index) {
-        const auto& spec = config.renditions[index];
-        // Keep 30 seconds advertised plus another 30 seconds of stale-request
-        // grace. Segment count is derived from the rendition's real GOP
-        // duration: the Segmenter target may be 1s, but a 60-frame GOP at
-        // 30fps can only produce independently decodable ~2s segments.
-        constexpr std::size_t kWindowSeconds = 30;
-        const auto fps = std::max<std::uint32_t>(config.fps, 1);
-        const auto segment_seconds =
-            std::max<std::uint32_t>(1, (spec.gop + fps - 1) / fps);
-        const auto window_segments = std::max<std::size_t>(
-            3, (kWindowSeconds + segment_seconds - 1) / segment_seconds);
-        std::shared_ptr<hls::SegmentStore> store;
-        if (first_start) {
-            hls::SegmentStoreConfig store_config;
-            store_config.live_window_segments = window_segments;
-            store_config.retention_grace_segments = window_segments;
-            store_config.target_duration_seconds = segment_seconds;
-            // Playlist requests keep receiving a loop of the last complete
-            // segment while the upstream source or puller is recovering.
-            // This preserves the same HLS URL and viewer session instead of
-            // letting the playlist stall until players disconnect.
-            store_config.repeat_last_segment_on_stall = true;
-            store = std::make_shared<hls::SegmentStore>(store_config);
-            job.stores.push_back(store);
-            job.output_streams.push_back(spec.output_stream);
-            if (hooks_.register_store) {
-                hooks_.register_store(config.application, spec.output_stream, store);
-            }
-        } else {
-            store = job.stores[index];
-            store->mark_live();
-        }
-
+    master_renditions.reserve(config.renditions.size());
+    const auto fps = std::max<std::uint32_t>(config.fps, 1);
+    for (const auto& spec : config.renditions) {
         hls::Rendition rendition;
         rendition.uri = "../" + spec.output_stream + "/index.m3u8";
         rendition.average_bandwidth = spec.video_bitrate + spec.audio_bitrate;
@@ -179,18 +160,118 @@ void SourceJobManager::start_locked(Job& job) {
         rendition.frame_rate = static_cast<double>(fps);
         rendition.name = spec.name;
         master_renditions.push_back(std::move(rendition));
-
-        puller_renditions.push_back(PullerRendition{spec, std::move(store)});
     }
-
     if (hooks_.set_renditions) {
         hooks_.set_renditions(config.application, config.name, std::move(master_renditions));
     }
+}
 
-    job.puller = std::make_unique<HlsSourcePuller>(config.source_url, std::move(puller_renditions),
-                                                   config.fps);
-    job.puller->start();
+void SourceJobManager::spawn_locked(Job& job) {
+    std::vector<char*> argv;
+    argv.reserve(job.argv.size() + 1);
+    for (auto& arg : job.argv) argv.push_back(arg.data());
+    argv.push_back(nullptr);
+
+    pid_t pid = -1;
+    const int result =
+        ::posix_spawn(&pid, options_.ffmpeg_path.c_str(), nullptr, nullptr, argv.data(), environ);
+    if (result != 0) {
+        ++job.restart_attempts;
+        job.restart_at = std::chrono::steady_clock::now() + std::chrono::seconds(job.config.restart_delay_seconds);
+        job.status = "error";
+        job.detail = "failed to spawn ffmpeg (errno " + std::to_string(result) + ")";
+        return;
+    }
+    job.pid = static_cast<int>(pid);
+    job.restart_at = {};
+    job.terminate_sent_at.reset();
+    job.stop_requested = false;
+    job.started_at = std::chrono::steady_clock::now();
+    job.status = "starting";
+    job.detail.clear();
+}
+
+void SourceJobManager::start_locked(Job& job) {
+    publish_master_locked(job.config);
     job.enabled = true;
+    spawn_locked(job);
+}
+
+void SourceJobManager::teardown_locked(Job& job, bool block_until_stopped) {
+    if (job.pid <= 0) {
+        job.status = "stopped";
+        return;
+    }
+    job.stop_requested = true;
+    ::kill(job.pid, SIGTERM);
+    job.terminate_sent_at = std::chrono::steady_clock::now();
+    if (!block_until_stopped) return;
+
+    // create()/remove()/set_enabled(false) are rare, operator-triggered
+    // actions; blocking here briefly (bounded by stop_timeout, then SIGKILL)
+    // keeps the same synchronous "torn down before this call returns"
+    // contract the old puller->stop() had.
+    const auto deadline = std::chrono::steady_clock::now() + options_.stop_timeout;
+    int status = 0;
+    for (;;) {
+        const pid_t waited = ::waitpid(job.pid, &status, WNOHANG);
+        if (waited == job.pid) break;
+        if (std::chrono::steady_clock::now() >= deadline) {
+            ::kill(job.pid, SIGKILL);
+            ::waitpid(job.pid, &status, 0);
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    job.pid = -1;
+    job.terminate_sent_at.reset();
+    job.status = "stopped";
+}
+
+void SourceJobManager::reap_locked() {
+    for (auto& [key, job] : jobs_) {
+        (void)key;
+        if (job.pid <= 0) continue;
+        int status = 0;
+        const pid_t pid = ::waitpid(job.pid, &status, WNOHANG);
+        if (pid <= 0) {
+            // Still running: promote "starting" to "running" once it has had
+            // a moment to establish the input/outputs.
+            if (job.status == "starting" &&
+                std::chrono::steady_clock::now() - job.started_at > std::chrono::seconds(2)) {
+                job.status = "running";
+            }
+            continue;
+        }
+        job.pid = -1;
+        job.terminate_sent_at.reset();
+        const bool exited_cleanly = WIFEXITED(status) && WEXITSTATUS(status) == 0;
+        if (job.stop_requested) {
+            job.status = "stopped";
+            job.stop_requested = false;
+            continue;
+        }
+        ++job.restart_attempts;
+        job.status = "error";
+        job.detail = exited_cleanly ? "ffmpeg exited"
+                                    : "ffmpeg exited with status " + std::to_string(status);
+        if (job.enabled && job.config.auto_restart &&
+            job.restart_attempts <= options_.max_restart_attempts) {
+            job.restart_at =
+                std::chrono::steady_clock::now() + std::chrono::seconds(job.config.restart_delay_seconds);
+        }
+    }
+}
+
+void SourceJobManager::enforce_stop_deadlines_locked() {
+    const auto now = std::chrono::steady_clock::now();
+    for (auto& [key, job] : jobs_) {
+        (void)key;
+        if (job.pid > 0 && job.terminate_sent_at && now - *job.terminate_sent_at >= options_.stop_timeout) {
+            ::kill(job.pid, SIGKILL);
+            job.terminate_sent_at = now + std::chrono::hours(24);
+        }
+    }
 }
 
 SourceJobSnapshot SourceJobManager::snapshot_locked(const Job& job) const {
@@ -203,9 +284,8 @@ SourceJobSnapshot SourceJobManager::snapshot_locked(const Job& job) const {
     snapshot.enabled = job.enabled;
     snapshot.auto_restart = job.config.auto_restart;
     snapshot.restart_delay_seconds = job.config.restart_delay_seconds;
-    snapshot.status = job.enabled ? (job.puller ? status_text(job.puller->status()) : "stopped")
-                                  : "disabled";
-    snapshot.detail = job.puller ? job.puller->detail() : "";
+    snapshot.status = job.enabled ? job.status : "disabled";
+    snapshot.detail = job.detail;
     snapshot.renditions = job.config.renditions;
     return snapshot;
 }
@@ -228,6 +308,9 @@ core::Result<SourceJobSnapshot> SourceJobManager::create(const SourceJobConfig& 
 
     Job job;
     job.config = config;
+    auto argv = build_argv(config);
+    if (!argv) return argv.error();
+    job.argv = std::move(argv).value();
     start_locked(job);
     auto snapshot = snapshot_locked(job);
 
@@ -244,9 +327,10 @@ core::Result<SourceJobSnapshot> SourceJobManager::set_enabled(const std::string&
     if (job.enabled == enabled) return snapshot_locked(job);
 
     if (enabled) {
-        start_locked(job); // restart the pull/transcode pipeline from stored config
+        job.restart_attempts = 0;
+        start_locked(job); // respawn ffmpeg from stored config
     } else {
-        teardown_locked(job); // stop pulling/transcoding; source's HLS output disappears
+        teardown_locked(job); // stop transcoding; source's HLS output stops updating
         job.enabled = false;
     }
     return snapshot_locked(job);
@@ -259,9 +343,9 @@ core::Result<SourceJobSnapshot> SourceJobManager::restart(const std::string& app
     if (it == jobs_.end()) return job_error("no such source job");
     Job& job = it->second;
     if (!job.enabled) return job_error("job is disabled; enable it first");
-    teardown_locked(job, /*preserve_delivery_state=*/true);
+    teardown_locked(job);
+    job.restart_attempts = 0;
     start_locked(job);
-    job.error_since = {};
     return snapshot_locked(job);
 }
 
@@ -278,6 +362,7 @@ std::vector<SourceJobSnapshot> SourceJobManager::list(const std::string& applica
     std::lock_guard lock(mutex_);
     std::vector<SourceJobSnapshot> result;
     for (const auto& [key, job] : jobs_) {
+        (void)key;
         if (!application.empty() && job.config.application != application) continue;
         result.push_back(snapshot_locked(job));
     }
@@ -286,7 +371,10 @@ std::vector<SourceJobSnapshot> SourceJobManager::list(const std::string& applica
 
 void SourceJobManager::stop_all() {
     std::lock_guard lock(mutex_);
-    for (auto& [key, job] : jobs_) teardown_locked(job);
+    for (auto& [key, job] : jobs_) {
+        (void)key;
+        teardown_locked(job);
+    }
     jobs_.clear();
 }
 

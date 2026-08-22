@@ -103,8 +103,9 @@ CONFIGURE_FIREWALL="${RTMP_CONFIGURE_FIREWALL:-1}"
 CONFIGURE_DNS="${RTMP_CONFIGURE_DNS:-1}"
 FORCE_ROTATE="${RTMP_FORCE_ROTATE_SECRETS:-0}"
 FRESH_INSTALL="${RTMP_FRESH_INSTALL:-1}"
-# The external-process transcoder is intentionally unavailable in production.
-# Source-transcode jobs use RTMP_NATIVE_TRANSCODE and never invoke FFmpeg.
+# The output-rule Transcode feature (arbitrary rendition rules on published
+# streams, distinct from Source Transcode) is intentionally left off by
+# default in production installs.
 ENABLE_TRANSCODING=0
 TRANSCODING_RULES="${RTMP_TRANSCODING_RULES:-}"
 ENABLE_FAST_JOIN="${RTMP_ENABLE_FAST_JOIN:-1}"
@@ -147,7 +148,7 @@ fi
 [[ "${FORCE_ROTATE}" =~ ^[01]$ ]] || die "RTMP_FORCE_ROTATE_SECRETS must be 0 or 1."
 [[ "${FRESH_INSTALL}" =~ ^[01]$ ]] || die "RTMP_FRESH_INSTALL must be 0 or 1."
 if [[ "${RTMP_ENABLE_TRANSCODING:-0}" != "0" ]]; then
-  die "RTMP_ENABLE_TRANSCODING is not supported: production source transcoding is FFmpeg-free and native."
+  die "RTMP_ENABLE_TRANSCODING is not supported by this installer's production preset."
 fi
 [[ "${ENABLE_FAST_JOIN}" =~ ^[01]$ ]] || die "RTMP_ENABLE_FAST_JOIN must be 0 or 1."
 [[ "${ENABLE_DISK_GUARD}" =~ ^[01]$ ]] || die "RTMP_ENABLE_DISK_GUARD must be 0 or 1."
@@ -422,14 +423,20 @@ DETECTED_CLANG_MAJOR="$("${CLANG_BIN}" --version | sed -n 's/.*version \([0-9]\+
   die "clang ${DETECTED_CLANG_MAJOR} is too old for C++23 (need >= ${CLANG_MIN_MAJOR}); this distribution only offers ${CLANG_PACKAGE}."
 log "Using ${CLANG_BIN} (clang ${DETECTED_CLANG_MAJOR})"
 
-# In-process FFmpeg-free transcoding pipeline + source-transcode jobs
-# (docs/native-transcoding.md): openh264 (H.264 decode), x265 (HEVC encode),
-# x264 (H.264 encode), libfdk-aac (AAC), libyuv (scale), libcurl (HLS source
-# pull). It is mandatory in the production installer: there is deliberately no
-# FFmpeg fallback.
+# Both the output-rule Transcode feature and Source Transcode jobs spawn real
+# FFmpeg subprocesses (src/transcoding/supervisor.cpp, native/source_job_manager.cpp),
+# so ffmpeg is mandatory. The old FFmpeg-free native decode/encode pipeline
+# (docs/native-transcoding.md) is kept in the tree but unused by default; its
+# codec dev libraries are still installed below so it keeps compiling if ever
+# re-enabled, but nothing in production depends on it anymore.
+apt-get install -y --no-install-recommends "${APT_REINSTALL_ARGS[@]}" ffmpeg
+FFMPEG_BIN="$(command -v ffmpeg || true)"
+[[ -n "${FFMPEG_BIN}" ]] || die "ffmpeg was installed but is not on PATH."
+log "Using ${FFMPEG_BIN} ($(ffmpeg -version | head -n1))"
+
 NATIVE_TRANSCODE=1
 if [[ "${RTMP_ENABLE_NATIVE_TRANSCODE:-1}" != "1" ]]; then
-  die "RTMP_ENABLE_NATIVE_TRANSCODE=0 is unsupported: no FFmpeg fallback is installed."
+  NATIVE_TRANSCODE=0
 fi
 apt-get install -y --no-install-recommends "${APT_REINSTALL_ARGS[@]}" \
   libx265-dev libx264-dev libopenh264-dev libfdk-aac-dev libcurl4-openssl-dev libyuv-dev

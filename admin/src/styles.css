@@ -894,6 +894,30 @@ tbody tr:hover { background: #fcfcfd; }
   white-space: nowrap;
 }
 .application-title-row p { margin: 4px 0 0; color: var(--muted); font-size: 10px; }
+.detail-tab-bar {
+  display: flex;
+  gap: 6px;
+  padding: 0 21px;
+  margin-top: 14px;
+}
+.detail-tab {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 9px 15px;
+  border: 1px solid #e3e7ee;
+  border-bottom: none;
+  border-radius: 10px 10px 0 0;
+  background: #f6f7fa;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.detail-tab.active {
+  background: #fff;
+  color: var(--ink, #16181d);
+}
 .source-workspace-heading {
   min-height: 82px;
   padding: 18px 21px;

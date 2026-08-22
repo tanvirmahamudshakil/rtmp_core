@@ -3,9 +3,11 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -13,9 +15,8 @@
 
 #include "rtmp_server/core/result.hpp"
 #include "rtmp_server/hls/playlist.hpp"
-#include "rtmp_server/hls/segment_store.hpp"
-#include "rtmp_server/transcoding/native/hls_source_puller.hpp"
-#include "rtmp_server/transcoding/native/source_transcoder.hpp"
+#include "rtmp_server/transcoding/backend.hpp"
+#include "rtmp_server/transcoding/native/source_transcoder.hpp" // RenditionSpec, FitMode
 
 namespace rtmp_server::transcoding::native {
 
@@ -23,12 +24,12 @@ namespace rtmp_server::transcoding::native {
 struct SourceJobConfig {
     std::string application;
     std::string name;          // output base stream name
-    std::string source_url;    // native rtmp:// pull or content-detected HTTP(S) HLS/TS
+    std::string source_url;    // rtmp:// pull or http(s):// HLS/TS, fed straight to ffmpeg -i
     std::string template_name; // for display / persistence
     std::uint32_t fps = 30;
     std::vector<RenditionSpec> renditions; // each with an output_stream key
-    // If the puller dies (source unreachable, dropped mid-stream, etc.) the
-    // manager's monitor loop restarts it automatically after this many
+    // If the ffmpeg child dies (source unreachable, dropped mid-stream, etc.)
+    // the manager's monitor loop restarts it automatically after this many
     // seconds, so a flaky upstream doesn't require manual re-enabling.
     bool auto_restart = true;
     std::uint32_t restart_delay_seconds = 5;
@@ -48,24 +49,39 @@ struct SourceJobSnapshot {
     std::vector<RenditionSpec> renditions;
 };
 
-// Owns the lifecycle of source-transcode jobs: for each rendition it creates a
-// SegmentStore, registers it for HLS serving, wires up the master playlist, and
-// runs a native RTMP/HLS/TS source puller. Segment-store registration and master-playlist
-// declaration are injected as hooks so this stays independent of the HTTP layer.
+// Options controlling how the manager talks to ffmpeg and the server's own
+// loopback RTMP listener. Mirrors transcoding::SupervisorOptions, since a
+// source job's output side works exactly like TranscoderSupervisor's: each
+// rendition is pushed as an ordinary `-f flv` RTMP publish back into the
+// server, which segments it into HLS the same way any other published stream
+// is segmented.
+struct SourceJobManagerOptions {
+    std::string ffmpeg_path = "/usr/bin/ffmpeg";
+    std::string loopback_host = "127.0.0.1";
+    std::uint16_t rtmp_port = 1935;
+    std::chrono::seconds stop_timeout{5};
+    std::uint32_t max_restart_attempts = 5;
+};
+
+// Owns the lifecycle of source-transcode jobs: for each job it spawns one
+// ffmpeg subprocess that pulls the external source_url and pushes every
+// rendition back into the server's own loopback RTMP listener as `-f flv`
+// outputs — exactly how TranscoderSupervisor's renditions work, just with an
+// arbitrary external URL as input instead of a locally-published stream. Each
+// pushed rendition is picked up by the server's normal publish-triggered HLS
+// segmenter with no extra code here; this class only has to publish the
+// master playlist (via the set_renditions hook) and manage the ffmpeg child's
+// lifecycle (spawn/restart/stop).
 class SourceJobManager {
 public:
     struct Hooks {
-        std::function<void(const std::string& application, const std::string& stream,
-                           std::shared_ptr<hls::SegmentStore>)>
-            register_store;
-        std::function<void(const std::string& application, const std::string& stream)>
-            unregister_store;
         std::function<void(const std::string& application, const std::string& master,
                            std::vector<hls::Rendition>)>
             set_renditions;
     };
 
-    explicit SourceJobManager(Hooks hooks, std::string hls_route_prefix = "/hls");
+    explicit SourceJobManager(Hooks hooks, SourceJobManagerOptions options = {},
+                              std::string hls_route_prefix = "/hls");
     ~SourceJobManager();
     SourceJobManager(const SourceJobManager&) = delete;
     SourceJobManager& operator=(const SourceJobManager&) = delete;
@@ -74,14 +90,14 @@ public:
     [[nodiscard]] core::Result<SourceJobSnapshot> create(const SourceJobConfig& config);
     [[nodiscard]] bool remove(const std::string& application, const std::string& name);
     // Toggles a job without dropping its configuration: disabling stops the
-    // puller and unregisters its segment stores (source stops transcoding,
-    // its HLS output disappears); enabling restarts the pull/transcode
-    // pipeline from the stored config, mirroring StreamManager::set_enabled.
+    // ffmpeg child (source stops transcoding, its HLS output stops updating);
+    // enabling restarts it from the stored config, mirroring
+    // StreamManager::set_enabled.
     [[nodiscard]] core::Result<SourceJobSnapshot> set_enabled(const std::string& application,
                                                               const std::string& name, bool enabled);
-    // Manual restart: tears down and rebuilds the pull/transcode pipeline from
-    // its stored config, same as an auto-restart cycle but triggered on
-    // demand (e.g. an operator hitting "Restart" in the admin UI). No-op on a
+    // Manual restart: tears down and respawns the ffmpeg child from its
+    // stored config, same as an auto-restart cycle but triggered on demand
+    // (e.g. an operator hitting "Restart" in the admin UI). No-op on a
     // disabled job — enable it first.
     [[nodiscard]] core::Result<SourceJobSnapshot> restart(const std::string& application,
                                                           const std::string& name);
@@ -91,26 +107,33 @@ public:
 private:
     struct Job {
         SourceJobConfig config;
-        std::unique_ptr<HlsSourcePuller> puller;
-        std::vector<std::string> output_streams; // registered stream keys
-        // Kept across automatic/manual pipeline restarts so the old live
-        // window, monotonic segment sequence and HLS viewer-session stats
-        // remain available while the source recovers.
-        std::vector<std::shared_ptr<hls::SegmentStore>> stores;
+        std::vector<std::string> argv;
+        int pid = -1;
+        std::uint32_t restart_attempts = 0;
         bool enabled = true;
-        // Set when the monitor loop first observes this job's puller in
-        // PullerStatus::Error; cleared once it's healthy again or restarted.
-        std::chrono::steady_clock::time_point error_since{};
+        bool stop_requested = false;
+        std::string status = "stopped"; // "starting" | "running" | "error" | "stopped" | "disabled"
+        std::string detail;
+        std::chrono::steady_clock::time_point started_at{};
+        std::chrono::steady_clock::time_point restart_at{};
+        std::optional<std::chrono::steady_clock::time_point> terminate_sent_at;
     };
 
     [[nodiscard]] std::string master_path(const std::string& application,
                                           const std::string& name) const;
-    void teardown_locked(Job& job, bool preserve_delivery_state = false);
+    [[nodiscard]] core::Result<std::vector<std::string>> build_argv(const SourceJobConfig& config) const;
+    void publish_master_locked(const SourceJobConfig& config);
     void start_locked(Job& job);
+    void spawn_locked(Job& job);
+    void teardown_locked(Job& job, bool block_until_stopped = true);
     [[nodiscard]] SourceJobSnapshot snapshot_locked(const Job& job) const;
     void monitor_loop();
+    void reap_locked();
+    void enforce_stop_deadlines_locked();
 
     Hooks hooks_;
+    SourceJobManagerOptions options_;
+    BackendRegistry backends_;
     std::string route_prefix_;
     mutable std::mutex mutex_;
     std::unordered_map<std::string, Job> jobs_; // key: "application/name"

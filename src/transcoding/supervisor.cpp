@@ -11,6 +11,7 @@
 
 #include "rtmp_server/core/error.hpp"
 #include "rtmp_server/observability/logger.hpp"
+#include "rtmp_server/transcoding/ffmpeg_args.hpp"
 
 extern char** environ;
 
@@ -27,42 +28,6 @@ std::string output_key(std::string_view application, std::string_view stream) {
 core::Error config_error(std::string message) {
     return core::Error(core::ErrorCode::InvalidConfiguration, core::ErrorCategory::Configuration,
                        std::move(message));
-}
-
-void append(std::vector<std::string>& args, std::string key, std::string value) {
-    args.push_back(std::move(key));
-    args.push_back(std::move(value));
-}
-
-std::string even(std::uint32_t value) {
-    return std::to_string(value - (value % 2));
-}
-
-std::optional<std::string> video_filter(const Preset& preset) {
-    switch (preset.fit_mode) {
-        case FitMode::MatchSource:
-            return std::nullopt;
-        case FitMode::FitWidth:
-            return "scale=" + even(*preset.width) + ":-2";
-        case FitMode::FitHeight:
-            return "scale=-2:" + even(*preset.height);
-        case FitMode::Stretch:
-            return "scale=" + even(*preset.width) + ":" + even(*preset.height);
-        case FitMode::Crop: {
-            const auto width = even(*preset.width);
-            const auto height = even(*preset.height);
-            return "scale=" + width + ":" + height +
-                   ":force_original_aspect_ratio=increase,crop=" + width + ":" + height;
-        }
-        case FitMode::Letterbox: {
-            const auto width = even(*preset.width);
-            const auto height = even(*preset.height);
-            return "scale=" + width + ":" + height +
-                   ":force_original_aspect_ratio=decrease,pad=" + width + ":" + height +
-                   ":(ow-iw)/2:(oh-ih)/2:black";
-        }
-    }
-    return std::nullopt;
 }
 
 } // namespace
@@ -436,6 +401,8 @@ core::Result<std::vector<std::string>> TranscoderSupervisor::build_arguments(
             source.app + "/" + source.stream_key,
     };
 
+    const std::size_t concurrent_encoders =
+        std::max<std::size_t>(1, options_.max_active_jobs * presets.size());
     for (const auto& preset : presets) {
         // The current origin's RTMP parser and MPEG-TS packager support
         // AVC/AAC. Other model values remain valid for future SRT/WebRTC
@@ -451,75 +418,13 @@ core::Result<std::vector<std::string>> TranscoderSupervisor::build_arguments(
             preset.audio_codec != AudioCodec::Disabled) {
             return config_error("RTMP/HLS output currently supports AAC, passthrough or disabled audio");
         }
-        if (preset.video_codec == VideoCodec::Passthrough && video_filter(preset)) {
-            return config_error("passthrough video cannot change frame size or fit mode");
-        }
 
-        auto video_encoder = backends_.video_encoder(preset);
-        if (!video_encoder) return video_encoder.error();
-        auto audio_encoder = backends_.audio_encoder(preset);
-        if (!audio_encoder) return audio_encoder.error();
-
-        if (preset.video_codec == VideoCodec::Disabled) {
-            args.push_back("-vn");
-        } else {
-            append(args, "-map", "0:v:0?");
-            append(args, "-c:v", video_encoder.value());
-            if (preset.video_codec != VideoCodec::Passthrough) {
-                if (auto filter = video_filter(preset)) append(args, "-vf", *filter);
-                append(args, "-b:v", std::to_string(preset.video_bitrate));
-                append(args, "-maxrate", std::to_string(preset.video_bitrate));
-                append(args, "-bufsize", std::to_string(preset.video_bitrate * 2));
-                append(args, "-profile:v", preset.profile);
-                append(args, "-pix_fmt", "yuv420p");
-                if (preset.keyframe_interval) {
-                    append(args, "-g", std::to_string(*preset.keyframe_interval));
-                    append(args, "-keyint_min", std::to_string(*preset.keyframe_interval));
-                } else {
-                    append(args, "-force_key_frames", "source");
-                }
-                append(args, "-sc_threshold", "0");
-                if (preset.backend == BackendKind::Software) {
-                    append(args, "-preset", "veryfast");
-                    append(args, "-tune", "zerolatency");
-                    // libx264 defaults to one thread per CPU core. Left
-                    // uncapped, concurrent jobs (multiple renditions of one
-                    // stream, or multiple streams up to max_active_jobs) each
-                    // try to claim every core and contend with each other,
-                    // which is what turns a real-time encode into a
-                    // behind-realtime one and produces the discontinuities
-                    // that follow from restart loops. Divide the host's
-                    // cores across the worst-case concurrent encoder count.
-                    const auto hardware = std::thread::hardware_concurrency();
-                    const std::size_t concurrent_encoders =
-                        std::max<std::size_t>(1, options_.max_active_jobs * presets.size());
-                    const std::size_t threads =
-                        std::max<std::size_t>(1, hardware > 0 ? hardware / concurrent_encoders : 1);
-                    append(args, "-threads", std::to_string(threads));
-                } else if (preset.backend == BackendKind::Nvenc) {
-                    append(args, "-preset", "p4");
-                    append(args, "-tune", "ll");
-                    if (preset.gpu_id) append(args, "-gpu", std::to_string(*preset.gpu_id));
-                } else if (preset.backend == BackendKind::QuickSync) {
-                    append(args, "-preset", "medium");
-                }
-            }
-        }
-
-        if (preset.audio_codec == AudioCodec::Disabled) {
-            args.push_back("-an");
-        } else {
-            append(args, "-map", "0:a:0?");
-            append(args, "-c:a", audio_encoder.value());
-            if (preset.audio_codec != AudioCodec::Passthrough) {
-                append(args, "-b:a", std::to_string(preset.audio_bitrate));
-                append(args, "-af", "aresample=async=1:first_pts=0");
-            }
-        }
-        append(args, "-flvflags", "no_duration_filesize");
-        append(args, "-f", "flv");
-        args.push_back("rtmp://" + options_.loopback_host + ":" + std::to_string(options_.rtmp_port) + "/" +
-                       source.app + "/" + preset.outgoing_stream_name);
+        const std::string destination = "rtmp://" + options_.loopback_host + ":" +
+                                        std::to_string(options_.rtmp_port) + "/" + source.app + "/" +
+                                        preset.outgoing_stream_name;
+        auto appended =
+            ffmpeg_append_rendition_output(args, backends_, preset, concurrent_encoders, destination);
+        if (!appended) return appended.error();
     }
     return args;
 }

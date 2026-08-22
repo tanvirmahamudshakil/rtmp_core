@@ -26,9 +26,7 @@
 #include "rtmp_server/protocol/commands/stream_ids.hpp"
 #include "rtmp_server/protocol/commands/stream_registry.hpp"
 #include "rtmp_server/transcoding/supervisor.hpp"
-#ifdef RTMP_NATIVE_TRANSCODE
 #include "rtmp_server/transcoding/native/source_job_manager.hpp"
-#endif
 
 namespace {
 
@@ -190,22 +188,7 @@ int main(int argc, char** argv) {
     // shares the same segment bytes instead of allocating its own media copy.
     rtmp_server::control::HlsHttpOptions hls_options;
     hls_options.require_playback_token = false;
-    // Keep one opaque identity per player in both modes. At high scale the
-    // first playlist open still reaches the origin for its private redirect,
-    // while subsequent session-bearing playlist polls share a query-free body
-    // at Varnish. This preserves NAT-safe viewer counting without multiplying
-    // origin playlist generation by the viewer count.
     hls_options.enable_playback_sessions = true;
-    hls_options.track_delivery_stats = !config.hls_high_scale_mode;
-    hls_options.propagate_query_to_playlist_uris = true;
-    if (config.hls_high_scale_mode) {
-        hls_options.enable_shared_playlist_cache = true;
-        hls_options.propagate_query_to_playlist_uris = false;
-        hls_options.playlist_cache_control =
-            "public, max-age=1, s-maxage=1, stale-while-revalidate=2";
-        hls_options.master_cache_control =
-            "public, max-age=30, s-maxage=30, stale-while-revalidate=60";
-    }
     rtmp_server::control::HlsHttpHandler hls_handler(std::move(hls_options));
     // Disabling a stream (or its application) takes its .m3u8 links offline
     // immediately, mirroring the RTMP publish/play gate above — no viewer can
@@ -236,13 +219,6 @@ int main(int argc, char** argv) {
             segmenter_config.target_duration = std::chrono::seconds(2);
             segmenter_config.max_segment_duration = std::chrono::seconds(8);
             segmenter_config.max_segment_bytes = 16u * 1024u * 1024u;
-            // Segment names must not repeat after a publisher reconnect or a
-            // process restart; shared caches may retain immutable objects long
-            // after the in-memory live window has advanced.
-            segmenter_config.initial_sequence = static_cast<std::uint64_t>(
-                std::chrono::duration_cast<std::chrono::milliseconds>(
-                    std::chrono::system_clock::now().time_since_epoch())
-                    .count());
 
             hls_handler.register_stream(std::string(application), std::string(stream), store);
             return std::make_shared<rtmp_server::hls::StreamSink>(std::move(store),
@@ -481,30 +457,28 @@ int main(int argc, char** argv) {
                 return {};
             });
     }
-#ifdef RTMP_NATIVE_TRANSCODE
-    // Source-transcode jobs: pull native RTMP or content-detected HTTP(S)
-    // HLS/TS, transcode it with the in-process external-process-free pipeline, and
-    // re-serve the renditions as one adaptive master .m3u8. Each rendition's
-    // segment store is registered with the HLS handler for delivery.
+    // Source-transcode jobs: pull an external URL (rtmp:// or an http(s)
+    // .m3u8/.ts) and re-encode it via real ffmpeg subprocesses, one per job,
+    // exactly like TranscoderSupervisor's output side — each rendition is
+    // pushed back into this server's own loopback RTMP listener as an
+    // ordinary `-f flv` publish, so the normal publish-triggered HLS
+    // segmenter (see services.recorder_factory above) picks it up with no
+    // extra code here. This class only has to publish the master playlist
+    // (set_renditions) and manage the ffmpeg child's lifecycle.
     rtmp_server::transcoding::native::SourceJobManager::Hooks source_hooks;
-    source_hooks.register_store = [&hls_handler](const std::string& application,
-                                                 const std::string& stream,
-                                                 std::shared_ptr<rtmp_server::hls::SegmentStore> store) {
-        hls_handler.register_stream(application, stream, std::move(store));
-    };
-    source_hooks.unregister_store = [&hls_handler](const std::string& application,
-                                                   const std::string& stream) {
-        hls_handler.unregister_stream(application, stream);
-    };
     source_hooks.set_renditions = [&hls_handler](const std::string& application,
                                                  const std::string& master,
                                                  std::vector<rtmp_server::hls::Rendition> renditions) {
         hls_handler.set_renditions(application, master, std::move(renditions));
     };
-    rtmp_server::transcoding::native::SourceJobManager source_job_manager(std::move(source_hooks),
-                                                                          "/hls");
+    rtmp_server::transcoding::native::SourceJobManagerOptions source_job_options;
+    source_job_options.ffmpeg_path = config.transcoding_ffmpeg_path;
+    source_job_options.rtmp_port = config.rtmp_port;
+    source_job_options.max_restart_attempts = config.transcoding_max_restart_attempts;
+    rtmp_server::transcoding::native::SourceJobManager source_job_manager(
+        std::move(source_hooks), std::move(source_job_options), "/hls");
 
-    const auto source_job_json = [&hls_handler, &config](const rtmp_server::transcoding::native::SourceJobSnapshot& job) {
+    const auto source_job_json = [&hls_handler](const rtmp_server::transcoding::native::SourceJobSnapshot& job) {
         auto esc = [](std::string_view v) {
             std::string out;
             for (char c : v) {
@@ -528,9 +502,7 @@ int main(int argc, char** argv) {
            << (job.enabled ? "true" : "false") << R"(,"auto_restart":)"
            << (job.auto_restart ? "true" : "false") << R"(,"restart_delay_seconds":)"
            << job.restart_delay_seconds << R"(,"bytes_total":)" << link_stats.bytes_total
-           << R"(,"viewer_count":)" << link_stats.viewer_count
-           << R"(,"delivery_stats_available":)" << (!config.hls_high_scale_mode ? "true" : "false")
-           << R"(,"outputs":[)";
+           << R"(,"viewer_count":)" << link_stats.viewer_count << R"(,"outputs":[)";
         for (std::size_t i = 0; i < job.renditions.size(); ++i) {
             const auto& r = job.renditions[i];
             if (i) os << ',';
@@ -630,7 +602,6 @@ int main(int argc, char** argv) {
             if (!snapshot) return snapshot.error();
             return source_job_json(snapshot.value());
         });
-#endif
 
     management_api.set_live_state_provider([&stream_manager, &stream_registry, &stream_id_registry, &pool] {
         std::vector<rtmp_server::management::LiveState> states;
@@ -646,7 +617,6 @@ int main(int argc, char** argv) {
                 if (state.is_live) {
                     if (auto id = stream_id_registry.find(stream.application, stream.name)) {
                         state.viewer_count = pool.subscriber_count(*id);
-                        state.egress_bytes_total = pool.egress_bytes_total(*id);
                     }
                 }
                 states.push_back(std::move(state));
