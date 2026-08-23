@@ -128,9 +128,25 @@ core::Result<std::vector<std::string>> SourceJobManager::build_argv(const Source
         "+genpts+discardcorrupt",
         "-rw_timeout",
         "15000000",
-        "-i",
-        config.source_url,
     };
+    // An http(s) source is an HLS/TS pull: ffmpeg's demuxer reads whatever
+    // segment bytes are already available on the wire as fast as the network
+    // delivers them, with no pacing of its own. Against an upstream that
+    // publishes in large chunks (e.g. 10s HLS segments), that means ffmpeg
+    // decodes/encodes/pushes an entire chunk in a burst — much faster than
+    // real time — then blocks until the next chunk exists, so this origin's
+    // own segmenter output arrives in the same bursty pattern instead of the
+    // steady per-segment cadence a live player expects, reading as stutter
+    // even though average throughput matches real time. `-re` paces the read
+    // to the source's own embedded timestamps, smoothing that out.
+    // An rtmp:// source is already a live, real-time push from its own
+    // encoder; ffmpeg's docs warn `-re` on a live input can itself introduce
+    // packet loss, so it is deliberately left off for that case.
+    if (config.source_url.starts_with("http://") || config.source_url.starts_with("https://")) {
+        args.push_back("-re");
+    }
+    args.push_back("-i");
+    args.push_back(config.source_url);
 
     const std::size_t concurrent_encoders = std::max<std::size_t>(1, config.renditions.size());
     for (const auto& spec : config.renditions) {
