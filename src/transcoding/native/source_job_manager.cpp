@@ -299,6 +299,22 @@ core::Result<SourceJobSnapshot> SourceJobManager::create(const SourceJobConfig& 
         if (rendition.output_stream.empty()) return job_error("every rendition needs an output stream name");
     }
 
+    // Every rendition publishes back into this server's own loopback RTMP
+    // listener, which enforces the same key_validator gate as an OBS
+    // publish: the target stream must already exist and be enabled, or
+    // ffmpeg's push is rejected ("Stream key rejected or missing") and the
+    // child exits immediately (build_argv's destination is
+    // rtmp://loopback:port/application/output_stream). Create/enable each
+    // output stream up front so a freshly created job doesn't spin in an
+    // error/auto-restart loop until an operator notices and creates it by hand.
+    if (hooks_.prepare_output) {
+        for (const auto& rendition : config.renditions) {
+            if (!hooks_.prepare_output(config.application, rendition.output_stream)) {
+                return job_error("failed to prepare output stream '" + rendition.output_stream + "'");
+            }
+        }
+    }
+
     std::lock_guard lock(mutex_);
     const std::string key = key_of(config.application, config.name);
     if (auto it = jobs_.find(key); it != jobs_.end()) {

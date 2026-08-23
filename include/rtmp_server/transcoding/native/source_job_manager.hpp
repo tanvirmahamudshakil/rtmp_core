@@ -78,6 +78,16 @@ public:
         std::function<void(const std::string& application, const std::string& master,
                            std::vector<hls::Rendition>)>
             set_renditions;
+        // Called once per rendition before the ffmpeg child is spawned, so the
+        // output stream exists and is enabled before ffmpeg tries to publish
+        // to it — otherwise the RTMP listener's key_validator rejects the
+        // push (same gate a normal OBS publish goes through) and the child
+        // exits immediately. Mirrors TranscoderSupervisor::PrepareOutput.
+        // Returning false aborts the job the same way an ffmpeg spawn failure
+        // does. Optional: an unset hook preserves the previous behaviour for
+        // any caller that already creates output streams itself.
+        std::function<bool(std::string_view application, std::string_view output_stream)>
+            prepare_output;
     };
 
     explicit SourceJobManager(Hooks hooks, SourceJobManagerOptions options = {},

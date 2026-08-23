@@ -498,6 +498,19 @@ int main(int argc, char** argv) {
                                                  std::vector<rtmp_server::hls::Rendition> renditions) {
         hls_handler.set_renditions(application, master, std::move(renditions));
     };
+    // Each rendition publishes back into this server's own loopback RTMP
+    // listener, which gates every publish on services.key_validator above:
+    // the target stream must already exist and be enabled. Without this, a
+    // freshly created source job's ffmpeg child gets "Stream key rejected or
+    // missing" from the server, exits immediately, and the job sits in an
+    // auto-restart loop until an operator notices and creates the output
+    // stream by hand. Same pattern as TranscoderSupervisor::set_prepare_output
+    // above.
+    source_hooks.prepare_output = [&stream_manager](std::string_view application,
+                                                     std::string_view output_stream) {
+        if (stream_manager.find_stream(application, output_stream)) return true;
+        return stream_manager.create_stream(application, std::string(output_stream), false).ok();
+    };
     rtmp_server::transcoding::native::SourceJobManagerOptions source_job_options;
     source_job_options.ffmpeg_path = config.transcoding_ffmpeg_path;
     source_job_options.rtmp_port = config.rtmp_port;
