@@ -205,12 +205,17 @@ int main(int argc, char** argv) {
     // is what makes one cached object correct for every player.
     hls_options.enable_shared_playlist_cache = true;
     hls_options.playlist_cache_control = "public, max-age=1, s-maxage=1, stale-while-revalidate=2";
-    // Delivery accounting takes that same shared mutex on every request it
-    // sees. With the cache collapsing playlist polls the origin no longer
-    // observes enough of them to count viewers anyway; the admin panel reads
-    // the edge's own per-session numbers from /internal/viewer_estimate.json
-    // (deploy/viewer-estimator), which sees hits as well as misses.
-    hls_options.track_delivery_stats = false;
+    // Delivery accounting stays on. The admin panel prefers the edge's own
+    // per-session numbers from /internal/viewer_estimate.json when they are
+    // fresh and match a stream's key (admin/src/api.ts sourceEdgeValue /
+    // exactEdgeValue), but a source-transcode job's viewer_count falls back
+    // to this handler's own aggregate_link_stats() whenever the edge file is
+    // stale, unreachable, or its rendition keys don't match yet — turning
+    // this off left that fallback permanently reporting zero viewers instead
+    // of only when the origin is otherwise idle. Cache collapsing above
+    // already cut playlist volume at the origin to ~1 req/s per stream, so
+    // this mutex is no longer the contention source it was before.
+    hls_options.track_delivery_stats = true;
     rtmp_server::control::HlsHttpHandler hls_handler(std::move(hls_options));
     // Disabling a stream (or its application) takes its .m3u8 links offline
     // immediately, mirroring the RTMP publish/play gate above — no viewer can
