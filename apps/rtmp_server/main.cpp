@@ -189,6 +189,28 @@ int main(int argc, char** argv) {
     rtmp_server::control::HlsHttpOptions hls_options;
     hls_options.require_playback_token = false;
     hls_options.enable_playback_sessions = true;
+    // The shared Varnish cache in front of this origin (deploy/varnish/
+    // streamforge.vcl) is the viewer-facing delivery tier. Two things have to
+    // line up for a media playlist to be collapsed there instead of reaching
+    // the origin once per viewer per segment duration:
+    //   * the redirect must carry `viewer_cache=1`, which is the only marker
+    //     vcl_recv accepts before hashing an .m3u8 rather than passing it, and
+    //   * the response must advertise a `public` Cache-Control, which is what
+    //     vcl_backend_response requires before giving the object a TTL.
+    // Without both, every viewer's playlist poll became an origin request that
+    // took the handler's shared registry mutex and the publisher's SegmentStore
+    // mutex, so viewer count stole CPU from the encoders and pushed transcoded
+    // output behind real time. Shared mode also forces playlist bodies to stay
+    // free of per-viewer query state (see the HlsHttpHandler constructor), which
+    // is what makes one cached object correct for every player.
+    hls_options.enable_shared_playlist_cache = true;
+    hls_options.playlist_cache_control = "public, max-age=1, s-maxage=1, stale-while-revalidate=2";
+    // Delivery accounting takes that same shared mutex on every request it
+    // sees. With the cache collapsing playlist polls the origin no longer
+    // observes enough of them to count viewers anyway; the admin panel reads
+    // the edge's own per-session numbers from /internal/viewer_estimate.json
+    // (deploy/viewer-estimator), which sees hits as well as misses.
+    hls_options.track_delivery_stats = false;
     rtmp_server::control::HlsHttpHandler hls_handler(std::move(hls_options));
     // Disabling a stream (or its application) takes its .m3u8 links offline
     // immediately, mirroring the RTMP publish/play gate above — no viewer can
