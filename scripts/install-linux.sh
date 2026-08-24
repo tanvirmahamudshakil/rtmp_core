@@ -423,23 +423,15 @@ DETECTED_CLANG_MAJOR="$("${CLANG_BIN}" --version | sed -n 's/.*version \([0-9]\+
   die "clang ${DETECTED_CLANG_MAJOR} is too old for C++23 (need >= ${CLANG_MIN_MAJOR}); this distribution only offers ${CLANG_PACKAGE}."
 log "Using ${CLANG_BIN} (clang ${DETECTED_CLANG_MAJOR})"
 
-# Both the output-rule Transcode feature and Source Transcode jobs spawn real
-# FFmpeg subprocesses (src/transcoding/supervisor.cpp, native/source_job_manager.cpp),
-# so ffmpeg is mandatory. The old FFmpeg-free native decode/encode pipeline
-# (docs/native-transcoding.md) is kept in the tree but unused by default; its
-# codec dev libraries are still installed below so it keeps compiling if ever
-# re-enabled, but nothing in production depends on it anymore.
-apt-get install -y --no-install-recommends "${APT_REINSTALL_ARGS[@]}" ffmpeg
-FFMPEG_BIN="$(command -v ffmpeg || true)"
-[[ -n "${FFMPEG_BIN}" ]] || die "ffmpeg was installed but is not on PATH."
-log "Using ${FFMPEG_BIN} ($(ffmpeg -version | head -n1))"
-
+# The FFmpeg-process-spawning transcode subsystem has been removed. The
+# FFmpeg-free native decode/encode pipeline (docs/native-transcoding.md) is
+# the only transcoding path now; its codec dev libraries are installed below.
 NATIVE_TRANSCODE=1
 if [[ "${RTMP_ENABLE_NATIVE_TRANSCODE:-1}" != "1" ]]; then
   NATIVE_TRANSCODE=0
 fi
 apt-get install -y --no-install-recommends "${APT_REINSTALL_ARGS[@]}" \
-  libx265-dev libx264-dev libopenh264-dev libfdk-aac-dev libcurl4-openssl-dev libyuv-dev
+  libx265-dev libx264-dev libopenh264-dev libde265-dev libfdk-aac-dev libcurl4-openssl-dev libyuv-dev
 
 if ! apt-cache show caddy >/dev/null 2>&1; then
   if [[ "${ID}" == "ubuntu" ]]; then

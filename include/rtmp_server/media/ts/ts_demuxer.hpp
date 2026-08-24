@@ -23,6 +23,12 @@
 // "unbounded" length 0 (routine for video) is handled correctly.
 namespace rtmp_server::media::ts {
 
+// Which codec was found on the video PID (from the PMT stream_type). Routing
+// of PES payload through to the video handler is identical either way — this
+// exists only so callers (e.g. the native source-transcode pipeline) know
+// which decoder to feed the emitted access units to.
+enum class TsVideoCodec { Unknown, H264, Hevc };
+
 class TsDemuxer {
 public:
     // annexb is a complete H.264 access unit (start-code prefixed). keyframe is
@@ -46,6 +52,11 @@ public:
 
     // Discards all reassembly and program state (e.g. on a source restart).
     void reset() noexcept;
+
+    // The video codec detected on the PMT's video elementary stream (H.264
+    // stream_type 0x1B or HEVC stream_type 0x24). Unknown until the PMT has
+    // been parsed and a supported video stream was found.
+    [[nodiscard]] TsVideoCodec video_codec() const noexcept { return video_codec_; }
 
 private:
     enum class ElementaryKind { None, Video, Audio };
@@ -71,6 +82,7 @@ private:
     std::uint16_t video_pid_ = 0xFFFF;
     std::uint16_t audio_pid_ = 0xFFFF;
     bool pmt_known_ = false;
+    TsVideoCodec video_codec_ = TsVideoCodec::Unknown;
 
     PesAssembly video_;
     PesAssembly audio_;

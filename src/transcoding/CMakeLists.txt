@@ -1,13 +1,5 @@
 add_library(rtmp_server_transcoding STATIC
     preset.cpp
-    backend.cpp
-    ffmpeg_args.cpp
-    supervisor.cpp
-    # Source Transcode: pulls an external rtmp://, http:// or https:// source
-    # and re-encodes it via real ffmpeg subprocesses (same shape as
-    # supervisor.cpp), so — unlike the native FFmpeg-free pipeline below —
-    # it needs no codec libraries of its own and always compiles.
-    native/source_job_manager.cpp
     # Pure geometry + x265 parameter mapping. No codec libraries required, so
     # these always compile and stay unit-testable even without the native
     # pipeline enabled.
@@ -40,6 +32,7 @@ if(RTMP_NATIVE_TRANSCODE_AVAILABLE)
     target_sources(rtmp_server_transcoding PRIVATE
         native/h264_decoder.cpp
         native/h264_encoder.cpp
+        native/hevc_decoder.cpp
         native/scaler.cpp
         native/hevc_encoder.cpp
         native/video_transcoder.cpp
@@ -59,6 +52,7 @@ if(RTMP_NATIVE_TRANSCODE_AVAILABLE)
             PkgConfig::OPENH264
             PkgConfig::FDKAAC
             PkgConfig::LIBCURL
+            PkgConfig::LIBDE265
             ${RTMP_LIBYUV_TARGET}
     )
     target_compile_definitions(rtmp_server_transcoding PUBLIC RTMP_NATIVE_TRANSCODE=1)

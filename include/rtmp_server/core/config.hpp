@@ -100,13 +100,6 @@ struct ServerConfig {
     std::string database_type = "sqlite";
     std::string database_connection = "./data/rtmp.db";
 
-    bool transcoding_enabled = false;
-    std::string transcoding_preset_file = "./config/transcoding.conf";
-    std::string transcoding_ffmpeg_path = "/usr/bin/ffmpeg";
-    std::uint32_t transcoding_max_active_jobs = 16;
-    std::uint32_t transcoding_max_outputs_per_job = 16;
-    std::uint32_t transcoding_max_restart_attempts = 5;
-
     // Shared-cache HLS delivery: no per-viewer redirect/query state and no
     // per-delivery origin accounting. This is the production default for a
     // single VPS serving a very large public audience through local Varnish.

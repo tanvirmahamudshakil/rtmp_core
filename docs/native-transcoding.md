@@ -1,8 +1,9 @@
 # Native CPU H.265 (HEVC) transcoding
 
-The stock transcoder shells out to FFmpeg (`docs/transcoding.md`). This module
-is an **in-process, FFmpeg-free** alternative that produces HEVC renditions on
-the CPU with a professional-grade quality-per-bitrate configuration.
+This is an **in-process, FFmpeg-free** transcoding pipeline that produces HEVC
+renditions on the CPU with a professional-grade quality-per-bitrate
+configuration. The old FFmpeg-process-spawning transcoder has been removed;
+this native pipeline is the only transcoding path.
 
 ```text
 FLV/AVCC H.264 sample
@@ -18,8 +19,14 @@ HevcEncoder  (x265)                  # -> HEVC Annex B access units (VPS/SPS/PPS
 TsMuxer / segment store              # HEVC PES on a 90 kHz clock
 ```
 
-Everything runs software-only: **openh264** decodes H.264, **libyuv** scales
-I420, **x265** encodes HEVC. No GPU, no FFmpeg process.
+Everything runs software-only: **openh264** decodes H.264, **libde265** decodes
+HEVC (for HEVC sources), **libyuv** scales I420, **x265** encodes HEVC. No GPU,
+no FFmpeg process.
+
+> **Licensing note:** libde265 is LGPL-2.1, unlike the BSD-family libraries
+> above. The CMake wiring links it via `PkgConfig::LIBDE265` (the system's
+> shared library through pkg-config) to stay LGPL-compliant — do not switch
+> this to a static link.
 
 Audio is transcoded in parallel with **libfdk-aac** — the highest-quality open
 AAC implementation:
@@ -88,7 +95,7 @@ The knobs live in `HevcQualityOptions`; the defaults target live streaming at
 Off by default. Enable with the CMake option after installing the dev packages:
 
 ```bash
-sudo apt-get install libx265-dev libx264-dev libopenh264-dev libfdk-aac-dev libcurl4-openssl-dev libyuv-dev
+sudo apt-get install libx265-dev libx264-dev libopenh264-dev libde265-dev libfdk-aac-dev libcurl4-openssl-dev libyuv-dev
 cmake -S . -B build -DRTMP_ENABLE_NATIVE_TRANSCODE=ON
 cmake --build build
 ```
@@ -138,6 +145,7 @@ option is on, `RTMP_NATIVE_TRANSCODE` is defined for consumers.
 | `native/geometry.*` | Pure FitMode → scale/crop/pad plan (testable, no libraries) |
 | `native/hevc_params.*` | Pure preset → x265 parameter set (testable, no libraries) |
 | `native/h264_decoder.*` | openh264 Annex B → I420 |
+| `native/hevc_decoder.*` | libde265 Annex B → I420 (HEVC sources; see licensing note below) |
 | `native/scaler.*` | libyuv scale + crop/letterbox execution of a `ScalePlan` |
 | `native/hevc_encoder.*` | x265 I420 → HEVC Annex B access units |
 | `native/video_transcoder.*` | Video glue: FLV sample → HEVC access units |
@@ -151,7 +159,6 @@ option is on, `RTMP_NATIVE_TRANSCODE` is defined for consumers.
 `NativeVideoTranscoder` produces HEVC Annex B access units with 90 kHz PTS/DTS
 and a keyframe flag — the exact shape `media::ts::TsMuxer::write_video`
 consumes. Wiring these into the live RTMP fanout additionally requires HEVC
-carriage in the origin's TS/enhanced-RTMP path (the current `TsMuxer` advertises
-the H.264 stream type, and `build_arguments` in the FFmpeg supervisor still
-rejects non-H.264 output). That packaging/fanout wiring is the next step; this
-module delivers the decode→scale→encode core it plugs into.
+carriage in the origin's TS/enhanced-RTMP path (the current `TsMuxer` only
+advertises the H.264 stream type). That packaging/fanout wiring is the next
+step; this module delivers the decode→scale→encode core it plugs into.

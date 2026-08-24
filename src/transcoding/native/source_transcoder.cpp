@@ -27,15 +27,23 @@ ScalePlan plan_for(const RenditionSpec& spec, std::uint32_t src_w, std::uint32_t
 
 } // namespace
 
-SourceTranscoder::SourceTranscoder(std::vector<RenditionSpec> renditions, std::uint32_t fps)
-    : specs_(std::move(renditions)), fps_(std::max<std::uint32_t>(fps, 1)) {}
+SourceTranscoder::SourceTranscoder(std::vector<RenditionSpec> renditions, std::uint32_t fps,
+                                   SourceVideoCodec video_codec)
+    : specs_(std::move(renditions)), fps_(std::max<std::uint32_t>(fps, 1)),
+      video_codec_(video_codec) {
+    if (video_codec_ == SourceVideoCodec::Hevc) {
+        video_decoder_.emplace<HevcDecoder>();
+    }
+    // else: variant already default-constructed to H264Decoder.
+}
 
 SourceTranscoder::~SourceTranscoder() = default;
 
 core::Result<void> SourceTranscoder::start() {
     if (started_) return {};
     if (specs_.empty()) return source_error("no renditions configured");
-    if (auto r = video_decoder_.initialize(); !r) return r.error();
+    auto init_result = std::visit([](auto& decoder) { return decoder.initialize(); }, video_decoder_);
+    if (!init_result) return init_result.error();
     for (auto& spec : specs_) {
         auto rendition = std::make_unique<Rendition>();
         rendition->spec = spec;
@@ -106,9 +114,16 @@ core::Result<void> SourceTranscoder::on_video(std::span<const std::byte> annexb,
     if (!started_) return source_error("transcoder not started");
 
     bool produced = false;
-    if (auto r = video_decoder_.decode(annexb, pts_90k, decoded_, produced); !r) return r.error();
+    // std::visit dispatches to whichever decoder this job was constructed
+    // with (H264Decoder or HevcDecoder); both expose the identical
+    // decode(annexb, pts_90k, out, produced) shape, so the H.264 branch below
+    // is byte-for-byte the same call it always was.
+    auto decode_result = std::visit(
+        [&](auto& decoder) { return decoder.decode(annexb, pts_90k, decoded_, produced); },
+        video_decoder_);
+    if (!decode_result) return decode_result.error();
     if (!produced) return {};
-    (void)dts_90k; // openh264 realtime output has DTS == PTS
+    (void)dts_90k; // realtime decoder output has DTS == PTS
 
     // Source jobs have an explicit output frame rate. Decode every source
     // frame (reference pictures are still required), but do not feed a 50/60

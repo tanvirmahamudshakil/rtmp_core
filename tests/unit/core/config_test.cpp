@@ -217,25 +217,5 @@ TEST(ServerConfigValidate, RecordingDirectoryOnlyRequiredWhenRecordingIsEnabled)
     EXPECT_TRUE(cfg.validate().ok());
 }
 
-TEST(ServerConfigValidate, TranscodingRequiresBoundedWorkerConfiguration) {
-    auto cfg = valid_config();
-    cfg.transcoding_enabled = true;
-    cfg.transcoding_preset_file.clear();
-    EXPECT_FALSE(cfg.validate().ok());
-
-    cfg = valid_config();
-    cfg.transcoding_enabled = true;
-    cfg.transcoding_ffmpeg_path.clear();
-    EXPECT_FALSE(cfg.validate().ok());
-
-    cfg = valid_config();
-    cfg.transcoding_max_active_jobs = 0;
-    EXPECT_FALSE(cfg.validate().ok());
-
-    cfg = valid_config();
-    cfg.transcoding_max_outputs_per_job = 33;
-    EXPECT_FALSE(cfg.validate().ok());
-}
-
 } // namespace
 } // namespace rtmp_server::core

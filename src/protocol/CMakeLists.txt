@@ -14,6 +14,7 @@ add_library(rtmp_server_protocol STATIC
     commands/live_fanout.cpp
     media/media_ingest.cpp
     session/rtmp_connection_session.cpp
+    ${CMAKE_SOURCE_DIR}/src/media/hevc/hevc.cpp
 )
 
 target_include_directories(rtmp_server_protocol PUBLIC

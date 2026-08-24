@@ -59,14 +59,6 @@ recording_queue_max_bytes: 16777216
 database_type: "sqlite"
 database_connection: "./data/rtmp.db"
 
-# Transcoding is an independent worker process. Rules are loaded once during
-# server startup from the pipe-delimited preset file.
-transcoding_enabled: false
-transcoding_preset_file: "./config/transcoding.conf"
-transcoding_ffmpeg_path: "/usr/bin/ffmpeg"
-transcoding_max_active_jobs: 16
-transcoding_max_outputs_per_job: 16
-transcoding_max_restart_attempts: 5
 
 # Public cached HLS mode. Every viewer gets a lightweight playback session for
 # edge counting. Session-bearing media playlists are micro-cached with no

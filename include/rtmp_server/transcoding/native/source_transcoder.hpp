@@ -5,6 +5,7 @@
 #include <memory>
 #include <span>
 #include <string>
+#include <variant>
 #include <vector>
 
 #include "rtmp_server/core/result.hpp"
@@ -14,10 +15,21 @@
 #include "rtmp_server/transcoding/native/frame.hpp"
 #include "rtmp_server/transcoding/native/h264_decoder.hpp"
 #include "rtmp_server/transcoding/native/h264_encoder.hpp"
+#include "rtmp_server/transcoding/native/hevc_decoder.hpp"
 #include "rtmp_server/transcoding/native/scaler.hpp"
 #include "rtmp_server/transcoding/preset.hpp"
 
 namespace rtmp_server::transcoding::native {
+
+// Which codec the source's video elementary stream is encoded in. Decode is
+// selected on this; it is independent of each rendition's own output codec
+// (a HEVC source can still fan out to H.264-encoded renditions, and vice
+// versa -- see RenditionSpec/Rendition::video_encoder, which is unaffected by
+// this choice).
+enum class SourceVideoCodec {
+    H264,
+    Hevc,
+};
 
 // One rendition of the output ladder, derived from a transcoding-template preset.
 struct RenditionSpec {
@@ -51,7 +63,8 @@ public:
         std::function<void(std::size_t rendition, const EncodedAudioFrame& frame,
                            std::int64_t pts_90k)>;
 
-    SourceTranscoder(std::vector<RenditionSpec> renditions, std::uint32_t fps);
+    SourceTranscoder(std::vector<RenditionSpec> renditions, std::uint32_t fps,
+                     SourceVideoCodec video_codec = SourceVideoCodec::H264);
     ~SourceTranscoder();
     SourceTranscoder(const SourceTranscoder&) = delete;
     SourceTranscoder& operator=(const SourceTranscoder&) = delete;
@@ -110,7 +123,12 @@ private:
 
     std::vector<RenditionSpec> specs_;
     std::uint32_t fps_ = 30;
-    H264Decoder video_decoder_;
+    SourceVideoCodec video_codec_ = SourceVideoCodec::H264;
+    // The H.264 branch (video_decoder_.emplace<H264Decoder>()) is unchanged
+    // from before this variant existed: same type, same calls, same order.
+    // HevcDecoder is a parallel alternative selected once at construction,
+    // never switched mid-stream.
+    std::variant<H264Decoder, HevcDecoder> video_decoder_;
     AacDecoder audio_decoder_;
     YuvFrame decoded_;
     PcmBlock pcm_;

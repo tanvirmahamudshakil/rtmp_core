@@ -117,9 +117,27 @@ std::optional<VideoTagInfo> classify_video_tag(std::span<const std::byte> payloa
     if (payload.empty()) return std::nullopt;
     auto tag = static_cast<std::uint8_t>(payload[0]);
     VideoTagInfo info;
+
+    if (tag & 0x80) {
+        // Enhanced RTMP ExVideoTagHeader: bit7 IsExVideoHeader(1),
+        // bits[6:4] FrameType(3), bits[3:0] PacketType(4). VideoFrameType's
+        // values (1..5) fit this 3-bit field directly, so no remapping is
+        // needed relative to the classic-tag frame_type extraction below.
+        info.enhanced = true;
+        info.frame_type = static_cast<VideoFrameType>((tag >> 4) & 0x07);
+        info.ex_packet_type = static_cast<ExVideoPacketType>(tag & 0x0F);
+        if (payload.size() < 5) return info; // FourCC truncated; caller validates further
+        info.fourcc = (static_cast<std::uint32_t>(payload[1]) << 24) |
+                     (static_cast<std::uint32_t>(payload[2]) << 16) |
+                     (static_cast<std::uint32_t>(payload[3]) << 8) |
+                     static_cast<std::uint32_t>(payload[4]);
+        if (info.fourcc == kVideoFourCcHevc) info.codec = VideoCodec::Hevc;
+        return info;
+    }
+
     info.frame_type = static_cast<VideoFrameType>(tag >> 4);
     info.codec = static_cast<VideoCodec>(tag & 0x0F);
-    if (info.codec == VideoCodec::Avc && payload.size() > 1) {
+    if ((info.codec == VideoCodec::Avc || info.codec == VideoCodec::Hevc) && payload.size() > 1) {
         info.avc_packet_type = static_cast<AvcPacketType>(payload[1]);
     }
     return info;
@@ -213,6 +231,35 @@ Result<void> MediaIngest::on_video_message(std::string_view stream_key, const ch
         state.seen_keyframe = true;
         state.stats.keyframe_count++;
         state.stats.last_keyframe_timestamp = message.timestamp;
+    }
+
+    if (info->enhanced) {
+        if (codec != VideoCodec::Hevc) {
+            return {}; // enhanced FourCC other than hvc1: not understood, nothing to retain
+        }
+        if (!info->ex_packet_type) {
+            state.stats.rejected_message_count++;
+            return malformed("Enhanced RTMP video tag missing the FourCC/PacketType header");
+        }
+        if (*info->ex_packet_type != ExVideoPacketType::SequenceStart) {
+            return {}; // coded frame / sequence end / metadata: nothing to retain here
+        }
+        // Payload after the 5-byte ExVideoTagHeader (1 tag byte + 4 FourCC
+        // bytes) is the HEVCDecoderConfigurationRecord verbatim -- unlike
+        // classic AVC's SequenceHeader, PacketTypeSequenceStart carries no
+        // composition-time field.
+        if (message.payload.size() < 5) {
+            state.stats.rejected_message_count++;
+            return malformed("Enhanced RTMP HEVC sequence-start tag shorter than its header");
+        }
+        std::span<const std::byte> config_data(message.payload.data() + 5, message.payload.size() - 5);
+        auto parsed = ::rtmp_server::media::hevc::parse_decoder_config(config_data);
+        if (!parsed) {
+            state.stats.rejected_message_count++;
+            return parsed.error();
+        }
+        state.hevc_sequence_header = std::move(parsed).value();
+        return {};
     }
 
     if (codec != VideoCodec::Avc) {

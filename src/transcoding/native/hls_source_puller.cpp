@@ -9,7 +9,9 @@
 
 #include "rtmp_server/media/aac/adts.hpp"
 #include "rtmp_server/media/h264/avc.hpp"
+#include "rtmp_server/media/hevc/hevc.hpp"
 #include "rtmp_server/observability/logger.hpp"
+#include "rtmp_server/protocol/media/media_ingest.hpp"
 #include "rtmp_server/transcoding/native/hls_playlist.hpp"
 #include "rtmp_server/transcoding/native/paced_segment_publisher.hpp"
 #include "rtmp_server/transcoding/native/rtmp_source_client.hpp"
@@ -18,6 +20,7 @@ namespace rtmp_server::transcoding::native {
 
 namespace {
 using observability::LogLevel;
+namespace protocol_media = rtmp_server::protocol::media;
 
 // Many IPTV/CDN panels answer an .m3u8-shaped URL with a redirect straight to
 // a continuously-flowing raw MPEG-TS body (no playlist, connection never
@@ -152,7 +155,15 @@ void HlsSourcePuller::run() {
     specs.reserve(renditions_.size());
     for (const auto& r : renditions_) specs.push_back(r.spec);
 
-    SourceTranscoder transcoder(specs, fps_);
+    // Construction is deferred until the source's actual video codec is
+    // known (TsDemuxer::video_codec() once the PMT is parsed for TS/HLS
+    // sources, or the first RTMP video tag's codec id/FourCC for an RTMP
+    // source) -- SourceTranscoder's decoder variant is selected once at
+    // construction and never switched mid-stream, so constructing it before
+    // that is known would silently default to H.264 for an HEVC source. See
+    // ensure_transcoder below, invoked lazily from whichever path first
+    // learns the codec.
+    std::optional<SourceTranscoder> transcoder;
     std::vector<std::unique_ptr<hls::Segmenter>> segmenters;
     std::vector<std::unique_ptr<hls::RenditionFeed>> feeds;
     // One paced publisher per rendition, sitting between its Segmenter and
@@ -210,32 +221,56 @@ void HlsSourcePuller::run() {
         publishers.push_back(std::move(publisher));
     }
 
-    transcoder.set_video_output([&](std::size_t i, const EncodedAccessUnit& au) {
-        feeds[i]->push_video(au.annexb, au.pts_90k, au.dts_90k, au.keyframe);
-    });
-    transcoder.set_audio_output(
-        [&](std::size_t i, const EncodedAudioFrame& frame, std::int64_t pts_90k) {
-            feeds[i]->push_audio(frame.adts, pts_90k);
+    std::optional<core::Error> pipeline_error;
+
+    // Constructs the transcoder (once) with the given source codec and wires
+    // its outputs to the per-rendition feeds exactly as before -- only the
+    // timing of this moved, not the wiring itself. Idempotent: a second call
+    // (e.g. audio arriving before video has resolved the codec, then video
+    // resolving it moments later) is a no-op.
+    auto ensure_transcoder = [&](SourceVideoCodec codec) -> core::Result<void> {
+        if (transcoder) return {};
+        transcoder.emplace(specs, fps_, codec);
+        transcoder->set_video_output([&](std::size_t i, const EncodedAccessUnit& au) {
+            feeds[i]->push_video(au.annexb, au.pts_90k, au.dts_90k, au.keyframe);
         });
-    if (auto r = transcoder.start(); !r) {
-        set_detail(r.error().message());
-        status_.store(PullerStatus::Error);
-        running_.store(false);
-        return;
-    }
+        transcoder->set_audio_output(
+            [&](std::size_t i, const EncodedAudioFrame& frame, std::int64_t pts_90k) {
+                feeds[i]->push_audio(frame.adts, pts_90k);
+            });
+        return transcoder->start();
+    };
 
     media::ts::TsDemuxer demux;
-    std::optional<core::Error> pipeline_error;
     demux.set_video_handler([&](std::span<const std::byte> annexb, std::uint64_t pts,
                                 std::uint64_t dts, bool keyframe) {
         if (pipeline_error) return;
-        auto result = transcoder.on_video(annexb, static_cast<std::int64_t>(pts),
-                                          static_cast<std::int64_t>(dts), keyframe);
+        // The PMT (which TsDemuxer::video_codec() reflects) is always parsed
+        // before any PES payload is reassembled off the video/audio PIDs it
+        // names, so by the time this handler fires for the first access
+        // unit the real codec is already known.
+        const auto codec = demux.video_codec() == media::ts::TsVideoCodec::Hevc ? SourceVideoCodec::Hevc
+                                                                                : SourceVideoCodec::H264;
+        if (auto r = ensure_transcoder(codec); !r) {
+            pipeline_error = r.error();
+            return;
+        }
+        auto result = transcoder->on_video(annexb, static_cast<std::int64_t>(pts),
+                                           static_cast<std::int64_t>(dts), keyframe);
         if (!result) pipeline_error = result.error();
     });
     demux.set_audio_handler([&](std::span<const std::byte> adts, std::uint64_t pts) {
         if (pipeline_error) return;
-        auto result = transcoder.on_audio(adts, static_cast<std::int64_t>(pts));
+        // Audio can in principle arrive before the first video access unit
+        // within the same feed() call; the PMT (and so the real codec) is
+        // still already known by then, same reasoning as the video handler.
+        const auto codec = demux.video_codec() == media::ts::TsVideoCodec::Hevc ? SourceVideoCodec::Hevc
+                                                                                : SourceVideoCodec::H264;
+        if (auto r = ensure_transcoder(codec); !r) {
+            pipeline_error = r.error();
+            return;
+        }
+        auto result = transcoder->on_audio(adts, static_cast<std::int64_t>(pts));
         if (!result) pipeline_error = result.error();
     });
 
@@ -318,10 +353,176 @@ void HlsSourcePuller::run() {
 
     if (rtmp_source) {
         media::h264::AvcDecoderConfig video_config;
+        std::optional<media::hevc::HevcDecoderConfig> hevc_video_config;
         std::optional<media::aac::AudioSpecificConfig> audio_config;
         RtmpTimestampUnwrapper video_clock;
         RtmpTimestampUnwrapper audio_clock;
         RtmpSourceClient client(source_url_);
+
+        // Handles one RTMP video message once the source's codec is known
+        // (classic AVC, legacy CodecID-12 HEVC, or Enhanced RTMP hvc1),
+        // covering both the plain-AVC path (unchanged from before this
+        // function existed) and the two HEVC forms. Factored into its own
+        // lambda so the outer message handler can still reach the shared
+        // detect_stall() call below regardless of which branch runs.
+        auto handle_video_message = [&](const protocol::chunk::RtmpMessage& message) -> core::Result<void> {
+            auto info = protocol_media::classify_video_tag(message.payload);
+            if (!info) {
+                return core::Error(core::ErrorCode::MalformedChunk, core::ErrorCategory::Protocol,
+                                   "empty RTMP video payload");
+            }
+            const auto source_codec = info->codec == protocol_media::VideoCodec::Hevc
+                                          ? SourceVideoCodec::Hevc
+                                          : SourceVideoCodec::H264;
+            if (auto r = ensure_transcoder(source_codec); !r) return r.error();
+
+            if (info->codec != protocol_media::VideoCodec::Hevc) {
+                // Plain classic-AVC tag -- byte-for-byte the same parse/convert
+                // calls as before this function gained HEVC support.
+                auto tag = media::h264::parse_video_tag(message.payload);
+                if (!tag) return tag.error();
+                if (tag.value().avc_packet_type == media::h264::kAvcPacketTypeSequenceHeader) {
+                    auto config = media::h264::parse_decoder_config(tag.value().body);
+                    if (!config) return config.error();
+                    video_config = std::move(config).value();
+                    return {};
+                }
+                if (tag.value().avc_packet_type == media::h264::kAvcPacketTypeEndOfSequence) {
+                    return {};
+                }
+                if (tag.value().avc_packet_type != media::h264::kAvcPacketTypeNalu) {
+                    return core::Error(core::ErrorCode::MalformedChunk, core::ErrorCategory::Protocol,
+                                       "unsupported RTMP AVC packet type");
+                }
+                if (!video_config.valid()) {
+                    return core::Error(core::ErrorCode::InvalidStateTransition,
+                                       core::ErrorCategory::Protocol,
+                                       "RTMP video frame arrived before its AVC sequence header");
+                }
+                std::vector<std::byte> annexb;
+                auto converted = media::h264::avcc_to_annexb(tag.value().body, video_config,
+                                                             tag.value().is_keyframe, annexb);
+                if (!converted) return converted.error();
+                const std::uint64_t dts_ms = video_clock.unwrap(message.timestamp);
+                const std::int64_t dts_90k = static_cast<std::int64_t>(dts_ms * 90);
+                const std::int64_t pts_90k =
+                    dts_90k + static_cast<std::int64_t>(tag.value().composition_time_ms) * 90;
+                auto transcoded =
+                    transcoder->on_video(annexb, pts_90k, dts_90k, tag.value().is_keyframe);
+                if (!transcoded) return transcoded.error();
+                note_input_progress();
+                return {};
+            }
+
+            // HEVC, either legacy CodecID-12 (info->enhanced == false, same
+            // tag layout as AVC's: packet-type byte then 3-byte composition
+            // time) or Enhanced RTMP hvc1 (info->enhanced == true, whose
+            // ExVideoTagHeader packet types this branch decodes directly --
+            // see ExVideoPacketType's comment on confidence for this layout).
+            std::span<const std::byte> body;
+            std::int32_t composition_time_ms = 0;
+            bool is_sequence_start = false;
+            bool is_coded_frame = false;
+
+            if (info->enhanced) {
+                if (!info->ex_packet_type) {
+                    return core::Error(core::ErrorCode::MalformedChunk, core::ErrorCategory::Protocol,
+                                       "Enhanced RTMP video tag missing its PacketType");
+                }
+                switch (*info->ex_packet_type) {
+                    case protocol_media::ExVideoPacketType::SequenceStart:
+                        if (message.payload.size() < 5) {
+                            return core::Error(core::ErrorCode::MalformedChunk,
+                                               core::ErrorCategory::Protocol,
+                                               "Enhanced RTMP HEVC sequence-start tag too short");
+                        }
+                        is_sequence_start = true;
+                        body = std::span<const std::byte>(message.payload.data() + 5,
+                                                          message.payload.size() - 5);
+                        break;
+                    case protocol_media::ExVideoPacketType::CodedFrames: {
+                        if (message.payload.size() < 8) {
+                            return core::Error(core::ErrorCode::MalformedChunk,
+                                               core::ErrorCategory::Protocol,
+                                               "Enhanced RTMP HEVC coded-frame tag too short");
+                        }
+                        std::int32_t cts = (static_cast<std::int32_t>(message.payload[5]) << 16) |
+                                           (static_cast<std::int32_t>(message.payload[6]) << 8) |
+                                           static_cast<std::int32_t>(message.payload[7]);
+                        if (cts & 0x00800000) cts |= static_cast<std::int32_t>(0xFF000000u);
+                        composition_time_ms = cts;
+                        is_coded_frame = true;
+                        body = std::span<const std::byte>(message.payload.data() + 8,
+                                                          message.payload.size() - 8);
+                        break;
+                    }
+                    case protocol_media::ExVideoPacketType::CodedFramesX:
+                        if (message.payload.size() < 5) {
+                            return core::Error(core::ErrorCode::MalformedChunk,
+                                               core::ErrorCategory::Protocol,
+                                               "Enhanced RTMP HEVC coded-frame-x tag too short");
+                        }
+                        is_coded_frame = true;
+                        body = std::span<const std::byte>(message.payload.data() + 5,
+                                                          message.payload.size() - 5);
+                        break;
+                    case protocol_media::ExVideoPacketType::SequenceEnd:
+                        return {};
+                    default:
+                        return {}; // Metadata / MPEG2TSSequenceStart: nothing this pipeline needs
+                }
+            } else {
+                // Legacy CodecID-12: identical layout to a classic AVC tag.
+                if (message.payload.size() < 5) {
+                    return core::Error(core::ErrorCode::MalformedChunk, core::ErrorCategory::Protocol,
+                                       "legacy HEVC video tag too short");
+                }
+                std::int32_t cts = (static_cast<std::int32_t>(message.payload[2]) << 16) |
+                                   (static_cast<std::int32_t>(message.payload[3]) << 8) |
+                                   static_cast<std::int32_t>(message.payload[4]);
+                if (cts & 0x00800000) cts |= static_cast<std::int32_t>(0xFF000000u);
+                composition_time_ms = cts;
+                body = std::span<const std::byte>(message.payload.data() + 5, message.payload.size() - 5);
+                if (!info->avc_packet_type) {
+                    return core::Error(core::ErrorCode::MalformedChunk, core::ErrorCategory::Protocol,
+                                       "legacy HEVC video tag missing its packet type");
+                }
+                if (*info->avc_packet_type == media::h264::kAvcPacketTypeSequenceHeader) {
+                    is_sequence_start = true;
+                } else if (*info->avc_packet_type == media::h264::kAvcPacketTypeEndOfSequence) {
+                    return {};
+                } else if (*info->avc_packet_type == media::h264::kAvcPacketTypeNalu) {
+                    is_coded_frame = true;
+                } else {
+                    return core::Error(core::ErrorCode::MalformedChunk, core::ErrorCategory::Protocol,
+                                       "unsupported legacy HEVC packet type");
+                }
+            }
+
+            if (is_sequence_start) {
+                auto config = media::hevc::parse_decoder_config(body);
+                if (!config) return config.error();
+                hevc_video_config = std::move(config).value();
+                return {};
+            }
+            if (!is_coded_frame) return {};
+            if (!hevc_video_config || !hevc_video_config->valid()) {
+                return core::Error(core::ErrorCode::InvalidStateTransition, core::ErrorCategory::Protocol,
+                                   "RTMP HEVC video frame arrived before its sequence header");
+            }
+            const bool is_keyframe = info->frame_type == protocol_media::VideoFrameType::KeyFrame ||
+                                     info->frame_type == protocol_media::VideoFrameType::GeneratedKeyFrame;
+            std::vector<std::byte> annexb;
+            auto converted = media::hevc::hvcc_to_annexb(body, *hevc_video_config, is_keyframe, annexb);
+            if (!converted) return converted.error();
+            const std::uint64_t dts_ms = video_clock.unwrap(message.timestamp);
+            const std::int64_t dts_90k = static_cast<std::int64_t>(dts_ms * 90);
+            const std::int64_t pts_90k = dts_90k + static_cast<std::int64_t>(composition_time_ms) * 90;
+            auto transcoded = transcoder->on_video(annexb, pts_90k, dts_90k, is_keyframe);
+            if (!transcoded) return transcoded.error();
+            note_input_progress();
+            return {};
+        };
 
         auto result = client.run(
             [this] { return running_.load(); },
@@ -329,40 +530,13 @@ void HlsSourcePuller::run() {
                 using protocol::chunk::MessageTypeId;
                 const auto type = static_cast<MessageTypeId>(message.message_type_id);
                 if (type == MessageTypeId::Video) {
-                    auto tag = media::h264::parse_video_tag(message.payload);
-                    if (!tag) return tag.error();
-                    if (tag.value().avc_packet_type == media::h264::kAvcPacketTypeSequenceHeader) {
-                        auto config = media::h264::parse_decoder_config(tag.value().body);
-                        if (!config) return config.error();
-                        video_config = std::move(config).value();
-                        return {};
-                    }
-                    if (tag.value().avc_packet_type == media::h264::kAvcPacketTypeEndOfSequence) {
-                        return {};
-                    }
-                    if (tag.value().avc_packet_type != media::h264::kAvcPacketTypeNalu) {
-                        return core::Error(core::ErrorCode::MalformedChunk,
-                                           core::ErrorCategory::Protocol,
-                                           "unsupported RTMP AVC packet type");
-                    }
-                    if (!video_config.valid()) {
-                        return core::Error(core::ErrorCode::InvalidStateTransition,
-                                           core::ErrorCategory::Protocol,
-                                           "RTMP video frame arrived before its AVC sequence header");
-                    }
-                    std::vector<std::byte> annexb;
-                    auto converted = media::h264::avcc_to_annexb(
-                        tag.value().body, video_config, tag.value().is_keyframe, annexb);
-                    if (!converted) return converted.error();
-                    const std::uint64_t dts_ms = video_clock.unwrap(message.timestamp);
-                    const std::int64_t dts_90k = static_cast<std::int64_t>(dts_ms * 90);
-                    const std::int64_t pts_90k =
-                        dts_90k + static_cast<std::int64_t>(tag.value().composition_time_ms) * 90;
-                    auto transcoded =
-                        transcoder.on_video(annexb, pts_90k, dts_90k, tag.value().is_keyframe);
-                    if (!transcoded) return transcoded.error();
-                    note_input_progress();
+                    if (auto r = handle_video_message(message); !r) return r.error();
                 } else if (type == MessageTypeId::Audio) {
+                    // Codec is unknown from audio alone; H.264 is the
+                    // pre-existing default for this path, so falling back to
+                    // it here preserves prior behavior when audio precedes
+                    // video far enough that no video codec is known yet.
+                    if (auto r = ensure_transcoder(SourceVideoCodec::H264); !r) return r.error();
                     auto tag = media::aac::parse_audio_tag(message.payload);
                     if (!tag) return tag.error();
                     if (tag.value().aac_packet_type == media::aac::kAacPacketTypeSequenceHeader) {
@@ -386,7 +560,7 @@ void HlsSourcePuller::run() {
                     media::aac::append_adts_header(adts, *audio_config, tag.value().body.size());
                     adts.insert(adts.end(), tag.value().body.begin(), tag.value().body.end());
                     const auto pts_90k = static_cast<std::int64_t>(audio_clock.unwrap(message.timestamp) * 90);
-                    auto transcoded = transcoder.on_audio(adts, pts_90k);
+                    auto transcoded = transcoder->on_audio(adts, pts_90k);
                     if (!transcoded) return transcoded.error();
                     note_input_progress();
                 }
@@ -571,8 +745,11 @@ void HlsSourcePuller::run() {
                 // Also reset the transcoder's own video clock gate -- see
                 // SourceTranscoder::mark_discontinuity()'s comment for why
                 // skipping this left video frozen (while audio kept
-                // playing) after exactly this kind of gap.
-                transcoder.mark_discontinuity();
+                // playing) after exactly this kind of gap. The transcoder
+                // may not exist yet if this discontinuity precedes the PMT
+                // ever being parsed (e.g. the very first segment is itself
+                // discontinuous); nothing to re-anchor in that case.
+                if (transcoder) transcoder->mark_discontinuity();
             }
             auto demuxed = demux.feed(result.value());
             if (!demuxed) pipeline_error = demuxed.error();

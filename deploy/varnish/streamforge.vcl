@@ -7,9 +7,10 @@ backend default {
     .connect_timeout = 1s;
     .first_byte_timeout = 5s;
     .between_bytes_timeout = 5s;
-    # A bounded burst ceiling; steady-state playlist traffic is collapsed by
-    # the micro-cache below instead of consuming one connection per viewer.
-    .max_connections = 4096;
+    # Unbounded by request (0 = no ceiling in Varnish). Previously capped at
+    # 4096 as a burst ceiling; removing it means a cache-miss storm can open
+    # as many backend connections as the origin will accept.
+    .max_connections = 0;
 }
 
 sub vcl_recv {

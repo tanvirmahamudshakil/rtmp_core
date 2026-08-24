@@ -9,7 +9,17 @@ namespace rtmp_server::media::ts {
 namespace {
 
 constexpr std::uint8_t kStreamTypeH264 = 0x1B;
+constexpr std::uint8_t kStreamTypeHevc = 0x24;
 constexpr std::uint8_t kStreamTypeAacAdts = 0x0F;
+
+// HEVC NAL unit type occupies bits 1-6 of the first header byte (the header is
+// two bytes, unlike H.264's one). 19/20 are IDR slice types; 21 (CRA) is not
+// a true IDR but is still the usual random-access point at the start of an
+// HEVC HLS/TS segment, so treat it the same way H.264's kNalTypeIdr is used
+// here: "safe to start decoding from".
+constexpr std::uint8_t kHevcNalTypeIdrWRadl = 19;
+constexpr std::uint8_t kHevcNalTypeIdrNLp = 20;
+constexpr std::uint8_t kHevcNalTypeCra = 21;
 
 std::uint8_t u8(std::span<const std::byte> b, std::size_t i) {
     return static_cast<std::uint8_t>(b[i]);
@@ -47,6 +57,37 @@ bool contains_idr(std::span<const std::byte> annexb) {
     return false;
 }
 
+// HEVC analogue of contains_idr: same Annex B start-code walk, but the NAL
+// type is 6 bits starting one bit into the first header byte, and there are
+// two header bytes (not one) to skip per NAL.
+bool contains_hevc_idr(std::span<const std::byte> annexb) {
+    std::size_t i = 0;
+    const std::size_t n = annexb.size();
+    while (i + 3 < n) {
+        const bool sc3 = u8(annexb, i) == 0 && u8(annexb, i + 1) == 0 && u8(annexb, i + 2) == 1;
+        const bool sc4 = i + 4 < n && u8(annexb, i) == 0 && u8(annexb, i + 1) == 0 &&
+                         u8(annexb, i + 2) == 0 && u8(annexb, i + 3) == 1;
+        std::size_t nal_start = 0;
+        if (sc4) {
+            nal_start = i + 4;
+            i += 4;
+        } else if (sc3) {
+            nal_start = i + 3;
+            i += 3;
+        } else {
+            ++i;
+            continue;
+        }
+        if (nal_start >= n) continue;
+        const std::uint8_t nal_type = (u8(annexb, nal_start) >> 1) & 0x3F;
+        if (nal_type == kHevcNalTypeIdrWRadl || nal_type == kHevcNalTypeIdrNLp ||
+            nal_type == kHevcNalTypeCra) {
+            return true;
+        }
+    }
+    return false;
+}
+
 } // namespace
 
 void TsDemuxer::reset() noexcept {
@@ -54,6 +95,7 @@ void TsDemuxer::reset() noexcept {
     video_pid_ = 0xFFFF;
     audio_pid_ = 0xFFFF;
     pmt_known_ = false;
+    video_codec_ = TsVideoCodec::Unknown;
     video_ = PesAssembly{};
     audio_ = PesAssembly{};
     partial_.clear();
@@ -158,8 +200,15 @@ void TsDemuxer::parse_pmt(std::span<const std::byte> section) {
         const std::uint16_t pid =
             static_cast<std::uint16_t>(((u8(section, i + 1) & 0x1F) << 8) | u8(section, i + 2));
         const std::size_t es_info_length = ((u8(section, i + 3) & 0x0F) << 8) | u8(section, i + 4);
-        if (stream_type == kStreamTypeH264 && video_pid_ == 0xFFFF) video_pid_ = pid;
-        else if (stream_type == kStreamTypeAacAdts && audio_pid_ == 0xFFFF) audio_pid_ = pid;
+        if (stream_type == kStreamTypeH264 && video_pid_ == 0xFFFF) {
+            video_pid_ = pid;
+            video_codec_ = TsVideoCodec::H264;
+        } else if (stream_type == kStreamTypeHevc && video_pid_ == 0xFFFF) {
+            video_pid_ = pid;
+            video_codec_ = TsVideoCodec::Hevc;
+        } else if (stream_type == kStreamTypeAacAdts && audio_pid_ == 0xFFFF) {
+            audio_pid_ = pid;
+        }
         i += 5 + es_info_length;
     }
 }
@@ -200,8 +249,9 @@ void TsDemuxer::finish_pes(PesAssembly& asm_state) {
         return;
     }
     if (&asm_state == &video_ && video_handler_) {
-        video_handler_(asm_state.data, asm_state.pts_90k, asm_state.dts_90k,
-                       contains_idr(asm_state.data));
+        const bool keyframe = video_codec_ == TsVideoCodec::Hevc ? contains_hevc_idr(asm_state.data)
+                                                                  : contains_idr(asm_state.data);
+        video_handler_(asm_state.data, asm_state.pts_90k, asm_state.dts_90k, keyframe);
     } else if (&asm_state == &audio_ && audio_handler_) {
         audio_handler_(asm_state.data, asm_state.pts_90k);
     }

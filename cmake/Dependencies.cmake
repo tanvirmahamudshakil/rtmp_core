@@ -65,6 +65,11 @@ if(RTMP_ENABLE_NATIVE_TRANSCODE)
     pkg_check_modules(FDKAAC IMPORTED_TARGET fdk-aac)
     pkg_check_modules(LIBCURL IMPORTED_TARGET libcurl)
     pkg_check_modules(LIBYUV IMPORTED_TARGET libyuv)
+    # HEVC decode (source-transcode ingest of an HEVC source). libde265 is
+    # LGPL-2.1: PkgConfig::LIBDE265 resolves to the system shared library via
+    # pkg-config, so this stays a dynamic link -- do not switch this to a
+    # static archive, that would violate the LGPL for a redistributed binary.
+    pkg_check_modules(LIBDE265 IMPORTED_TARGET libde265)
 
     # libyuv frequently ships without a .pc file; fall back to a plain search.
     if(NOT LIBYUV_FOUND)
@@ -81,13 +86,13 @@ if(RTMP_ENABLE_NATIVE_TRANSCODE)
         set(RTMP_LIBYUV_TARGET PkgConfig::LIBYUV)
     endif()
 
-    if(X265_FOUND AND X264_FOUND AND OPENH264_FOUND AND FDKAAC_FOUND AND LIBCURL_FOUND AND RTMP_LIBYUV_TARGET)
+    if(X265_FOUND AND X264_FOUND AND OPENH264_FOUND AND FDKAAC_FOUND AND LIBCURL_FOUND AND RTMP_LIBYUV_TARGET AND LIBDE265_FOUND)
         set(RTMP_NATIVE_TRANSCODE_AVAILABLE ON)
     else()
         message(FATAL_ERROR
             "RTMP_ENABLE_NATIVE_TRANSCODE=ON but dependencies are missing "
             "(x265=${X265_FOUND} x264=${X264_FOUND} openh264=${OPENH264_FOUND} fdk-aac=${FDKAAC_FOUND} "
-            "libcurl=${LIBCURL_FOUND} libyuv=${LIBYUV_FOUND}). Install them, e.g. on Ubuntu: "
-            "sudo apt-get install libx265-dev libx264-dev libopenh264-dev libfdk-aac-dev libcurl4-openssl-dev libyuv-dev")
+            "libcurl=${LIBCURL_FOUND} libyuv=${LIBYUV_FOUND} libde265=${LIBDE265_FOUND}). Install them, e.g. on Ubuntu: "
+            "sudo apt-get install libx265-dev libx264-dev libopenh264-dev libfdk-aac-dev libcurl4-openssl-dev libyuv-dev libde265-dev")
     endif()
 endif()

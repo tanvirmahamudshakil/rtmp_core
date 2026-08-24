@@ -761,7 +761,6 @@ function ApplicationDetailPage({
   application,
   templates,
   client,
-  streams,
   onRefresh,
   onBack,
   onNotify,
@@ -770,13 +769,11 @@ function ApplicationDetailPage({
   application: Application;
   templates: TranscodingTemplate[];
   client: ControlClient;
-  streams: Stream[];
   onRefresh: () => void;
   onBack: () => void;
   onNotify: (type: "success" | "error", message: string) => void;
   onDeleteRequest: (application: Application) => void;
 }) {
-  const [detailTab, setDetailTab] = useState<"rtmp" | "source">("rtmp");
   const [copiedUrl, setCopiedUrl] = useState<string | null>(null);
   const [sourceJobs, setSourceJobs] = useState<SourceTranscodeJob[]>([]);
   const [sourceUrl, setSourceUrl] = useState("");
@@ -786,59 +783,7 @@ function ApplicationDetailPage({
   const [sourceRestartDelay, setSourceRestartDelay] = useState("5");
   const [sourceBusy, setSourceBusy] = useState(false);
   const [pendingDeleteJob, setPendingDeleteJob] = useState<SourceTranscodeJob | null>(null);
-  const [newStreamName, setNewStreamName] = useState("");
-  const [newStreamRecording, setNewStreamRecording] = useState(false);
-  const [rtmpBusy, setRtmpBusy] = useState(false);
-  const [pendingDeleteStream, setPendingDeleteStream] = useState<Stream | null>(null);
-  const appStreams = streams.filter((stream) => stream.application === application.name);
 
-  const generateStreamName = () =>
-    `stream-${Math.random().toString(36).slice(2, 8)}`;
-
-  const createRtmpStream = async () => {
-    const name = safeRuleName(newStreamName, generateStreamName());
-    if (!name) {
-      onNotify("error", "Enter a stream name or leave it blank to auto-generate one.");
-      return;
-    }
-    setRtmpBusy(true);
-    try {
-      await client.createStream(application.name, name, newStreamRecording);
-      onNotify("success", `Generated RTMP link for ${name}.`);
-      setNewStreamName("");
-      onRefresh();
-    } catch (error) {
-      onNotify("error", error instanceof Error ? error.message : "Could not generate the RTMP link.");
-    } finally {
-      setRtmpBusy(false);
-    }
-  };
-
-  const toggleRtmpStream = async (stream: Stream) => {
-    setRtmpBusy(true);
-    try {
-      await client.patchStream(stream, { enabled: !stream.enabled });
-      onNotify("success", stream.enabled ? `Disabled ${stream.name}.` : `Enabled ${stream.name}.`);
-      onRefresh();
-    } catch (error) {
-      onNotify("error", error instanceof Error ? error.message : "Could not update the stream.");
-    } finally {
-      setRtmpBusy(false);
-    }
-  };
-
-  const removeRtmpStream = async (stream: Stream) => {
-    setRtmpBusy(true);
-    try {
-      await client.deleteStream(stream);
-      onNotify("success", `Deleted ${stream.name}.`);
-      onRefresh();
-    } catch (error) {
-      onNotify("error", error instanceof Error ? error.message : "Could not delete the stream.");
-    } finally {
-      setRtmpBusy(false);
-    }
-  };
   const copyUrl = async (url: string) => {
     await copyText(url);
     setCopiedUrl(url);
@@ -947,74 +892,6 @@ function ApplicationDetailPage({
     } finally {
       setSourceBusy(false);
     }
-  };
-
-  const renderRtmp = () => {
-    return (
-      <section className="assignment-workspace">
-        <div className="source-workspace-heading">
-          <div><span className="eyebrow">PUBLISH · PASSTHROUGH · SERVE</span><h2>RTMP</h2><p>Generate a new RTMP push URL for this application. Whatever an encoder publishes to it plays back both directly over RTMP and as an HLS .m3u8, with no transcoding.</p></div>
-          <span className="panel-count">{appStreams.length} links</span>
-        </div>
-        <article className="assignment-card source-form">
-          <label className="assignment-select">Stream name
-            <input
-              type="text"
-              placeholder="leave blank to auto-generate"
-              value={newStreamName}
-              onChange={(event) => setNewStreamName(event.target.value)}
-            />
-          </label>
-          <label className="assignment-checkbox">
-            <input
-              type="checkbox"
-              checked={newStreamRecording}
-              onChange={(event) => setNewStreamRecording(event.target.checked)}
-            />
-            Record this stream
-          </label>
-          <div className="assignment-actions">
-            <button className="primary-button" disabled={rtmpBusy} onClick={createRtmpStream}>
-              {rtmpBusy ? <RefreshCw className="spin" size={16} /> : <Plus size={16} />}
-              Generate RTMP link
-            </button>
-          </div>
-        </article>
-        <div className="assignment-grid">
-          {appStreams.map((stream) => {
-            const hlsUrl = absoluteUrl(stream.hls_path);
-            return (
-              <article className="assignment-card assigned" key={`${stream.application}:${stream.name}`}>
-                <div className="assignment-card-head">
-                  <span className="stream-avatar"><Radio size={17} /></span>
-                  <div><strong>{stream.name}</strong><small>/{stream.application}/{stream.name}</small></div>
-                  <StatusPill live={!!stream.is_live} label={stream.is_live ? "Live" : stream.enabled ? "Idle" : "Disabled"} />
-                </div>
-                <div className="master-url-row">
-                  <span>RTMP</span><code title={stream.rtmp_url}>{stream.rtmp_url}</code>
-                  <IconButton label="Copy RTMP URL" onClick={() => copyUrl(stream.rtmp_url)}>
-                    {copiedUrl === stream.rtmp_url ? <Check size={16} /> : <Copy size={16} />}
-                  </IconButton>
-                </div>
-                <div className="master-url-row">
-                  <span>M3U8</span><code title={hlsUrl}>{hlsUrl}</code>
-                  <IconButton label="Copy HLS URL" onClick={() => copyUrl(hlsUrl)}>
-                    {copiedUrl === hlsUrl ? <Check size={16} /> : <Copy size={16} />}
-                  </IconButton>
-                </div>
-                <div className="assignment-actions">
-                  <button className="secondary-button danger-text" disabled={rtmpBusy} onClick={() => setPendingDeleteStream(stream)}><Trash2 size={15} /> Delete</button>
-                  <button className="secondary-button" disabled={rtmpBusy} onClick={() => toggleRtmpStream(stream)}>
-                    <SlidersHorizontal size={15} /> {stream.enabled ? "Disable" : "Enable"}
-                  </button>
-                </div>
-              </article>
-            );
-          })}
-          {!appStreams.length && <div className="empty-state full"><Radio size={28} /><strong>No RTMP links yet</strong><span>Generate one above, then publish to it from OBS or another encoder.</span></div>}
-        </div>
-      </section>
-    );
   };
 
   const renderSourceTranscode = () => {
@@ -1153,35 +1030,7 @@ function ApplicationDetailPage({
           </div>
         </div>
       </section>
-      <div className="detail-tab-bar">
-        <button className={`detail-tab${detailTab === "rtmp" ? " active" : ""}`} onClick={() => setDetailTab("rtmp")}>
-          <Radio size={16} /> RTMP
-        </button>
-        <button className={`detail-tab${detailTab === "source" ? " active" : ""}`} onClick={() => setDetailTab("source")}>
-          <Workflow size={16} /> Source Transcode
-        </button>
-      </div>
-      {detailTab === "rtmp" ? renderRtmp() : renderSourceTranscode()}
-      {pendingDeleteStream && (
-        <Modal
-          title={`Delete ${pendingDeleteStream.name}?`}
-          description={pendingDeleteStream.rtmp_url}
-          onClose={() => setPendingDeleteStream(null)}
-        >
-          <div className="delete-warning">
-            <Trash2 size={21} />
-            <div><strong>This cannot be undone.</strong><span>The RTMP link and its HLS output go offline immediately.</span></div>
-          </div>
-          <div className="modal-actions">
-            <button className="secondary-button" onClick={() => setPendingDeleteStream(null)}>Cancel</button>
-            <button className="danger-button" onClick={() => {
-              const stream = pendingDeleteStream;
-              setPendingDeleteStream(null);
-              removeRtmpStream(stream);
-            }}><Trash2 size={17} /> Delete RTMP link</button>
-          </div>
-        </Modal>
-      )}
+      {renderSourceTranscode()}
       {pendingDeleteJob && (
         <Modal
           title={`Delete ${pendingDeleteJob.name}?`}
@@ -2109,7 +1958,6 @@ function App() {
                   application={selectedApplication}
                   templates={templates}
                   client={client}
-                  streams={snapshot.streams}
                   onRefresh={() => refresh(client, true)}
                   onNotify={notify}
                   onDeleteRequest={setPendingDeleteApplication}

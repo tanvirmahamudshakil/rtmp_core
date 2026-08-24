@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <deque>
 #include <functional>
+#include <limits>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -65,11 +66,24 @@ using HttpHandler = std::function<HttpResponse(const HttpRequest&)>;
 struct HttpServerOptions {
     std::string bind_address = "127.0.0.1";
     std::uint16_t port = 0; // 0 lets the OS choose an ephemeral port (tests)
-    int listen_backlog = 64;
-    std::size_t worker_threads = 4;
-    std::size_t max_pending_requests = 256; // bounded queue between accept and workers
-    std::size_t max_header_bytes = 8 * 1024;
-    std::size_t max_body_bytes = 64 * 1024;
+    // Unbounded by request: the kernel still clamps this to net.core.somaxconn
+    // regardless of what we pass, so INT_MAX just asks for the OS ceiling.
+    int listen_backlog = std::numeric_limits<int>::max();
+    // Threads can't actually be unlimited -- spawning an unbounded number of
+    // OS threads at startup hangs/crashes the process before it serves a
+    // single request. hardware_concurrency() is the practical ceiling (use
+    // every core); falls back to 4 if the platform can't report it.
+    std::size_t worker_threads = std::thread::hardware_concurrency() > 0
+                                      ? std::thread::hardware_concurrency()
+                                      : 4;
+    // The following are intentionally unbounded per explicit request. This
+    // removes the DoS protection described above: a slow or malicious client
+    // can now grow the pending queue, header buffer, or body buffer without
+    // limit, exhausting server memory. Re-bound these if this is exposed to
+    // untrusted clients.
+    std::size_t max_pending_requests = std::numeric_limits<std::size_t>::max();
+    std::size_t max_header_bytes = std::numeric_limits<std::size_t>::max();
+    std::size_t max_body_bytes = std::numeric_limits<std::size_t>::max();
 
     // Off by default: every existing caller (management API, tests) expects
     // one request per connection and detects response-end via EOF. Set true

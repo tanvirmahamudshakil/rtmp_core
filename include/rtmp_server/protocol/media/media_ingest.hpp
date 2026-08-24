@@ -11,6 +11,7 @@
 
 #include "rtmp_server/core/clock.hpp"
 #include "rtmp_server/core/result.hpp"
+#include "rtmp_server/media/hevc/hevc.hpp"
 #include "rtmp_server/protocol/chunk/chunk_types.hpp"
 
 namespace rtmp_server::protocol::media {
@@ -36,7 +37,17 @@ enum class AudioCodec : std::uint8_t {
 };
 
 // FLV/RTMP video "codec id" nibble (bottom 4 bits of the first video tag
-// byte). Only AVC (7) carries a sequence header this phase needs to parse.
+// byte). AVC (7) and, now, HEVC (12) carry a sequence header this phase
+// understands.
+//
+// CodecID 12 for HEVC is a pre-"Enhanced RTMP" convention used by several
+// live vendors (notably in China) before the FLV spec had an official HEVC
+// codec id: legacy FLV/RTMP tags just reuse AVC's tag layout (frame-type
+// nibble, then a packet-type byte, then either an HEVCDecoderConfigurationRecord
+// or Annex-B-convertible NALUs) with codec id 12 instead of 7. This is
+// distinct from the newer "Enhanced RTMP" extended tag header (FourCC
+// `hvc1`, ExVideoTagHeader, PacketTypeSequenceStart, ...), which is not
+// implemented here -- see classify_video_tag's comment.
 enum class VideoCodec : std::uint8_t {
     Unknown = 0xFF,
     Sorenson_H263 = 2,
@@ -45,6 +56,7 @@ enum class VideoCodec : std::uint8_t {
     On2_VP6WithAlpha = 5,
     ScreenVideo2 = 6,
     Avc = 7,
+    Hevc = 12,
 };
 
 // FLV video frame type nibble (top 4 bits of the first video tag byte).
@@ -69,6 +81,28 @@ enum class AacPacketType : std::uint8_t {
     SequenceHeader = 0, // AudioSpecificConfig
     Raw = 1,
 };
+
+// Enhanced RTMP (github.com/veovera/enhanced-rtmp) ExVideoTagHeader video
+// PacketType nibble (low 4 bits of the first tag byte, present only when
+// that byte's top bit -- IsExVideoHeader -- is set). Confidence note: this
+// server has no test vectors for Enhanced RTMP to validate against, so this
+// layout follows the publicly documented "Enhanced RTMP v1" spec from
+// memory; if a real Enhanced-RTMP encoder's bytes don't decode as expected,
+// re-check this against the spec's ExVideoTagHeader section before assuming
+// the encoder is wrong.
+enum class ExVideoPacketType : std::uint8_t {
+    SequenceStart = 0,   // VideoFourCc-specific decoder configuration record
+    CodedFrames = 1,     // composition-time-prefixed coded frame (like classic AVC)
+    SequenceEnd = 2,
+    CodedFramesX = 3,    // coded frame with composition time implicitly 0 (no CTS field)
+    Metadata = 4,
+    Mpeg2TsSequenceStart = 5,
+};
+
+// VideoFourCc values ExVideoTagHeader carries (4 ASCII bytes, big-endian as
+// a uint32) identifying the packaging in use. Only HEVC is understood here.
+inline constexpr std::uint32_t kVideoFourCcHevc =
+    (std::uint32_t{'h'} << 24) | (std::uint32_t{'v'} << 16) | (std::uint32_t{'c'} << 8) | std::uint32_t{'1'};
 
 // Parsed contents of one AVCDecoderConfigurationRecord (ISO 14496-15), as
 // carried by an AVCPacketType::SequenceHeader video tag. SPS/PPS are kept in
@@ -126,6 +160,11 @@ struct StreamMediaState {
     VideoCodec video_codec = VideoCodec::Unknown;
     std::optional<AvcSequenceHeader> avc_sequence_header;
     std::optional<AacSequenceHeader> aac_sequence_header;
+    // Set once an Enhanced RTMP (hvc1) PacketTypeSequenceStart tag has been
+    // parsed. Legacy CodecID-12 HEVC (see VideoCodec::Hevc's comment) has no
+    // sequence-header parsing yet -- only classification -- so this is only
+    // ever populated via the Enhanced path.
+    std::optional<::rtmp_server::media::hevc::HevcDecoderConfig> hevc_sequence_header;
     bool seen_keyframe = false;
     MediaStats stats;
 };
@@ -179,7 +218,22 @@ private:
 struct VideoTagInfo {
     VideoFrameType frame_type = VideoFrameType::Unknown;
     VideoCodec codec = VideoCodec::Unknown;
-    std::optional<AvcPacketType> avc_packet_type; // set only when codec == Avc and payload carries the byte
+    // Set when codec == Avc, or codec == Hevc (legacy CodecID 12 -- see
+    // VideoCodec::Hevc's comment; the packet-type byte has the same layout
+    // as AVC's in that convention), and the payload carries the byte.
+    std::optional<AvcPacketType> avc_packet_type;
+    // True when the first tag byte's top bit (IsExVideoHeader) was set --
+    // i.e. this is an Enhanced RTMP ExVideoTagHeader tag, not a classic FLV
+    // one. `codec`/`avc_packet_type` above are only meaningful for the
+    // classic form; use `fourcc`/`ex_packet_type` instead for an enhanced tag.
+    bool enhanced = false;
+    // VideoFourCc from the ExVideoTagHeader (valid only when `enhanced` and
+    // the payload was long enough to carry it). codec is set to
+    // VideoCodec::Hevc as a convenience when fourcc == kVideoFourCcHevc, so
+    // existing frame_type/keyframe logic keyed on `codec != Avc` keeps
+    // working unchanged for the enhanced path.
+    std::uint32_t fourcc = 0;
+    std::optional<ExVideoPacketType> ex_packet_type;
 };
 struct AudioTagInfo {
     AudioCodec codec = AudioCodec::Unknown;
