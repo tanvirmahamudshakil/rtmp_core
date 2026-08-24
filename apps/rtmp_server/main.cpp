@@ -193,6 +193,7 @@ int main(int argc, char** argv) {
     // already cut playlist volume at the origin to ~1 req/s per stream, so
     // this mutex is no longer the contention source it was before.
     hls_options.track_delivery_stats = true;
+    hls_options.enable_fast_join = config.enable_hls_fast_join;
     rtmp_server::control::HlsHttpHandler hls_handler(std::move(hls_options));
     // Disabling a stream (or its application) takes its .m3u8 links offline
     // immediately, mirroring the RTMP publish/play gate above — no viewer can

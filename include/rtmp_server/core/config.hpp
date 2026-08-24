@@ -48,7 +48,10 @@ struct ServerConfig {
     // actually control worker creation" + "default based on hardware
     // concurrency, with a configurable upper bound").
     std::uint32_t worker_ring_count = 0;
-    std::uint32_t max_worker_ring_count = 64;
+    // Raised from the original 64 so a high-core-count box isn't artificially
+    // capped below its real core count; SO_REUSEPORT/io_uring ring setup is
+    // the real ceiling per worker (fd/memory), not this number.
+    std::uint32_t max_worker_ring_count = 4096;
 
     // Pins worker i to CPU (i % hardware_concurrency) via
     // pthread_setaffinity_np when true. Optional per task 12 ("must not be
@@ -86,6 +89,12 @@ struct ServerConfig {
     std::uint32_t input_chunk_size = 128;
     std::uint32_t output_chunk_size = 4096;
     std::uint32_t maximum_rtmp_message_size = 10 * 1024 * 1024;
+
+    // "Fast join": a fresh open of any stream's master.m3u8 is redirected
+    // straight to its lowest-bitrate rendition instead of serving the master
+    // playlist, skipping the variant-negotiation round trip. Applies to
+    // every stream generically -- see HlsHttpOptions::enable_fast_join.
+    bool enable_hls_fast_join = false;
 
     std::chrono::milliseconds handshake_timeout{5000};
     std::chrono::milliseconds authentication_timeout{5000};

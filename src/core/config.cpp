@@ -315,6 +315,7 @@ Result<ServerConfig> load_config(const std::string& path) {
     u32("input_chunk_size", cfg.input_chunk_size);
     u32("output_chunk_size", cfg.output_chunk_size);
     u32("maximum_rtmp_message_size", cfg.maximum_rtmp_message_size);
+    boolean("enable_hls_fast_join", cfg.enable_hls_fast_join);
 
     duration("handshake_timeout", cfg.handshake_timeout);
     duration("authentication_timeout", cfg.authentication_timeout);

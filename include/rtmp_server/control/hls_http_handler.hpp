@@ -102,6 +102,20 @@ struct HlsHttpOptions {
     // can be run in plain-HTTP deployments (docs/tls.md), where a `Secure`
     // cookie would simply never be sent back and defeat its own purpose.
     bool viewer_cookie_secure = false;
+
+    // "Fast join": skip the master-playlist variant-negotiation round trip.
+    // A fresh open of any stream's master.m3u8 is redirected straight to its
+    // lowest-bitrate rendition's media playlist (hls::Rendition lists are
+    // always emitted lowest-bandwidth-first, see hls/playlist.hpp) instead of
+    // serving the master body -- the player starts on the cheapest rendition
+    // immediately rather than fetching the master, picking a variant, then
+    // fetching that. Applies to every stream generically; there is no
+    // per-stream configuration; a player is always free to step up to a
+    // higher rendition afterward via its own ABR logic on subsequent
+    // requests. Replaces the old static single-stream Caddy `uri replace`
+    // fast-join hack (RTMP_FAST_JOIN_APPLICATION/STREAM/RENDITION), which
+    // only ever worked for one hardcoded stream.
+    bool enable_fast_join = false;
 };
 
 // Serves HLS playlists and segments over the existing Phase 5
@@ -219,7 +233,8 @@ private:
     [[nodiscard]] HttpResponse serve_media_playlist(const HttpRequest& request, const StreamEntry& entry,
                                                     const std::string& application,
                                                     const std::string& stream);
-    [[nodiscard]] HttpResponse serve_master_playlist(const HttpRequest& request, const StreamEntry& entry);
+    [[nodiscard]] HttpResponse serve_master_playlist(const HttpRequest& request, const StreamEntry& entry,
+                                                     const std::string& application);
     [[nodiscard]] HttpResponse serve_segment(const HttpRequest& request, const StreamEntry& entry,
                                              const std::string& name);
     void decorate(HttpResponse& response, const std::string& cache_control) const;

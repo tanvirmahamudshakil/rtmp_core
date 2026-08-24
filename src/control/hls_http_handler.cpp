@@ -401,9 +401,42 @@ HttpResponse HlsHttpHandler::serve_media_playlist(const HttpRequest& request, co
     return response;
 }
 
-HttpResponse HlsHttpHandler::serve_master_playlist(const HttpRequest& request, const StreamEntry& entry) {
+HttpResponse HlsHttpHandler::serve_master_playlist(const HttpRequest& request, const StreamEntry& entry,
+                                                   const std::string& application) {
     if (entry.renditions.empty()) {
         return plain(404, "no renditions declared for this stream");
+    }
+    if (options_.enable_fast_join) {
+        // Renditions are always lowest-bandwidth-first (hls/playlist.hpp), so
+        // the first entry is exactly the one fast-join wants. Its `uri` is
+        // always the fixed "../<output_stream>/index.m3u8" shape every
+        // renditions-ready callback builds (main.cpp, source_job_manager.cpp)
+        // -- reuse the same reversal the delivery-stats aggregator uses
+        // rather than a generic relative-URL resolver, since that's the only
+        // shape this ever has to handle.
+        const std::string rendition_stream = rendition_stream_from_uri(entry.renditions.front().uri);
+        if (!rendition_stream.empty()) {
+            HttpResponse redirect;
+            redirect.status = 302;
+            redirect.content_type = "text/plain";
+            std::string location = options_.route_prefix + "/" + application + "/" + rendition_stream + "/index.m3u8";
+            if (!request.query.empty()) location += "?" + request.query;
+            redirect.headers["Location"] = location;
+            // Same reasoning as the playback-session redirect: this response
+            // is per-request routing, not shared content, so it must never
+            // be cached (and in shared-cache mode, master.m3u8 itself is a
+            // cached object -- this redirect only ever fires on the fresh,
+            // un-cached bootstrap request that reaches serve_master_playlist,
+            // never on a cache hit).
+            redirect.headers["Cache-Control"] = "private, no-store";
+            if (!options_.cors_allow_origin.empty()) {
+                redirect.headers["Access-Control-Allow-Origin"] = options_.cors_allow_origin;
+            }
+            return redirect;
+        }
+        // Fall through to the normal master playlist if the URI shape ever
+        // doesn't match (defensive -- shouldn't happen given how renditions
+        // are always registered).
     }
     HttpResponse response;
     response.status = 200;
@@ -626,7 +659,7 @@ HttpResponse HlsHttpHandler::handle(const HttpRequest& request) {
             std::lock_guard lock(mutex_);
             stats_.playlist_requests += 1;
         }
-        response = serve_master_playlist(request, entry);
+        response = serve_master_playlist(request, entry, application);
     } else if (ends_with(resource, ".m3u8")) {
         {
             std::lock_guard lock(mutex_);

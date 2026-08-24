@@ -8,20 +8,29 @@
 #
 # Supported inputs:
 #   RTMP_DOMAIN                  DNS name for HTTPS panel and RTMP URLs.
-#                                Empty = HTTP on the server's primary IP.
-#   RTMP_BANDWIDTH_MBIT          "auto" (default) reads the NIC-reported link
-#                                speed; set Mbps explicitly for provider caps.
+#                                Optional -- empty (default) serves over HTTP on
+#                                the server's primary IP; a domain later pointed
+#                                at that IP works too, no reinstall needed.
+#   RTMP_BANDWIDTH_MBIT          Defaults to a flat 20000 (20 Gbps). Set "auto"
+#                                to read the NIC-reported link speed instead, or
+#                                a specific Mbps number for a provider cap.
 #   RTMP_EXPECTED_STREAM_MBIT    "auto" (default) keeps OBS/transcoder bitrate
 #                                unchanged and measures it while live. A numeric
 #                                value only overrides install-time capacity sizing.
 #   RTMP_RESOURCE_SIZING_MBIT    Pre-live socket/buffer sizing floor used only
-#                                in auto mode (default 0.50 Mbps). It never
-#                                changes or transcodes media.
+#                                in auto mode (default 3 Mbps, a typical 720p
+#                                live encode). It never changes or transcodes
+#                                media.
 #   RTMP_LINK_UTILIZATION_PERCENT
 #                                Capacity target (default 90, accepted 50-95).
 #   RTMP_PROTOCOL_OVERHEAD_PERCENT
-#                                RTMP/TCP/IP overhead budget (default 5).
-#   RTMP_ADMIN_TOKEN             Existing admin token; generated if absent.
+#                                Delivery overhead budget on top of raw stream
+#                                bitrate -- TCP/IP framing plus HLS's MPEG-TS
+#                                container and HTTP header cost (default 8).
+#   RTMP_ADMIN_TOKEN             Optional -- not needed for a normal install; a
+#                                random 32-byte token is generated automatically
+#                                if left unset. Set it only to pin a known token
+#                                (e.g. restoring a prior deployment's value).
 #   RTMP_ENABLE_FAIR_QUEUE       1 (default) shapes at the configured link
 #                                utilization target and fairly schedules viewer
 #                                flows, reserving capacity for new joins.
@@ -31,8 +40,11 @@
 #                                so source-transcode pulls of an external HLS/RTMP
 #                                URL still resolve if the provider's own DNS
 #                                fails or blocks a niche domain.
-#   RTMP_WORKERS                 Worker count; default min(nproc, 16).
-#   RTMP_MAX_CONNECTIONS_PER_IP  Per-source safety limit (default 1000).
+#   RTMP_WORKERS                 Worker count; default = every detected CPU
+#                                core (no artificial cap besides the core count
+#                                itself and the 4096 io_uring ring ceiling).
+#   RTMP_MAX_CONNECTIONS_PER_IP  Per-source connection cap. Unbounded (uint32
+#                                max) by default -- no per-IP admission limit.
 #   RTMP_FRESH_INSTALL           1 (default) removes every prior StreamForge
 #                                install, database, key, recording and build
 #                                artefact before reinstalling. Set 0 only for
@@ -42,12 +54,14 @@
 #                                to seed the legacy preset file (the external
 #                                supervisor remains disabled; source jobs use
 #                                the native in-process pipeline).
-#   RTMP_ENABLE_FAST_JOIN        1 (default) sends fresh opens of one configured
-#                                master link directly to its startup rendition.
-#                                Existing rendition sessions are unaffected.
-#   RTMP_FAST_JOIN_APPLICATION   Application for the optimized link (default kk).
-#   RTMP_FAST_JOIN_STREAM        Public/base stream name (default KK).
-#   RTMP_FAST_JOIN_RENDITION     Startup rendition stream (default KK_480p).
+#   RTMP_ENABLE_FAST_JOIN        1 (default) redirects a fresh open of ANY
+#                                stream's master.m3u8 straight to its
+#                                lowest-bitrate rendition (renditions are
+#                                always listed lowest-bitrate-first), skipping
+#                                the master-playlist variant-negotiation round
+#                                trip. Applies to every stream automatically --
+#                                no per-stream configuration needed. Existing
+#                                rendition sessions are unaffected.
 #   RTMP_ENABLE_DISK_GUARD       1 (default) checks disk pressure every 5m.
 #   RTMP_DISK_TRIGGER_PERCENT    Start cleanup at this usage (default 80).
 #   RTMP_DISK_TARGET_PERCENT     Stop cleanup at this usage (default 70).
@@ -92,12 +106,22 @@ case "${ID:-}" in
 esac
 
 DOMAIN="${RTMP_DOMAIN:-}"
-BANDWIDTH_MBIT="${RTMP_BANDWIDTH_MBIT:-auto}"
+# Default to a flat 20 Gbps instead of NIC auto-detection -- set
+# RTMP_BANDWIDTH_MBIT=auto explicitly to go back to reading the NIC's
+# reported link speed, or a specific number for a provider-capped link.
+BANDWIDTH_MBIT="${RTMP_BANDWIDTH_MBIT:-20000}"
 EXPECTED_STREAM_MBIT="${RTMP_EXPECTED_STREAM_MBIT:-auto}"
-RESOURCE_SIZING_MBIT="${RTMP_RESOURCE_SIZING_MBIT:-0.50}"
+# Pre-live capacity-sizing floor, used only until a real bitrate is measured
+# from live traffic. 0.5 Mbps under-sized socket/buffer reservations for a
+# realistic stream; 3 Mbps matches a typical 720p live encode, so day-one
+# sizing doesn't undershoot before the first publisher goes live.
+RESOURCE_SIZING_MBIT="${RTMP_RESOURCE_SIZING_MBIT:-3}"
 LINK_UTILIZATION_PERCENT="${RTMP_LINK_UTILIZATION_PERCENT:-90}"
-PROTOCOL_OVERHEAD_PERCENT="${RTMP_PROTOCOL_OVERHEAD_PERCENT:-5}"
-MAX_CONNECTIONS_PER_IP="${RTMP_MAX_CONNECTIONS_PER_IP:-1000}"
+# 5% covers raw TCP/IP framing but HLS delivery adds MPEG-TS container and
+# HTTP header overhead on top of that; 8% reflects the combined real-world
+# cost more accurately for this delivery path.
+PROTOCOL_OVERHEAD_PERCENT="${RTMP_PROTOCOL_OVERHEAD_PERCENT:-8}"
+MAX_CONNECTIONS_PER_IP="${RTMP_MAX_CONNECTIONS_PER_IP:-4294967295}"
 ENABLE_FAIR_QUEUE="${RTMP_ENABLE_FAIR_QUEUE:-1}"
 CONFIGURE_FIREWALL="${RTMP_CONFIGURE_FIREWALL:-1}"
 CONFIGURE_DNS="${RTMP_CONFIGURE_DNS:-1}"
@@ -109,9 +133,6 @@ FRESH_INSTALL="${RTMP_FRESH_INSTALL:-1}"
 ENABLE_TRANSCODING=0
 TRANSCODING_RULES="${RTMP_TRANSCODING_RULES:-}"
 ENABLE_FAST_JOIN="${RTMP_ENABLE_FAST_JOIN:-1}"
-FAST_JOIN_APPLICATION="${RTMP_FAST_JOIN_APPLICATION:-kk}"
-FAST_JOIN_STREAM="${RTMP_FAST_JOIN_STREAM:-KK}"
-FAST_JOIN_RENDITION="${RTMP_FAST_JOIN_RENDITION:-KK_480p}"
 ENABLE_DISK_GUARD="${RTMP_ENABLE_DISK_GUARD:-1}"
 DISK_TRIGGER_PERCENT="${RTMP_DISK_TRIGGER_PERCENT:-80}"
 DISK_TARGET_PERCENT="${RTMP_DISK_TARGET_PERCENT:-70}"
@@ -140,8 +161,8 @@ fi
   die "RTMP_PROTOCOL_OVERHEAD_PERCENT must be between 1 and 20."
 [[ "${MAX_CONNECTIONS_PER_IP}" =~ ^[1-9][0-9]*$ ]] ||
   die "RTMP_MAX_CONNECTIONS_PER_IP must be a positive integer."
-(( MAX_CONNECTIONS_PER_IP <= 1000000 )) ||
-  die "RTMP_MAX_CONNECTIONS_PER_IP is outside the supported range."
+(( MAX_CONNECTIONS_PER_IP <= 4294967295 )) ||
+  die "RTMP_MAX_CONNECTIONS_PER_IP is outside the supported range (uint32)."
 [[ "${ENABLE_FAIR_QUEUE}" =~ ^[01]$ ]] || die "RTMP_ENABLE_FAIR_QUEUE must be 0 or 1."
 [[ "${CONFIGURE_FIREWALL}" =~ ^[01]$ ]] || die "RTMP_CONFIGURE_FIREWALL must be 0 or 1."
 [[ "${CONFIGURE_DNS}" =~ ^[01]$ ]] || die "RTMP_CONFIGURE_DNS must be 0 or 1."
@@ -161,12 +182,6 @@ fi
   die "RTMP_DISK_TARGET_PERCENT must be between 40 and trigger-1."
 [[ "${DISK_MIN_FREE_MB}" =~ ^[0-9]+$ ]] && (( DISK_MIN_FREE_MB >= 512 )) ||
   die "RTMP_DISK_MIN_FREE_MB must be at least 512."
-if [[ "${ENABLE_FAST_JOIN}" == "1" ]]; then
-  for fast_join_value in "${FAST_JOIN_APPLICATION}" "${FAST_JOIN_STREAM}" "${FAST_JOIN_RENDITION}"; do
-    [[ "${fast_join_value}" =~ ^[A-Za-z0-9][A-Za-z0-9_-]*$ ]] ||
-      die "Fast-join application/stream/rendition names may contain only letters, numbers, underscores and hyphens."
-  done
-fi
 if [[ -n "${DOMAIN}" && ! "${DOMAIN}" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]]; then
   die "RTMP_DOMAIN must be a hostname without a URL scheme, path, port or whitespace."
 fi
@@ -486,12 +501,17 @@ if [[ "${NODE_OK}" != "1" ]]; then
 fi
 
 CPU_COUNT="$(nproc)"
+# Must match ServerConfig::max_worker_ring_count (include/rtmp_server/core/config.hpp).
+MAX_WORKER_RING_COUNT=4096
+# No artificial 16-worker ceiling: default to one worker per core. Still
+# clamp to CPU_COUNT (more workers than cores just thrashes the scheduler,
+# it doesn't add capacity) and to ServerConfig::max_worker_ring_count, which
+# is the hard SO_REUSEPORT ring-count ceiling enforced downstream.
 DEFAULT_WORKERS="${CPU_COUNT}"
-if (( DEFAULT_WORKERS > 16 )); then DEFAULT_WORKERS=16; fi
 WORKERS="${RTMP_WORKERS:-${DEFAULT_WORKERS}}"
 [[ "${WORKERS}" =~ ^[1-9][0-9]*$ ]] || die "RTMP_WORKERS must be a positive integer."
 if (( WORKERS > CPU_COUNT )); then WORKERS="${CPU_COUNT}"; fi
-if (( WORKERS > 64 )); then WORKERS=64; fi
+if (( WORKERS > MAX_WORKER_RING_COUNT )); then WORKERS="${MAX_WORKER_RING_COUNT}"; fi
 
 PRIMARY_INTERFACE="$(ip -o route get 1.1.1.1 2>/dev/null | awk '{for (i=1;i<=NF;i++) if ($i=="dev") {print $(i+1); exit}}')"
 [[ -n "${PRIMARY_INTERFACE}" ]] || PRIMARY_INTERFACE="$(ip -o route show default | awk 'NR == 1 { print $5 }')"
@@ -669,6 +689,7 @@ RTMP_SERVER_MAXIMUM_CONNECTIONS_PER_IP=${MAX_CONNECTIONS_PER_IP}
 RTMP_SERVER_MAXIMUM_PUBLISHERS=${MAX_PUBLISHERS}
 RTMP_SERVER_MAXIMUM_VIEWERS_PER_STREAM=${MAX_VIEWERS}
 RTMP_SERVER_WORKER_RING_COUNT=${WORKERS}
+RTMP_SERVER_ENABLE_HLS_FAST_JOIN=$([[ "${ENABLE_FAST_JOIN}" == "1" ]] && echo true || echo false)
 RTMP_SERVER_PROVIDED_BUFFER_COUNT=${PROVIDED_BUFFER_COUNT}
 RTMP_SERVER_PROVIDED_BUFFER_SIZE=16384
 RTMP_SERVER_DATABASE_TYPE=sqlite
@@ -968,19 +989,10 @@ if [[ -n "${DOMAIN}" ]]; then
 else
   CADDY_SITE=":80"
 fi
-FAST_JOIN_CADDY_BLOCK=""
-if [[ "${ENABLE_FAST_JOIN}" == "1" ]]; then
-  FAST_JOIN_CADDY_BLOCK="$(cat <<EOF
-    @fast_join path /hls/${FAST_JOIN_APPLICATION}/${FAST_JOIN_STREAM}/master.m3u8
-    handle @fast_join {
-        # Start a fresh player on the smaller shared-cache rendition.
-        uri replace /hls/${FAST_JOIN_APPLICATION}/${FAST_JOIN_STREAM}/master.m3u8 /hls/${FAST_JOIN_APPLICATION}/${FAST_JOIN_RENDITION}/index.m3u8
-        reverse_proxy 127.0.0.1:6081
-    }
-
-EOF
-)"
-fi
+# Fast join is now a generic origin-server behavior (HlsHttpOptions::
+# enable_fast_join, wired via RTMP_SERVER_ENABLE_HLS_FAST_JOIN below) that
+# applies to every stream's lowest-bitrate rendition automatically, not a
+# per-stream static Caddy rewrite -- no Caddyfile block needed here anymore.
 cat > /etc/caddy/Caddyfile <<EOF
 # Managed by StreamForge install-linux.sh
 ${CADDY_SITE} {
@@ -1001,7 +1013,6 @@ ${CADDY_SITE} {
         file_server
     }
 
-${FAST_JOIN_CADDY_BLOCK}
     # Both playlists and segments use the local shared cache.
     @hls path /hls/*
     handle @hls {
@@ -1138,8 +1149,7 @@ else
   printf '  Disk guard:        disabled by RTMP_ENABLE_DISK_GUARD=0\n'
 fi
 if [[ "${ENABLE_FAST_JOIN}" == "1" ]]; then
-  printf '  Fast join:         /hls/%s/%s/master.m3u8 -> %s\n' \
-    "${FAST_JOIN_APPLICATION}" "${FAST_JOIN_STREAM}" "${FAST_JOIN_RENDITION}"
+  printf '  Fast join:         every stream master.m3u8 -> its lowest-bitrate rendition\n'
 else
   printf '  Fast join:         disabled by RTMP_ENABLE_FAST_JOIN=0\n'
 fi
