@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <limits>
+#include <thread>
 
 #include "rtmp_server/core/error.hpp"
 #include "rtmp_server/transcoding/preset.hpp"
@@ -121,6 +122,37 @@ void SourceJobManager::publish_master_locked(const SourceJobConfig& config,
 }
 
 void SourceJobManager::build_renditions_locked(Job& job) {
+    // Segment stores outlive the puller that fills them. A restart (upstream
+    // dropped, manual restart, auto-restart) previously threw the stores
+    // away and started from an empty live window, so every viewer's playlist
+    // went 404/empty until a whole new startup runway had been primed --
+    // tens of seconds of dead air for what may have been a two-second
+    // upstream hiccup. Reusing them keeps the last window on air while the
+    // new pipeline spins up, and lets the puller resume the media sequence
+    // instead of colliding with already-cached segment URLs (see
+    // HlsSourcePuller::run's `resuming` branch, which was unreachable
+    // before this).
+    if (job.renditions.size() == job.config.renditions.size()) {
+        bool same_outputs = true;
+        for (std::size_t i = 0; i < job.renditions.size(); ++i) {
+            if (job.renditions[i].store == nullptr ||
+                job.renditions[i].spec.output_stream != job.config.renditions[i].output_stream) {
+                same_outputs = false;
+                break;
+            }
+        }
+        if (same_outputs) {
+            for (std::size_t i = 0; i < job.renditions.size(); ++i) {
+                job.renditions[i].spec = job.config.renditions[i];
+                // A cleanly stopped pipeline marked its store ended
+                // (EXT-X-ENDLIST). Reopen it: the window is about to start
+                // moving again.
+                job.renditions[i].store->mark_live();
+            }
+            return;
+        }
+    }
+
     job.renditions.clear();
     job.renditions.reserve(job.config.renditions.size());
     for (const auto& spec : job.config.renditions) {
@@ -129,6 +161,15 @@ void SourceJobManager::build_renditions_locked(Job& job) {
         store_config.retention_grace_segments = options_.retention_grace_segments;
         store_config.max_total_bytes = options_.max_total_bytes_per_rendition;
         store_config.target_duration_seconds = options_.target_duration_seconds;
+        // A pulled source is not under this server's control: it can stall
+        // for a few seconds at any time, and the pipeline is rebuilt around
+        // it automatically. Repeating the last complete segment keeps the
+        // playlist advancing through that gap so established players hold
+        // the stream open instead of ending the session on a frozen
+        // playlist. Synthetic copies do not count as real output, so the
+        // puller's own stall detection is unaffected (SegmentStoreStats::
+        // real_segments_added).
+        store_config.repeat_last_segment_on_stall = true;
         PullerRendition pr;
         pr.spec = spec;
         pr.store = std::make_shared<hls::SegmentStore>(store_config);
@@ -150,6 +191,19 @@ void SourceJobManager::unregister_outputs_locked(const Job& job) {
     }
 }
 
+std::uint32_t SourceJobManager::cpu_budget_locked() const {
+    const auto hardware = std::thread::hardware_concurrency();
+    const std::uint32_t cores = hardware > 0 ? hardware : 1;
+    std::uint32_t active = 0;
+    for (const auto& [key, job] : jobs_) {
+        (void)key;
+        if (job.enabled) ++active;
+    }
+    // The caller is about to start a job, which may not be in jobs_ yet.
+    active = std::max<std::uint32_t>(active, 1);
+    return std::max<std::uint32_t>(1, cores / active);
+}
+
 void SourceJobManager::start_locked(Job& job) {
     build_renditions_locked(job);
     register_outputs_locked(job);
@@ -157,19 +211,35 @@ void SourceJobManager::start_locked(Job& job) {
 
     // HlsSourcePuller owns its renditions by value (copies the shared_ptr
     // stores), so a fresh puller is constructed on every (re)start.
-    job.puller = std::make_unique<HlsSourcePuller>(job.config.source_url, job.renditions, job.config.fps);
+    // Every running job shares one machine: hand this one its slice rather
+    // than letting each job's encoders size themselves from the full core
+    // count independently (see SourceTranscoder's constructor). The split is
+    // recomputed whenever a job starts, so adding a job narrows the share
+    // for jobs started after it and a restart re-levels the rest.
+    job.puller = std::make_unique<HlsSourcePuller>(job.config.source_url, job.renditions,
+                                                   job.config.fps, cpu_budget_locked());
     job.puller->start();
     job.enabled = true;
     job.detail_override.clear();
     job.restart_scheduled = false;
+    job.running_since.reset();
+    // This is the authoritative "a puller is running again" point. Clearing
+    // the flag here means an in-flight restart_job that was overtaken (an
+    // operator disabled then re-enabled the job while its old puller was
+    // being joined) sees the job as already started and does not start a
+    // second one on top.
+    job.restart_in_progress = false;
 }
 
-void SourceJobManager::teardown_locked(Job& job) {
-    if (job.puller) {
-        job.puller->stop();
-        job.puller.reset();
-    }
-    unregister_outputs_locked(job);
+std::unique_ptr<HlsSourcePuller> SourceJobManager::detach_puller_locked(Job& job) {
+    job.running_since.reset();
+    return std::move(job.puller);
+}
+
+void SourceJobManager::teardown_locked(Job& job, std::unique_ptr<HlsSourcePuller>& retired,
+                                       bool release_outputs) {
+    retired = detach_puller_locked(job);
+    if (release_outputs) unregister_outputs_locked(job);
 }
 
 SourceJobSnapshot SourceJobManager::snapshot_locked(const Job& job) const {
@@ -254,6 +324,21 @@ void SourceJobManager::load_from_store() {
     }
 }
 
+std::chrono::seconds SourceJobManager::restart_delay_for(const SourceJobConfig& config,
+                                                         const SourceJobOptions& options,
+                                                         std::uint32_t attempts) {
+    const std::uint32_t base = std::max<std::uint32_t>(config.restart_delay_seconds, 1);
+    const std::uint32_t cap = std::max(options.restart_backoff_cap_seconds, base);
+    // Double the wait per consecutive failure, up to the cap. A source that
+    // is simply down should be retried patiently rather than hammered every
+    // few seconds for hours; a source that dropped once still comes back on
+    // the configured delay.
+    const std::uint32_t exponent = std::min(attempts, options.max_restart_attempts);
+    std::uint64_t delay = base;
+    for (std::uint32_t i = 0; i < exponent && delay < cap; ++i) delay *= 2;
+    return std::chrono::seconds(static_cast<std::uint32_t>(std::min<std::uint64_t>(delay, cap)));
+}
+
 void SourceJobManager::monitor_loop() {
     // Polls every job's puller roughly 5x/s and respawns a job whose
     // restart_at has passed (scheduled below when a puller reports Error and
@@ -266,24 +351,78 @@ void SourceJobManager::monitor_loop() {
         }
         if (!monitor_running_.load()) break;
 
-        std::lock_guard lock(mutex_);
-        const auto now = std::chrono::steady_clock::now();
-        for (auto& [key, job] : jobs_) {
-            (void)key;
-            if (!job.enabled || !job.config.auto_restart) continue;
-            if (job.puller && job.puller->status() == PullerStatus::Error && !job.restart_scheduled) {
-                job.restart_scheduled = true;
-                job.restart_at = now + std::chrono::seconds(job.config.restart_delay_seconds);
-                continue;
-            }
-            if (job.restart_scheduled && now >= job.restart_at &&
-                job.restart_attempts <= options_.max_restart_attempts) {
-                ++job.restart_attempts;
-                teardown_locked(job);
-                start_locked(job);
+        std::vector<std::string> due;
+        {
+            std::lock_guard lock(mutex_);
+            const auto now = std::chrono::steady_clock::now();
+            for (auto& [key, job] : jobs_) {
+                if (!job.enabled || !job.config.auto_restart || job.restart_in_progress) continue;
+
+                // Forgive the failure streak once this puller has held
+                // Running long enough. Without this a job that drops once a
+                // day still climbs to the maximum backoff over a week, and
+                // (before restarts became unlimited) eventually stopped
+                // being restarted at all.
+                if (job.puller && job.puller->status() == PullerStatus::Running) {
+                    if (!job.running_since) job.running_since = now;
+                    if (job.restart_attempts > 0 &&
+                        now - *job.running_since >=
+                            std::chrono::seconds(options_.healthy_reset_seconds)) {
+                        job.restart_attempts = 0;
+                    }
+                } else if (job.puller && job.puller->status() != PullerStatus::Starting) {
+                    job.running_since.reset();
+                }
+
+                if (job.puller && job.puller->status() == PullerStatus::Error &&
+                    !job.restart_scheduled) {
+                    job.restart_scheduled = true;
+                    job.restart_at =
+                        now + restart_delay_for(job.config, options_, job.restart_attempts);
+                    continue;
+                }
+                // No attempt ceiling: a job is never abandoned permanently.
+                // The delay grows to restart_backoff_cap_seconds and stays
+                // there, so an upstream that returns after an hour is picked
+                // up automatically instead of requiring someone to log in
+                // and press restart.
+                if (job.restart_scheduled && now >= job.restart_at) {
+                    ++job.restart_attempts;
+                    due.push_back(key);
+                }
             }
         }
+        for (const auto& key : due) restart_job(key);
     }
+}
+
+void SourceJobManager::restart_job(const std::string& key) {
+    // Declared before the lock guard in each scope below so the puller's
+    // thread join happens after mutex_ is released.
+    std::unique_ptr<HlsSourcePuller> retired;
+    {
+        std::lock_guard lock(mutex_);
+        auto it = jobs_.find(key);
+        if (it == jobs_.end()) return;
+        Job& job = it->second;
+        if (job.restart_in_progress || !job.enabled) return;
+        job.restart_in_progress = true;
+        // Outputs stay registered across a restart: the retained segment
+        // stores keep serving their last window (and, while the source is
+        // down, the store's own stall fallback) instead of 404ing every
+        // viewer for the length of the rebuild.
+        teardown_locked(job, retired, /*release_outputs=*/false);
+    }
+    retired.reset(); // joins the puller thread with mutex_ released
+
+    std::lock_guard lock(mutex_);
+    auto it = jobs_.find(key);
+    if (it == jobs_.end()) return; // removed while we were stopping it
+    Job& job = it->second;
+    if (!job.restart_in_progress) return; // replaced by a fresh create()
+    job.restart_in_progress = false;
+    if (!job.enabled) return; // disabled while we were stopping it
+    start_locked(job);
 }
 
 core::Result<SourceJobSnapshot> SourceJobManager::create(const SourceJobConfig& config) {
@@ -295,10 +434,16 @@ core::Result<SourceJobSnapshot> SourceJobManager::create(const SourceJobConfig& 
         if (rendition.output_stream.empty()) return job_error("every rendition needs an output stream name");
     }
 
+    // Declared before the lock so the replaced job's puller thread is joined
+    // after mutex_ is released (that join can block on a network read).
+    std::unique_ptr<HlsSourcePuller> retired;
     std::lock_guard lock(mutex_);
     const std::string key = key_of(config.application, config.name);
     if (auto it = jobs_.find(key); it != jobs_.end()) {
-        teardown_locked(it->second); // replace an existing job with the same name
+        // Replace an existing job with the same name. Its outputs are
+        // released here because the replacement rebuilds its own stores from
+        // the new configuration.
+        teardown_locked(it->second, retired, /*release_outputs=*/true);
         jobs_.erase(it);
     }
 
@@ -314,6 +459,7 @@ core::Result<SourceJobSnapshot> SourceJobManager::create(const SourceJobConfig& 
 
 core::Result<SourceJobSnapshot> SourceJobManager::set_enabled(const std::string& application,
                                                               const std::string& name, bool enabled) {
+    std::unique_ptr<HlsSourcePuller> retired; // joined after the lock is released
     std::lock_guard lock(mutex_);
     auto it = jobs_.find(key_of(application, name));
     if (it == jobs_.end()) return job_error("no such source job");
@@ -324,8 +470,11 @@ core::Result<SourceJobSnapshot> SourceJobManager::set_enabled(const std::string&
         job.restart_attempts = 0;
         start_locked(job); // respawn puller from stored config
     } else {
-        teardown_locked(job); // stop transcoding; source's HLS output stops updating
+        // Disabling is an operator decision to take the stream off the air:
+        // unlike a restart, its HLS links stop resolving.
+        teardown_locked(job, retired, /*release_outputs=*/true);
         job.enabled = false;
+        job.restart_scheduled = false;
     }
     persist_locked(job);
     return snapshot_locked(job);
@@ -333,22 +482,31 @@ core::Result<SourceJobSnapshot> SourceJobManager::set_enabled(const std::string&
 
 core::Result<SourceJobSnapshot> SourceJobManager::restart(const std::string& application,
                                                           const std::string& name) {
+    const std::string key = key_of(application, name);
+    {
+        std::lock_guard lock(mutex_);
+        auto it = jobs_.find(key);
+        if (it == jobs_.end()) return job_error("no such source job");
+        if (!it->second.enabled) return job_error("job is disabled; enable it first");
+        it->second.restart_attempts = 0;
+    }
+    // Same stop-outside-the-lock path the auto-restart monitor uses, so a
+    // manual restart of a job whose source is hung cannot block the
+    // management API's other readers while the puller's thread is joined.
+    restart_job(key);
+
     std::lock_guard lock(mutex_);
-    auto it = jobs_.find(key_of(application, name));
+    auto it = jobs_.find(key);
     if (it == jobs_.end()) return job_error("no such source job");
-    Job& job = it->second;
-    if (!job.enabled) return job_error("job is disabled; enable it first");
-    teardown_locked(job);
-    job.restart_attempts = 0;
-    start_locked(job);
-    return snapshot_locked(job);
+    return snapshot_locked(it->second);
 }
 
 bool SourceJobManager::remove(const std::string& application, const std::string& name) {
+    std::unique_ptr<HlsSourcePuller> retired; // joined after the lock is released
     std::lock_guard lock(mutex_);
     auto it = jobs_.find(key_of(application, name));
     if (it == jobs_.end()) return false;
-    teardown_locked(it->second);
+    teardown_locked(it->second, retired, /*release_outputs=*/true);
     if (store_ != nullptr) (void)store_->delete_source_job(application, name);
     jobs_.erase(it);
     return true;
@@ -366,11 +524,22 @@ std::vector<SourceJobSnapshot> SourceJobManager::list(const std::string& applica
 }
 
 void SourceJobManager::stop_all() {
-    std::lock_guard lock(mutex_);
-    for (auto& [key, job] : jobs_) {
-        (void)key;
-        teardown_locked(job);
+    // Detach every puller under the lock, then join them once it is
+    // released: each join can wait on its own network timeout, and holding
+    // the manager lock across that would block every management-API read
+    // for the whole shutdown.
+    std::vector<std::unique_ptr<HlsSourcePuller>> retired;
+    {
+        std::lock_guard lock(mutex_);
+        retired.reserve(jobs_.size());
+        for (auto& [key, job] : jobs_) {
+            (void)key;
+            std::unique_ptr<HlsSourcePuller> puller;
+            teardown_locked(job, puller, /*release_outputs=*/true);
+            if (puller) retired.push_back(std::move(puller));
+        }
     }
+    retired.clear();
 }
 
 } // namespace rtmp_server::transcoding::native

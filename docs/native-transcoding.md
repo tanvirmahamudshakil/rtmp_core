@@ -92,7 +92,9 @@ The knobs live in `HevcQualityOptions`; the defaults target live streaming at
 
 ## Building
 
-Off by default. Enable with the CMake option after installing the dev packages:
+On by default (`RTMP_ENABLE_NATIVE_TRANSCODE=ON`), but only actually compiled
+when the codec libraries are present — the CMake probe degrades gracefully to a
+build without transcoding when they are not. Install the dev packages first:
 
 ```bash
 sudo apt-get install libx265-dev libx264-dev libopenh264-dev libde265-dev libfdk-aac-dev libcurl4-openssl-dev libyuv-dev
@@ -130,6 +132,61 @@ fragmented-MP4 HLS playlists are rejected immediately with a precise job
 detail because the native demuxer currently accepts MPEG-TS segments.
 
 Or during a VPS install: `RTMP_ENABLE_NATIVE_TRANSCODE=1 bash scripts/install-linux.sh`.
+
+### How a source job behaves at runtime
+
+These are the properties an unattended VPS deployment depends on; each is
+enforced in `native/source_job_manager.cpp` or `native/hls_source_puller.cpp`.
+
+**Joining a live source.** The first playlist poll ingests only the trailing
+segments needed to fill the publisher's cold-start runway (≈35 s, minimum
+three segments). Many IPTV panels advertise a window minutes deep; ingesting
+all of it would put that entire backlog through the transcoder and leave every
+viewer permanently that far behind the broadcast. A VOD source
+(`EXT-X-ENDLIST`) is still played from its beginning.
+
+**Staying at the live edge.** After the initial join, a poll that turns up more
+than 60 s of un-ingested media means the pipeline is behind real time. The
+puller skips the oldest of that backlog and emits `EXT-X-DISCONTINUITY` at the
+jump rather than transcoding history. `PacedSegmentPublisher` separately bounds
+its own queue (`max_buffer`, default 45 s): past that bound it releases each
+segment at 90% of its media duration, so a surplus handed over by a bursty
+source is absorbed over a few minutes instead of becoming permanent latency.
+
+**Segment fetching.** All un-ingested segments in a poll are fetched
+concurrently by a fixed four-worker pool whose libcurl handles live for the
+whole job, so connections to the source's CDN are reused across segments and
+polls. Demuxing stays strictly in playlist order — only the network fetch is
+parallel.
+
+**Restarts never give up.** A puller that reports `Error` is rebuilt after
+`restart_delay_seconds`, doubling per consecutive failure up to
+`restart_backoff_cap_seconds` (60 s) — and then retried at that interval
+indefinitely. A source that is down for an hour comes back on its own when the
+upstream returns; no operator action is needed. The failure streak is forgiven
+once a puller has held `Running` for `healthy_reset_seconds` (120 s).
+
+**A restart does not take the stream off the air.** Each rendition's
+`SegmentStore` and its HLS registration outlive the puller, so the last live
+window keeps serving while the pipeline is rebuilt, and the media sequence
+resumes instead of colliding with already-cached segment URLs. Source-job
+stores also set `repeat_last_segment_on_stall`, so the playlist keeps
+advancing through an upstream outage instead of freezing (synthetic repeats
+are excluded from `real_segments_added`, so stall detection still works).
+Disabling a job is the one case that does unregister its outputs — that is an
+operator decision to take the stream offline.
+
+**CPU is divided between jobs.** `SourceJobManager` gives each starting job
+`hardware_concurrency() / enabled_jobs` cores, which `SourceTranscoder` then
+splits across that job's renditions. Without it, every job sized itself from
+the full core count independently and four two-rendition jobs on an 8-core box
+asked for ~32 encoder threads, pushing *all* of them behind real time.
+
+**Management calls never block on a hung source.** Stopping a puller joins a
+worker that may be inside a libcurl read for tens of seconds. Every path that
+stops one (`remove`, `set_enabled(false)`, `restart`, auto-restart,
+`stop_all`) detaches it under the manager mutex and joins it after releasing
+that mutex, so `GET /v1/transcoding/source-jobs` stays responsive.
 
 The pure geometry, x265 and AAC parameter-mapping logic (`native/geometry.cpp`,
 `native/hevc_params.cpp`, `native/aac_params.cpp`) compiles and is unit-tested

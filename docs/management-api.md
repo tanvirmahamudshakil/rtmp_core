@@ -64,6 +64,28 @@ could still vendor a library if the endpoint surface grows.
 Stream identifiers in the path are `<application>:<name>` (colon, not
 slash) so they fit in one path segment without percent-encoding.
 
+### `status` / `viewers` payload
+
+```json
+{
+  "application": "live", "name": "main-stage", "is_live": true,
+  "viewer_count": 1523,
+  "rtmp_viewer_count": 3,
+  "hls_viewer_count": 1520,
+  "hls_viewers_measured": true,
+  "egress_bytes_total": 91234567,
+  "rtmp_egress_bytes_total": 1234567,
+  "hls_egress_bytes_total": 90000000
+}
+```
+
+`viewer_count` is the total across both delivery paths — use it directly.
+The HLS half is measured at the cache edge, because a Varnish-collapsed
+origin cannot observe viewer polls; `hls_viewers_measured` is `false` when
+that reading was unavailable, in which case the HLS numbers are only what
+this origin itself delivered and undercount the real audience. See
+`docs/hls.md`, "Where a link's viewer count comes from".
+
 ## Known limitations (not faked, explicitly deferred)
 
 - **Not wired into `apps/rtmp_server/main.cpp`.** `apps/rtmp_server` only

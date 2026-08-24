@@ -28,9 +28,9 @@ ScalePlan plan_for(const RenditionSpec& spec, std::uint32_t src_w, std::uint32_t
 } // namespace
 
 SourceTranscoder::SourceTranscoder(std::vector<RenditionSpec> renditions, std::uint32_t fps,
-                                   SourceVideoCodec video_codec)
+                                   SourceVideoCodec video_codec, std::uint32_t cpu_budget)
     : specs_(std::move(renditions)), fps_(std::max<std::uint32_t>(fps, 1)),
-      video_codec_(video_codec) {
+      video_codec_(video_codec), cpu_budget_(cpu_budget) {
     if (video_codec_ == SourceVideoCodec::Hevc) {
         video_decoder_.emplace<HevcDecoder>();
     }
@@ -54,7 +54,14 @@ core::Result<void> SourceTranscoder::start() {
     // thread counts as an additive fixed budget left the 1080p barrier with
     // only two cores even though its 720p/360p peers finish much earlier.
     const auto hardware = std::thread::hardware_concurrency();
-    const std::size_t core_budget = static_cast<std::size_t>(hardware > 0 ? hardware : 1);
+    const std::size_t machine_cores = static_cast<std::size_t>(hardware > 0 ? hardware : 1);
+    // A caller-supplied budget is this job's share of the machine, not the
+    // whole machine: several source jobs run in the same process and each
+    // used to size itself from hardware_concurrency() as though it were
+    // alone. Clamp to what actually exists so a stale/oversized allocation
+    // can never ask for more threads than cores.
+    const std::size_t core_budget =
+        cpu_budget_ > 0 ? std::min<std::size_t>(cpu_budget_, machine_cores) : machine_cores;
     // A resolution-tiered baseline alone left a low-res job (720p and below
     // -- most source-transcode jobs, which are typically one or two low-
     // bitrate renditions) pinned to 1-2 encoder threads regardless of how

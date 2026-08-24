@@ -63,8 +63,16 @@ public:
         std::function<void(std::size_t rendition, const EncodedAudioFrame& frame,
                            std::int64_t pts_90k)>;
 
+    // `cpu_budget` caps how many cores this job's scale+encode work may use
+    // (0 = the whole machine, the historical behaviour). SourceJobManager
+    // divides the box between concurrently running jobs and passes each one
+    // its share: sizing every job from hardware_concurrency() independently
+    // meant four two-rendition jobs on an 8-core box asked for ~32 encoder
+    // threads, and the resulting oversubscription pushed *every* job behind
+    // real time instead of only the one that was over budget.
     SourceTranscoder(std::vector<RenditionSpec> renditions, std::uint32_t fps,
-                     SourceVideoCodec video_codec = SourceVideoCodec::H264);
+                     SourceVideoCodec video_codec = SourceVideoCodec::H264,
+                     std::uint32_t cpu_budget = 0);
     ~SourceTranscoder();
     SourceTranscoder(const SourceTranscoder&) = delete;
     SourceTranscoder& operator=(const SourceTranscoder&) = delete;
@@ -124,6 +132,9 @@ private:
     std::vector<RenditionSpec> specs_;
     std::uint32_t fps_ = 30;
     SourceVideoCodec video_codec_ = SourceVideoCodec::H264;
+    // 0 = use every core the machine reports; otherwise the ceiling this job
+    // was allocated by its manager.
+    std::uint32_t cpu_budget_ = 0;
     // The H.264 branch (video_decoder_.emplace<H264Decoder>()) is unchanged
     // from before this variant existed: same type, same calls, same order.
     // HevcDecoder is a parallel alternative selected once at construction,

@@ -89,6 +89,14 @@ public:
     void set_fanout(protocol::commands::LiveFanout* fanout) { fanout_ = fanout; }
     void set_stream_id_registry(protocol::commands::StreamIdRegistry* stream_ids) { stream_ids_ = stream_ids; }
     void set_live_state_provider(LiveStateProvider provider) { live_state_provider_ = std::move(provider); }
+    // Invoked at the start of every /metrics scrape, before the exposition is
+    // rendered. Lets the composition root publish gauges it samples from
+    // outside this layer -- notably the cache edge's viewer/egress totals,
+    // which no component below the composition root can see. Must be cheap
+    // and non-blocking: it runs on the management HTTP thread.
+    void set_metrics_refresher(std::function<void()> refresher) {
+        metrics_refresher_ = std::move(refresher);
+    }
     void set_stream_deleted_handler(StreamDeletedHandler handler) {
         stream_deleted_handler_ = std::move(handler);
     }
@@ -164,6 +172,7 @@ private:
     protocol::commands::LiveFanout* fanout_ = nullptr;
     protocol::commands::StreamIdRegistry* stream_ids_ = nullptr;
     LiveStateProvider live_state_provider_;
+    std::function<void()> metrics_refresher_;
     StreamDeletedHandler stream_deleted_handler_;
     TranscodingStatusProvider transcoding_status_provider_;
     TranscodingAssignmentsProvider transcoding_assignments_provider_;

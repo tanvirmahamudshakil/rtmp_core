@@ -206,7 +206,14 @@ fan-out, GOP cache, slow-viewer backpressure, multi-worker routing, SQLite
 control state, open management HTTP API, metrics, audit records, and the
 Linux deployment stack.
 
-Not included: transcoding, WebRTC, SRT, clustering, multi-node state
+Also implemented: FFmpeg-free source-transcode jobs — pull an external
+`rtmp://`/HLS/HTTP-TS URL, transcode it in-process into an H.264/AAC rendition
+ladder, and serve it as one adaptive master `.m3u8`
+(`docs/native-transcoding.md`).
+
+Not included: transcoding of streams published *to* this origin (the
+`/v1/transcoding/assignments` endpoints exist but are not wired into the
+server and answer `503`), WebRTC, SRT, clustering, multi-node state
 replication, or a CDN. HLS and recording components exist in the library but
 their full production service composition is still separate from the main
 direct-RTMP deployment; the panel persists recording policy but the installer

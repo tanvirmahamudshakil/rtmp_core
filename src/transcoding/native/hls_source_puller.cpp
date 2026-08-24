@@ -3,9 +3,10 @@
 #include <algorithm>
 #include <chrono>
 #include <condition_variable>
-#include <future>
 #include <mutex>
+#include <optional>
 #include <thread>
+#include <vector>
 
 #include "rtmp_server/media/aac/adts.hpp"
 #include "rtmp_server/media/h264/avc.hpp"
@@ -32,11 +33,154 @@ bool looks_like_raw_ts(std::span<const std::byte> data) {
     return true;
 }
 
+// How much of a live playlist's trailing media to ingest on the first poll.
+// Enough to fill PacedSegmentPublisher's cold-start runway in one go (so the
+// output goes live immediately rather than waiting for the source to publish
+// another runway's worth in real time), and nothing beyond it -- everything
+// older is history no viewer of a live stream wants to sit through. RFC 8216
+// 6.3.3's "start three target durations from the end" is the floor here; the
+// runway is normally the larger of the two.
+constexpr double kInitialLiveEdgeSeconds = 35.0;
+constexpr std::size_t kMinInitialLiveEdgeSegments = 3;
+// Sequences kept in the "already ingested" set below the current playlist
+// window. Enough that a source briefly re-advertising an older segment is
+// still recognised, while the set stays bounded on a job that runs for
+// weeks (it used to grow by one entry per segment, forever).
+constexpr std::uint64_t kSeenSequenceHistory = 64;
+// Most media one poll may ingest, after the initial live-edge join, before
+// the puller decides it is not keeping up and jumps forward. A healthy poll
+// turns up one publish interval's worth; a minute of backlog means the
+// pipeline is behind real time (transcode slower than the source publishes,
+// or a long stall), and transcoding all of it only puts it further behind
+// while every viewer watches history. Expressed in seconds rather than
+// segments so it means the same thing for a 2-second and a 15-second source.
+constexpr double kMaxCatchUpSeconds = 60.0;
+
 constexpr auto kInputProgressTimeout = std::chrono::seconds(45);
 constexpr auto kOutputStartupTimeout = std::chrono::seconds(90);
 constexpr auto kOutputProgressTimeout = std::chrono::seconds(45);
 
 bool is_rtmp_source(std::string_view url) { return url.starts_with("rtmp://"); }
+
+// Fetches HLS media segments concurrently, reusing one libcurl handle per
+// worker across every request.
+//
+// The previous shape spawned a std::async thread per segment, each
+// constructing its own HttpClient. That paid a fresh DNS lookup, TCP connect
+// and TLS handshake for every single segment -- on an HTTPS IPTV source that
+// is easily more wall-clock time than the transfer itself, and it created
+// (and destroyed) an unbounded number of OS threads per playlist poll on a
+// box that may be running many jobs at once. Long-lived handles let libcurl
+// keep the connection alive between segments, which is what the source's own
+// CDN expects.
+class SegmentFetchPool {
+public:
+    using Body = core::Result<std::vector<std::byte>>;
+
+    explicit SegmentFetchPool(std::size_t workers) {
+        workers = std::clamp<std::size_t>(workers, 1, 8);
+        clients_.reserve(workers);
+        for (std::size_t i = 0; i < workers; ++i) clients_.push_back(std::make_unique<HttpClient>());
+        threads_.reserve(workers);
+        for (std::size_t i = 0; i < workers; ++i) threads_.emplace_back([this, i] { worker(i); });
+    }
+
+    ~SegmentFetchPool() {
+        {
+            std::lock_guard lock(mutex_);
+            stopping_ = true;
+        }
+        work_cv_.notify_all();
+        for (auto& thread : threads_) {
+            if (thread.joinable()) thread.join();
+        }
+    }
+
+    SegmentFetchPool(const SegmentFetchPool&) = delete;
+    SegmentFetchPool& operator=(const SegmentFetchPool&) = delete;
+
+    // Fetches every URL and returns the bodies in the same order. Blocks
+    // until all of them have completed; `should_continue` is polled before
+    // each fetch so a stopping job abandons the rest of the batch instead of
+    // waiting out every remaining timeout.
+    [[nodiscard]] std::vector<Body> fetch_all(const std::vector<std::string>& urls,
+                                              const std::function<bool()>& should_continue) {
+        std::vector<Body> out;
+        if (urls.empty()) return out;
+        {
+            std::lock_guard lock(mutex_);
+            urls_ = &urls;
+            should_continue_ = &should_continue;
+            results_.assign(urls.size(), std::nullopt);
+            next_ = 0;
+            remaining_ = urls.size();
+        }
+        work_cv_.notify_all();
+
+        std::unique_lock lock(mutex_);
+        done_cv_.wait(lock, [this] { return remaining_ == 0; });
+        urls_ = nullptr;
+        should_continue_ = nullptr;
+        out.reserve(results_.size());
+        for (auto& result : results_) out.push_back(std::move(*result));
+        results_.clear();
+        return out;
+    }
+
+private:
+    void worker(std::size_t index) {
+        std::unique_lock lock(mutex_);
+        for (;;) {
+            work_cv_.wait(lock, [this] {
+                return stopping_ || (urls_ != nullptr && next_ < urls_->size());
+            });
+            if (stopping_) return;
+
+            const std::size_t slot = next_++;
+            const std::string url = (*urls_)[slot];
+            const bool proceed = should_continue_ == nullptr || (*should_continue_)();
+            lock.unlock();
+
+            Body body = fetch_one(*clients_[index], url, proceed);
+
+            lock.lock();
+            results_[slot] = std::move(body);
+            if (--remaining_ == 0) done_cv_.notify_one();
+        }
+    }
+
+    static Body fetch_one(HttpClient& client, const std::string& url, bool proceed) {
+        if (!proceed) {
+            return core::Error(core::ErrorCode::OperationCanceled, core::ErrorCategory::Network,
+                               "source job stopping");
+        }
+        std::vector<std::byte> bytes;
+        auto result = client.get(url, bytes);
+        if (!result) {
+            // A segment is often still available after a transient edge
+            // timeout. Retry once (on the same warm handle) before
+            // permanently skipping it and introducing an avoidable media
+            // discontinuity.
+            bytes.clear();
+            result = client.get(url, bytes);
+        }
+        if (!result) return result.error();
+        return Body(std::move(bytes));
+    }
+
+    std::vector<std::unique_ptr<HttpClient>> clients_;
+    std::vector<std::thread> threads_;
+
+    std::mutex mutex_;
+    std::condition_variable work_cv_;
+    std::condition_variable done_cv_;
+    bool stopping_ = false;
+    const std::vector<std::string>* urls_ = nullptr;
+    const std::function<bool()>* should_continue_ = nullptr;
+    std::vector<std::optional<Body>> results_;
+    std::size_t next_ = 0;
+    std::size_t remaining_ = 0;
+};
 
 // Expands RTMP's wrapping 32-bit millisecond clock into a monotonic 64-bit
 // timeline. A small backwards jump is treated as broken/discontinuous input,
@@ -58,10 +202,11 @@ private:
 } // namespace
 
 HlsSourcePuller::HlsSourcePuller(std::string source_url, std::vector<PullerRendition> renditions,
-                                 std::uint32_t fps)
+                                 std::uint32_t fps, std::uint32_t cpu_budget)
     : source_url_(std::move(source_url)),
       renditions_(std::move(renditions)),
-      fps_(std::max<std::uint32_t>(fps, 1)) {}
+      fps_(std::max<std::uint32_t>(fps, 1)),
+      cpu_budget_(cpu_budget) {}
 
 HlsSourcePuller::~HlsSourcePuller() { stop(); }
 
@@ -230,7 +375,7 @@ void HlsSourcePuller::run() {
     // resolving it moments later) is a no-op.
     auto ensure_transcoder = [&](SourceVideoCodec codec) -> core::Result<void> {
         if (transcoder) return {};
-        transcoder.emplace(specs, fps_, codec);
+        transcoder.emplace(specs, fps_, codec, cpu_budget_);
         transcoder->set_video_output([&](std::size_t i, const EncodedAccessUnit& au) {
             feeds[i]->push_video(au.annexb, au.pts_90k, au.dts_90k, au.keyframe);
         });
@@ -487,11 +632,17 @@ void HlsSourcePuller::run() {
                     return core::Error(core::ErrorCode::MalformedChunk, core::ErrorCategory::Protocol,
                                        "legacy HEVC video tag missing its packet type");
                 }
-                if (*info->avc_packet_type == media::h264::kAvcPacketTypeSequenceHeader) {
+                // classify_video_tag reports the packet type as the scoped
+                // protocol_media::AvcPacketType enum, not as the loose
+                // media::h264::kAvcPacketType* byte constants the classic-AVC
+                // branch above compares against -- a scoped enum has no
+                // implicit conversion to std::uint8_t, so comparing the two
+                // does not compile.
+                if (*info->avc_packet_type == protocol_media::AvcPacketType::SequenceHeader) {
                     is_sequence_start = true;
-                } else if (*info->avc_packet_type == media::h264::kAvcPacketTypeEndOfSequence) {
+                } else if (*info->avc_packet_type == protocol_media::AvcPacketType::EndOfSequence) {
                     return {};
-                } else if (*info->avc_packet_type == media::h264::kAvcPacketTypeNalu) {
+                } else if (*info->avc_packet_type == protocol_media::AvcPacketType::Nalu) {
                     is_coded_frame = true;
                 } else {
                     return core::Error(core::ErrorCode::MalformedChunk, core::ErrorCategory::Protocol,
@@ -649,6 +800,14 @@ void HlsSourcePuller::run() {
     // happened repeatedly.
     std::unordered_set<std::uint64_t> seen;
     std::optional<std::uint64_t> last_ingested_sequence;
+    bool first_playlist_poll = true;
+
+    // One pool for the whole job: its workers keep their libcurl handles (and
+    // therefore their connections to the source's CDN) alive across polls.
+    // Four concurrent fetches cover the 2-3 unseen segments a poll typically
+    // turns up without turning a many-job box into a download storm.
+    SegmentFetchPool segment_fetcher(4);
+    const std::function<bool()> fetch_should_continue = [this] { return running_.load(); };
 
     while (running_.load()) {
         std::vector<std::byte> playlist_bytes;
@@ -682,42 +841,88 @@ void HlsSourcePuller::run() {
             break;
         }
 
+        // Join a live source at its live edge, not at the oldest segment it
+        // still advertises. IPTV panels commonly publish a window several
+        // minutes deep; ingesting all of it puts that entire backlog through
+        // the transcoder and leaves every viewer permanently that far behind
+        // the broadcast, for as long as the job runs. RFC 8216 6.3.3 says a
+        // live client should start about three target durations from the
+        // end, which is also the runway PacedSegmentPublisher primes. A VOD
+        // source (EXT-X-ENDLIST) is played from its true beginning, unchanged.
+        const bool initial_poll = first_playlist_poll;
+        if (first_playlist_poll) {
+            first_playlist_poll = false;
+            if (!playlist.endlist && playlist.segments.size() > kMinInitialLiveEdgeSegments) {
+                // Walk back from the live edge until the runway is covered.
+                std::size_t keep = 0;
+                double media_seconds = 0;
+                for (auto it = playlist.segments.rbegin(); it != playlist.segments.rend(); ++it) {
+                    ++keep;
+                    media_seconds += it->duration > 0 ? it->duration
+                                                      : std::max(playlist.target_duration, 1.0);
+                    if (keep >= kMinInitialLiveEdgeSegments && media_seconds >= kInitialLiveEdgeSeconds)
+                        break;
+                }
+                if (keep < playlist.segments.size()) {
+                    const std::size_t skip = playlist.segments.size() - keep;
+                    for (std::size_t i = 0; i < skip; ++i) seen.insert(playlist.segments[i].sequence);
+                    // Nothing has been fed to the demuxer yet, so the first
+                    // segment actually ingested must not be reported as a
+                    // gap: anchor the continuity check to the last skipped
+                    // sequence, which it follows directly.
+                    last_ingested_sequence = playlist.segments[skip - 1].sequence;
+                }
+            }
+        }
+
         // Collect every not-yet-pulled segment from this playlist window
-        // first, then fetch them all concurrently (one HttpClient per fetch —
-        // the member `http` above is single-use, reserved for the playlist
-        // itself). A playlist poll regularly turns up 2-3 unseen segments at
-        // once (the window is wider than the source's own publish interval),
-        // and fetching them one at a time serially adds each segment's
-        // network round-trip to the next one's, on a 24-core box that spends
-        // the rest of its time idle. Demuxing must still happen strictly in
-        // playlist order (PTS/DTS continuity depends on it), so only the
-        // network fetch is parallel; feeding to the demuxer below is
-        // unchanged serial code.
+        // first, then fetch them all through the pool (the member `http`
+        // above stays reserved for the playlist itself). A playlist poll
+        // regularly turns up 2-3 unseen segments at once (the window is
+        // wider than the source's own publish interval), and fetching them
+        // one at a time serially adds each segment's network round-trip to
+        // the next one's. Demuxing must still happen strictly in playlist
+        // order (PTS/DTS continuity depends on it), so only the network
+        // fetch is parallel; feeding to the demuxer below is unchanged
+        // serial code.
         std::vector<const decltype(playlist.segments)::value_type*> pending;
         for (const auto& segment : playlist.segments) {
             if (seen.contains(segment.sequence)) continue;
             pending.push_back(&segment);
         }
 
-        std::vector<std::future<core::Result<std::vector<std::byte>>>> fetches;
-        fetches.reserve(pending.size());
-        for (const auto* segment : pending) {
-            fetches.push_back(std::async(std::launch::async, [uri = segment->uri]() {
-                HttpClient segment_http;
-                std::vector<std::byte> bytes;
-                auto result = segment_http.get(uri, bytes);
-                if (!result) {
-                    // A segment is often still available after a transient
-                    // edge timeout. Retry once before permanently skipping
-                    // it and introducing an avoidable media discontinuity.
-                    HttpClient retry_http;
-                    bytes.clear();
-                    result = retry_http.get(uri, bytes);
-                }
-                if (!result) return core::Result<std::vector<std::byte>>(result.error());
-                return core::Result<std::vector<std::byte>>(std::move(bytes));
-            }));
+        // Bounded catch-up: drop the oldest of a backlog that says we are
+        // behind, keeping the newest kMaxCatchUpSeconds. Skipped here (not
+        // on the initial poll) because that one deliberately ingests a
+        // runway's worth in one go. last_ingested_sequence is deliberately
+        // left pointing at the last segment actually fed to the demuxer, so
+        // the gap check below sees the jump and emits EXT-X-DISCONTINUITY
+        // for it -- the media really is discontinuous at that point.
+        if (!initial_poll && !playlist.endlist && !pending.empty()) {
+            double backlog_seconds = 0;
+            for (const auto* segment : pending) {
+                backlog_seconds += segment->duration > 0 ? segment->duration
+                                                         : std::max(playlist.target_duration, 1.0);
+            }
+            std::size_t skip = 0;
+            while (skip < pending.size() && backlog_seconds > kMaxCatchUpSeconds) {
+                backlog_seconds -= pending[skip]->duration > 0
+                                       ? pending[skip]->duration
+                                       : std::max(playlist.target_duration, 1.0);
+                ++skip;
+            }
+            if (skip > 0) {
+                for (std::size_t i = 0; i < skip; ++i) seen.insert(pending[i]->sequence);
+                RTMP_LOG(LogLevel::Warn, "source-transcoder", "skipping ahead to the live edge",
+                         {{"url", source_url_}, {"skipped", std::to_string(skip)}});
+                pending.erase(pending.begin(), pending.begin() + static_cast<std::ptrdiff_t>(skip));
+            }
         }
+
+        std::vector<std::string> pending_uris;
+        pending_uris.reserve(pending.size());
+        for (const auto* segment : pending) pending_uris.push_back(segment->uri);
+        auto fetches = segment_fetcher.fetch_all(pending_uris, fetch_should_continue);
 
         // Preserve playlist order even though downloads run concurrently. If
         // one segment is not available yet, leave it and every later segment
@@ -728,7 +933,7 @@ void HlsSourcePuller::run() {
         for (std::size_t i = 0; i < pending.size(); ++i) {
             if (!running_.load()) break;
             const auto* segment = pending[i];
-            auto result = fetches[i].get();
+            auto& result = fetches[i];
             if (!result) {
                 RTMP_LOG(LogLevel::Warn, "source-transcoder", "segment fetch failed",
                          {{"url", segment->uri}, {"error", result.error().message()}});
@@ -765,6 +970,18 @@ void HlsSourcePuller::run() {
         }
 
         if (status_.load() == PullerStatus::Error) break;
+
+        // Keep the ingested-sequence set bounded. A 24/7 job pulling a
+        // source that publishes a segment every few seconds otherwise adds
+        // an entry per segment for the life of the process; only sequences
+        // at or near the current window can ever be re-offered.
+        if (!playlist.segments.empty()) {
+            const auto oldest_advertised = playlist.segments.front().sequence;
+            const auto floor = oldest_advertised > kSeenSequenceHistory
+                                   ? oldest_advertised - kSeenSequenceHistory
+                                   : 0;
+            if (floor > 0) std::erase_if(seen, [floor](std::uint64_t s) { return s < floor; });
+        }
 
         if (detect_stall()) break;
 

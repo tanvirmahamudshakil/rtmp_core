@@ -74,6 +74,14 @@ database_connection: "./data/rtmp.db"
 # totals come from viewer-estimator.service at the cache edge.
 hls_high_scale_mode: true
 
+# Per-link viewer counting. Varnish collapses every viewer's playlist polls
+# into roughly one origin request per second, so the origin cannot see how
+# many people are watching a link; viewer-estimator.service does, and writes
+# its per-link counts here every two seconds. The server reads this file so
+# its own API reports the real viewer count for each link. Set to an empty
+# string on a deployment with no cache edge.
+edge_viewer_stats_path: "/var/www/streamforge/internal/viewer_estimate.json"
+
 # CHANGE THESE before production use. Never commit real secrets.
 token_signing_secret: "CHANGE_ME"
 api_authentication_secret: "CHANGE_ME"

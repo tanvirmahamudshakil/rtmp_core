@@ -8,9 +8,11 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include "rtmp_server/authentication/rtmp_authenticator.hpp"
+#include "rtmp_server/control/edge_viewer_stats.hpp"
 #include "rtmp_server/control/hls_http_handler.hpp"
 #include "rtmp_server/control/http_server.hpp"
 #include "rtmp_server/control/management_api.hpp"
@@ -261,9 +263,22 @@ int main(int argc, char** argv) {
         [&hls_handler](std::string_view application, std::string_view stream) {
             hls_handler.unregister_stream(std::string(application), std::string(stream));
         });
-    management_api.set_live_state_provider([&stream_manager, &stream_registry, &stream_id_registry, &pool] {
+    // Real per-link viewer counting. The origin only ever sees the requests
+    // Varnish could not answer from cache -- roughly one per second per link
+    // no matter how large the audience -- so the cache edge's own accounting
+    // (viewer-estimator.service) is the only place a true HLS viewer count
+    // exists. Reading it here means every consumer of this server's API gets
+    // the real number, instead of the admin panel being the one client that
+    // knew to go and fetch that file for itself.
+    rtmp_server::control::EdgeViewerStats::Options edge_viewer_options;
+    edge_viewer_options.path = config.edge_viewer_stats_path;
+    rtmp_server::control::EdgeViewerStats edge_viewers(edge_viewer_options);
+
+    management_api.set_live_state_provider([&stream_manager, &stream_registry, &stream_id_registry,
+                                            &pool, &hls_handler, &edge_viewers] {
         std::vector<rtmp_server::management::LiveState> states;
         const auto registrations = stream_registry.snapshot();
+        const auto edge = edge_viewers.snapshot();
         for (const auto& application : stream_manager.list_applications()) {
             for (const auto& stream : stream_manager.list_streams(application.name)) {
                 rtmp_server::management::LiveState state;
@@ -272,15 +287,55 @@ int main(int argc, char** argv) {
                 state.is_live = std::ranges::any_of(registrations, [&stream](const auto& registration) {
                     return registration.app == stream.application && registration.stream_key == stream.name;
                 });
+                std::uint64_t rtmp_bytes = 0;
                 if (state.is_live) {
                     if (auto id = stream_id_registry.find(stream.application, stream.name)) {
-                        state.viewer_count = pool.subscriber_count(*id);
+                        state.rtmp_viewer_count = pool.subscriber_count(*id);
+                        rtmp_bytes = pool.egress_bytes_total(*id);
                     }
                 }
+                // A published stream's HLS link is /hls/<app>/<name>/index.m3u8,
+                // so the edge keys its sessions under exactly "app/name".
+                const auto link = state.application + "/" + state.name;
+                state.hls_viewers_measured = edge.fresh;
+                std::uint64_t hls_bytes = 0;
+                if (edge.fresh) {
+                    if (const auto it = edge.viewers.find(link); it != edge.viewers.end()) {
+                        state.hls_viewer_count = static_cast<std::size_t>(it->second);
+                    }
+                    if (const auto it = edge.bytes_total.find(link); it != edge.bytes_total.end()) {
+                        hls_bytes = it->second;
+                    }
+                } else {
+                    // No edge reading: fall back to what this origin itself
+                    // delivered. Behind a cache that is a floor, not a count,
+                    // which hls_viewers_measured=false tells the caller.
+                    const auto origin = hls_handler.link_stats(state.application, state.name);
+                    state.hls_viewer_count = origin.viewer_count;
+                    hls_bytes = origin.bytes_total;
+                }
+                state.viewer_count = state.rtmp_viewer_count + state.hls_viewer_count;
+                // Everything this link has cost, both delivery paths together
+                // — the panel derives its per-link bitrate from the delta.
+                state.rtmp_egress_bytes_total = rtmp_bytes;
+                state.hls_egress_bytes_total = hls_bytes;
+                state.egress_bytes_total = rtmp_bytes + hls_bytes;
                 states.push_back(std::move(state));
             }
         }
         return states;
+    });
+
+    // Publish the edge's deduplicated totals as gauges so /metrics carries
+    // the same viewer figure the per-link numbers add up to. The panel used
+    // to synthesise these client-side from the raw file.
+    management_api.set_metrics_refresher([&metrics, &edge_viewers] {
+        const auto edge = edge_viewers.snapshot();
+        metrics.set_gauge("edge_delivery_stats_available", edge.fresh ? 1 : 0);
+        if (!edge.fresh) return;
+        metrics.set_gauge("hls_active_viewers", static_cast<std::int64_t>(edge.total_viewers));
+        metrics.set_gauge("hls_egress_bytes_total", static_cast<std::int64_t>(edge.total_bytes));
+        metrics.set_gauge("hls_egress_bitrate", static_cast<std::int64_t>(edge.total_bitrate_bps));
     });
 
 #ifdef RTMP_NATIVE_TRANSCODE
@@ -309,14 +364,45 @@ int main(int argc, char** argv) {
     source_job_manager.load_from_store();
 
     const auto source_job_json =
-        [&hls_handler](const rtmp_server::transcoding::native::SourceJobSnapshot& job) {
+        [&hls_handler, &edge_viewers](const rtmp_server::transcoding::native::SourceJobSnapshot& job) {
             // Source-transcode renditions never register with LiveFanout/
             // StreamManager (no RTMP subscriber exists for a pull-based
-            // job's own output), so this is the only place live bandwidth/
-            // viewer numbers for the job exist -- derived from actual HLS
-            // playlist/segment request traffic, summed across every
-            // rendition (see HlsHttpHandler::aggregate_link_stats).
-            const auto link_stats = hls_handler.aggregate_link_stats(job.application, job.name);
+            // job's own output), so their audience is only visible in HLS
+            // request traffic. Prefer the cache edge's count: the origin
+            // sees only the ~1 req/s Varnish could not answer from cache,
+            // so aggregate_link_stats() reports about one viewer for a link
+            // with ten thousand. It stays as the fallback for a deployment
+            // with no edge accounting, flagged by delivery_stats_available.
+            const auto edge = edge_viewers.snapshot();
+            const auto origin_stats = hls_handler.aggregate_link_stats(job.application, job.name);
+
+            // Players fetch a rendition's index.m3u8, so the edge keys each
+            // session under that rendition's own stream name; the job's own
+            // name is included for a rendition published under it directly.
+            std::vector<std::string> link_keys;
+            link_keys.reserve(job.renditions.size() + 1);
+            link_keys.push_back(job.name);
+            for (const auto& rendition : job.renditions) {
+                if (rendition.output_stream != job.name) link_keys.push_back(rendition.output_stream);
+            }
+            const auto edge_value = [&](const std::unordered_map<std::string, std::uint64_t>& values,
+                                        const std::string& stream) -> std::uint64_t {
+                const auto it = values.find(job.application + "/" + stream);
+                return it == values.end() ? 0 : it->second;
+            };
+            const auto edge_total = [&](const std::unordered_map<std::string, std::uint64_t>& values) {
+                std::uint64_t total = 0;
+                for (const auto& key : link_keys) total += edge_value(values, key);
+                return total;
+            };
+
+            const std::uint64_t viewer_count =
+                edge.fresh ? edge_total(edge.viewers)
+                           : static_cast<std::uint64_t>(origin_stats.viewer_count);
+            const std::uint64_t bytes_total =
+                edge.fresh ? edge_total(edge.bytes_total) : origin_stats.bytes_total;
+            const std::uint64_t bitrate_bps = edge.fresh ? edge_total(edge.bitrate_bps) : 0;
+
             std::ostringstream os;
             os << R"({"id":")" << json_escape(job.application + ":" + job.name) << R"(","application":")"
                << json_escape(job.application) << R"(","name":")" << json_escape(job.name)
@@ -326,14 +412,23 @@ int main(int argc, char** argv) {
                << R"(","detail":")" << json_escape(job.detail) << R"(","enabled":)"
                << (job.enabled ? "true" : "false") << R"(,"auto_restart":)"
                << (job.auto_restart ? "true" : "false") << R"(,"restart_delay_seconds":)"
-               << job.restart_delay_seconds << R"(,"bytes_total":)" << link_stats.bytes_total
-               << R"(,"viewer_count":)" << link_stats.viewer_count << R"(,"outputs":[)";
+               << job.restart_delay_seconds << R"(,"bytes_total":)" << bytes_total
+               << R"(,"viewer_count":)" << viewer_count
+               << R"(,"hls_egress_bitrate_bps":)" << bitrate_bps
+               << R"(,"delivery_stats_available":)" << (edge.fresh ? "true" : "false")
+               << R"(,"outputs":[)";
             for (std::size_t i = 0; i < job.renditions.size(); ++i) {
                 const auto& r = job.renditions[i];
                 if (i) os << ',';
+                // Per-rendition delivery, so each rung of the ladder shows
+                // its own audience rather than only the job's total.
                 os << R"({"name":")" << json_escape(r.name) << R"(","stream":")"
                    << json_escape(r.output_stream) << R"(","video_codec":"h264","video_bitrate":)"
-                   << r.video_bitrate << R"(,"width":)" << r.width << R"(,"height":)" << r.height << "}";
+                   << r.video_bitrate << R"(,"width":)" << r.width << R"(,"height":)" << r.height
+                   << R"(,"viewer_count":)" << (edge.fresh ? edge_value(edge.viewers, r.output_stream) : 0)
+                   << R"(,"bytes_total":)" << (edge.fresh ? edge_value(edge.bytes_total, r.output_stream) : 0)
+                   << R"(,"hls_egress_bitrate_bps":)"
+                   << (edge.fresh ? edge_value(edge.bitrate_bps, r.output_stream) : 0) << "}";
             }
             os << "]}";
             return os.str();

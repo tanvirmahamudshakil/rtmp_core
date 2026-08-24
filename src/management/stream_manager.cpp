@@ -466,8 +466,10 @@ std::vector<LiveState> StreamManager::live_state(const protocol::commands::Strea
                 // viewer reloading or opening a second tab on this link
                 // should not inflate the count the admin panel shows.
                 if (id) {
-                    state.viewer_count = fanout.unique_viewer_count(*id);
-                    state.egress_bytes_total = fanout.egress_bytes_total(*id);
+                    state.rtmp_viewer_count = fanout.unique_viewer_count(*id);
+                    state.viewer_count = state.rtmp_viewer_count;
+                    state.rtmp_egress_bytes_total = fanout.egress_bytes_total(*id);
+                    state.egress_bytes_total = state.rtmp_egress_bytes_total;
                 }
             }
             out.push_back(std::move(state));

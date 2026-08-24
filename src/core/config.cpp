@@ -337,6 +337,7 @@ Result<ServerConfig> load_config(const std::string& path) {
     str("database_type", cfg.database_type);
     str("database_connection", cfg.database_connection);
     boolean("hls_high_scale_mode", cfg.hls_high_scale_mode);
+    str("edge_viewer_stats_path", cfg.edge_viewer_stats_path);
     str("token_signing_secret", cfg.token_signing_secret);
     str("api_authentication_secret", cfg.api_authentication_secret);
     str("log_level", cfg.log_level);

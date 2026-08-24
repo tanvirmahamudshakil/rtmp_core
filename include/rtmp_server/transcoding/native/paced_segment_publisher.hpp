@@ -27,6 +27,25 @@ struct PacedSegmentPublisherConfig {
     // Used only for a malformed/empty-duration segment. Normal publication
     // is paced by each segment's actual EXTINF duration.
     std::chrono::milliseconds fallback_interval{1000};
+
+    // Upper bound on how much media may sit queued ahead of the viewer.
+    // Strict real-time pacing only holds the buffer steady when the source
+    // delivers at exactly real time; anything that hands over a burst it
+    // never gives back -- an upstream window several minutes long, a source
+    // clock running slightly fast, a catch-up after a reconnect -- adds that
+    // surplus to the queue permanently. The viewer then watches the whole
+    // stream that far behind the live edge and the queue's memory is never
+    // reclaimed. Past this bound release runs slightly faster than real time
+    // (see drain_ratio) until the backlog is back under it.
+    std::chrono::milliseconds max_buffer{45000};
+
+    // Fraction of a segment's own duration to wait before releasing the next
+    // one while over max_buffer. 0.9 drains 10% faster than real time: a
+    // viewer's buffer still fills faster than it empties, so nothing stalls,
+    // and a 30s surplus is absorbed over a few minutes rather than never.
+    // Deliberately not an immediate flush -- dumping the backlog at once is
+    // exactly the burst this class exists to hide.
+    double drain_ratio = 0.9;
 };
 
 // Converts the bursty completion cadence of an HLS pull/transcode pipeline

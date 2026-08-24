@@ -33,8 +33,12 @@ enum class PullerStatus { Starting, Running, Error, Stopped };
 // own worker; the inbound RTMP and HTTP serving threads are never touched.
 class HlsSourcePuller {
 public:
+    // `cpu_budget` is the number of cores this job may use for scale+encode
+    // (0 = the whole machine). Passed straight to SourceTranscoder; see its
+    // constructor for why a per-job share matters once more than one job
+    // runs in the same process.
     HlsSourcePuller(std::string source_url, std::vector<PullerRendition> renditions,
-                    std::uint32_t fps = 30);
+                    std::uint32_t fps = 30, std::uint32_t cpu_budget = 0);
     ~HlsSourcePuller();
     HlsSourcePuller(const HlsSourcePuller&) = delete;
     HlsSourcePuller& operator=(const HlsSourcePuller&) = delete;
@@ -57,6 +61,7 @@ private:
     std::string source_url_;
     std::vector<PullerRendition> renditions_;
     std::uint32_t fps_;
+    std::uint32_t cpu_budget_ = 0;
 
     std::thread thread_;
     std::atomic<bool> running_{false};

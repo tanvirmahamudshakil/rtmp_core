@@ -7,6 +7,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -69,6 +70,34 @@ struct SourceJobSnapshot {
     std::vector<RenditionSpec> renditions;
 };
 
+// Tuning for SourceJobManager. Defined at namespace scope rather than nested
+// inside the class because the constructor below takes it by value with a
+// `= {}` default: a nested type's default member initializers are not usable
+// in a default argument of its own enclosing class (clang rejects it
+// outright), and `SourceJobManager::Options` still names it through the
+// member alias.
+struct SourceJobOptions {
+    // Number of consecutive failed restarts after which the retry delay
+    // stops growing. Restarts never stop entirely -- a source that is down
+    // for an hour must come back on its own when the upstream returns, with
+    // no operator action. See SourceJobManager::monitor_loop.
+    std::uint32_t max_restart_attempts = 5;
+    // Ceiling on the exponential retry delay, in seconds.
+    std::uint32_t restart_backoff_cap_seconds = 60;
+    // How long a restarted puller has to stay in Running before its failure
+    // streak is forgiven. Without this, a job that hiccups once a day still
+    // ends up at the maximum backoff after a week of otherwise healthy
+    // operation.
+    std::uint32_t healthy_reset_seconds = 120;
+    // Segment-store sizing for a source job's own rendition outputs;
+    // mirrors main.cpp's services.recorder_factory defaults for a normal
+    // published stream.
+    std::uint32_t live_window_segments = 6;
+    std::uint32_t retention_grace_segments = 6;
+    std::uint64_t max_total_bytes_per_rendition = 128u * 1024u * 1024u;
+    std::uint32_t target_duration_seconds = 2;
+};
+
 // Owns the lifecycle of source-transcode jobs: for each job it builds one
 // HlsSourcePuller (decode-once, encode-per-rendition, entirely in-process —
 // no external ffmpeg dependency), gives it one hls::SegmentStore per
@@ -93,16 +122,7 @@ public:
             unregister_output;
     };
 
-    struct Options {
-        std::uint32_t max_restart_attempts = 5;
-        // Segment-store sizing for a source job's own rendition outputs;
-        // mirrors main.cpp's services.recorder_factory defaults for a normal
-        // published stream.
-        std::uint32_t live_window_segments = 6;
-        std::uint32_t retention_grace_segments = 6;
-        std::uint64_t max_total_bytes_per_rendition = 128u * 1024u * 1024u;
-        std::uint32_t target_duration_seconds = 2;
-    };
+    using Options = SourceJobOptions;
 
     // `store` is optional (nullable): when unset, jobs are neither persisted
     // nor reloaded across restarts, but otherwise function normally.
@@ -134,6 +154,13 @@ public:
     [[nodiscard]] std::vector<SourceJobSnapshot> list(const std::string& application) const;
     void stop_all();
 
+    // Exponential retry delay for the given consecutive-failure count,
+    // capped by options.restart_backoff_cap_seconds. Pure and static so the
+    // backoff schedule can be exercised without a live manager.
+    [[nodiscard]] static std::chrono::seconds restart_delay_for(const SourceJobConfig& config,
+                                                                const SourceJobOptions& options,
+                                                                std::uint32_t attempts);
+
 private:
     struct Job {
         SourceJobConfig config;
@@ -144,6 +171,14 @@ private:
         std::string detail_override; // set on spawn failure before the puller exists
         std::chrono::steady_clock::time_point restart_at{};
         bool restart_scheduled = false;
+        // Set while a restart has detached this job's puller and is joining
+        // it outside mutex_ (see restart_job). Anything that could otherwise
+        // start a second puller onto the same segment stores checks this.
+        bool restart_in_progress = false;
+        // When the current puller first reported Running, used to forgive a
+        // stale failure streak once it has been healthy for
+        // healthy_reset_seconds.
+        std::optional<std::chrono::steady_clock::time_point> running_since;
     };
 
     [[nodiscard]] std::string master_path(const std::string& application,
@@ -154,7 +189,20 @@ private:
     void register_outputs_locked(const Job& job);
     void unregister_outputs_locked(const Job& job);
     void start_locked(Job& job);
-    void teardown_locked(Job& job);
+    // Detaches the job's puller and returns it. Stopping a puller joins a
+    // worker that may be blocked in libcurl for tens of seconds, so callers
+    // let the returned owner die *after* releasing mutex_ -- holding the
+    // manager lock across that join froze every management-API read
+    // (list()/status) for the duration.
+    [[nodiscard]] std::unique_ptr<HlsSourcePuller> detach_puller_locked(Job& job);
+    void teardown_locked(Job& job, std::unique_ptr<HlsSourcePuller>& retired,
+                         bool release_outputs);
+    // Stop-then-start with the join performed outside mutex_. Used by both
+    // the manual restart endpoint and the auto-restart monitor.
+    void restart_job(const std::string& key);
+    // Cores this job may use for scale+encode, given how many jobs are
+    // enabled right now. Caller must hold mutex_.
+    [[nodiscard]] std::uint32_t cpu_budget_locked() const;
     [[nodiscard]] SourceJobSnapshot snapshot_locked(const Job& job) const;
     void persist_locked(const Job& job);
     void monitor_loop();

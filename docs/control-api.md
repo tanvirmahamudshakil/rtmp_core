@@ -148,12 +148,21 @@ complete; the flag is exactly what a future wiring step would branch on.
 
 ## Live-state endpoints
 
-`StreamManager::live_state(registry, fanout)` returns one `LiveState{
-application, name, is_live, viewer_count }` per known stream: `is_live` comes
-from the same registry-scan-by-key-hash `disconnect_publisher` uses,
-`viewer_count` from `LiveFanout::subscriber_count()` on the resolved raw key
-(0 if not currently live — `LiveFanout` never associates a viewer count with
-a stream key nobody is publishing under).
+`StreamManager::live_state(registry, fanout)` returns one `LiveState` per
+known stream: `is_live` comes from the same registry-scan-by-key-hash
+`disconnect_publisher` uses, and `rtmp_viewer_count` from
+`LiveFanout::unique_viewer_count()` on the resolved raw key (0 if not
+currently live — `LiveFanout` never associates a viewer count with a stream
+key nobody is publishing under).
+
+This path only ever knows about RTMP subscribers, so on that path
+`viewer_count == rtmp_viewer_count`. The composition root
+(`apps/rtmp_server/main.cpp`) installs a `live_state_provider` that fills in
+`hls_viewer_count` from the cache edge as well and reports their sum as
+`viewer_count` — the origin cannot see HLS viewers for itself, since Varnish
+collapses their polls before they arrive. `hls_viewers_measured` distinguishes
+a real edge measurement from the origin-only fallback. See `docs/hls.md`,
+"Where a link's viewer count comes from".
 
 ## API security
 

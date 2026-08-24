@@ -968,7 +968,15 @@ function ApplicationDetailPage({
                     {job.outputs.map((output) => (
                       <span key={output.stream}>
                         <b>{output.width && output.height ? `${output.width}×${output.height}` : output.name}</b>
-                        <small>{bitrate(output.video_bitrate)} · {output.video_codec.toUpperCase()}</small>
+                        {/* Each rung carries its own measured audience, so an
+                            operator can see which rendition players actually
+                            settle on rather than only the job's total. */}
+                        <small>
+                          {bitrate(output.video_bitrate)} · {output.video_codec.toUpperCase()}
+                          {output.viewer_count !== undefined && job.status === "running"
+                            ? ` · ${compact(output.viewer_count)} watching`
+                            : ""}
+                        </small>
                       </span>
                     ))}
                   </div>

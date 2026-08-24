@@ -122,6 +122,15 @@ struct ServerConfig {
     // single VPS serving a very large public audience through local Varnish.
     bool hls_high_scale_mode = true;
 
+    // Where the cache edge publishes its per-link viewer/delivery accounting
+    // (deploy/viewer-estimator writes this every 2s from varnishncsa). The
+    // origin cannot count HLS viewers itself -- Varnish collapses a thousand
+    // players' polls into roughly one origin request per second -- so this
+    // file is the only source of a real per-link viewer count. Empty turns
+    // the reader off, and every link then reports only what the origin can
+    // see for itself. See control::EdgeViewerStats.
+    std::string edge_viewer_stats_path = "/var/www/streamforge/internal/viewer_estimate.json";
+
     std::string token_signing_secret;
     std::string api_authentication_secret;
 

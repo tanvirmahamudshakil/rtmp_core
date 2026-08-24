@@ -58,12 +58,31 @@ struct LiveState {
     std::string application;
     std::string name;
     bool is_live = false;
+    // Everyone watching this link right now, however they are watching it:
+    // rtmp_viewer_count + hls_viewer_count. Reporting only the RTMP fan-out
+    // here (which is all this used to carry) showed zero for a stream whose
+    // whole audience is on HLS, which is the normal case for a public link.
     std::size_t viewer_count = 0;
-    // Cumulative egress bytes delivered to viewers of this stream. The admin
-    // panel polls this repeatedly and derives a per-link bitrate from the
-    // delta over its own poll interval, the same way it already derives
-    // trend history from repeated snapshots.
+    // RTMP subscribers attached to the live fan-out.
+    std::size_t rtmp_viewer_count = 0;
+    // Active HLS playback sessions, measured at the cache edge
+    // (control::EdgeViewerStats) because Varnish collapses viewer polls
+    // before they reach this origin.
+    std::size_t hls_viewer_count = 0;
+    // False when the edge accounting is unavailable/stale: hls_viewer_count
+    // then carries only what the origin itself observed, which undercounts
+    // badly behind a cache. Consumers should present the number as an
+    // estimate rather than a measurement in that case.
+    bool hls_viewers_measured = false;
+    // Cumulative egress bytes delivered to viewers of this stream, across
+    // both delivery paths. The admin panel polls this repeatedly and derives
+    // a per-link bitrate from the delta over its own poll interval, the same
+    // way it already derives trend history from repeated snapshots.
     std::uint64_t egress_bytes_total = 0;
+    // The same total split by path, so an operator can see which one a link's
+    // bandwidth is actually going to.
+    std::uint64_t rtmp_egress_bytes_total = 0;
+    std::uint64_t hls_egress_bytes_total = 0;
 };
 
 // Fired with the connection_id of the publisher/viewer session a management

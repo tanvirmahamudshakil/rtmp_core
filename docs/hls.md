@@ -208,6 +208,40 @@ HIT and MISS responses, the admin homepage includes cache-served viewers and
 traffic rather than reporting only origin misses. The origin's own
 delivery-stats mutex remains disabled in this mode.
 
+### Where a link's viewer count comes from
+
+The origin **cannot** count HLS viewers. A media playlist is cached for one
+second, so a thousand players polling one link produce roughly one origin
+request per second, and `HlsHttpHandler::link_stats` therefore reports about
+one viewer no matter how large the audience really is. Only the edge sees
+every request.
+
+The server reads the estimator's file itself (`control::EdgeViewerStats`,
+path from `edge_viewer_stats_path`, re-read at most once a second) so the
+real per-link number is part of what the API reports, rather than something
+each client has to go and assemble for itself:
+
+| Link | Field | Source |
+|---|---|---|
+| Published stream | `viewer_count` | `rtmp_viewer_count` + `hls_viewer_count` |
+| Published stream | `hls_viewer_count` | edge key `app/stream` |
+| Source-transcode job | `viewer_count` | edge keys for the job name and every rendition output |
+| One rendition of a job | `outputs[].viewer_count` | edge key `app/<rendition>` |
+| Whole server | `hls_active_viewers` gauge | the estimator's session-union total |
+
+`hls_viewers_measured` (streams) and `delivery_stats_available` (jobs) say
+whether the number is an edge measurement. When they are false the edge file
+was missing or older than its own window, and the figure falls back to what
+the origin itself observed — a floor, not a count. The admin panel keeps its
+own reading of the same file only as a fallback for a server that predates
+this, and does not add it on top of a server-measured count.
+
+Per-link counts are summed across a job's renditions, so a player that is
+mid-ABR-switch (briefly visible under two rendition keys inside the 20s
+window) can count twice on that job's total. The server-wide
+`hls_active_viewers` gauge uses the estimator's session union and never
+double-counts.
+
 This profile is deliberately for public links. Query-token authorization still
 requires a private-cache policy; the installer intentionally shares immutable
 segment objects across every viewer.

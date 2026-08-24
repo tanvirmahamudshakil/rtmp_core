@@ -17,7 +17,12 @@ export type Stream = {
   // from the delta between two snapshots (see bandwidthFromSamples in App.tsx).
   egress_bytes_total?: number;
   rtmp_egress_bytes_total?: number;
+  rtmp_viewer_count?: number;
   hls_viewer_count?: number;
+  // Present only when the server itself read the cache edge's accounting
+  // (control::EdgeViewerStats). When it is, viewer_count is already the real
+  // total and this client must not add its own edge reading on top of it.
+  hls_viewers_measured?: boolean;
   hls_egress_bytes_total?: number;
   hls_egress_bitrate_bps?: number;
 };
@@ -31,6 +36,12 @@ export type TranscodingOutput = {
   video_bitrate: number;
   width: number;
   height: number;
+  // Delivery measured at the cache edge for this rendition's own link, so a
+  // ladder shows which rung its audience is actually on. Absent on a server
+  // that does not read the edge accounting.
+  viewer_count?: number;
+  bytes_total?: number;
+  hls_egress_bitrate_bps?: number;
 };
 
 // A transcode driven from an external source URL (RTMP or HLS/TS carrying
@@ -64,6 +75,9 @@ export type SourceTranscodeJob = {
   bytes_total?: number;
   viewer_count?: number;
   hls_egress_bitrate_bps?: number;
+  // True when these numbers came from the cache edge (whether the server read
+  // it or this client did). False means they are the origin's own view, which
+  // undercounts badly behind Varnish.
   delivery_stats_available?: boolean;
 };
 
@@ -306,10 +320,33 @@ export class ControlClient {
     const withStatus = await Promise.all(
       streams.map(async (stream) => {
         try {
-          const status = await this.request<{ is_live: boolean; viewer_count: number; egress_bytes_total?: number }>(
+          const status = await this.request<{
+            is_live: boolean;
+            viewer_count: number;
+            rtmp_viewer_count?: number;
+            hls_viewer_count?: number;
+            hls_viewers_measured?: boolean;
+            egress_bytes_total?: number;
+            rtmp_egress_bytes_total?: number;
+            hls_egress_bytes_total?: number;
+          }>(
             `/v1/streams/${encodeURIComponent(`${stream.application}:${stream.name}`)}/status`
           );
           const merged = { ...stream, ...status };
+          // A server that reads the cache-edge accounting itself already
+          // reports the true total in viewer_count, with the RTMP/HLS split
+          // alongside it. Adding this client's own edge reading on top would
+          // count the whole HLS audience twice.
+          if (status.hls_viewers_measured !== undefined) {
+            // The server already split viewers and bytes by delivery path;
+            // only the live bitrate still has no server-side field.
+            return {
+              ...merged,
+              hls_egress_bitrate_bps: edgeStats
+                ? exactEdgeValue(edgeStats.bitrate_bps, stream.application, stream.name)
+                : merged.hls_egress_bitrate_bps
+            };
+          }
           const rtmpBytes = merged.egress_bytes_total ?? 0;
           const hlsViewers = edgeStats ? exactEdgeValue(edgeStats.viewers, stream.application, stream.name) : 0;
           const hlsBytes = edgeStats ? exactEdgeValue(edgeStats.bytes_total, stream.application, stream.name) : 0;
@@ -353,13 +390,19 @@ export class ControlClient {
       // A metrics scrape failure degrades charts, not the control plane.
     }
 
-    if (edgeStats) {
-      metrics.hls_active_viewers = edgeStats.totals.viewers;
-      metrics.hls_egress_bytes_total = edgeStats.totals.bytes_total;
-      metrics.hls_egress_bitrate = edgeStats.totals.bitrate_bps;
-      metrics.edge_delivery_stats_available = 1;
-    } else {
-      metrics.edge_delivery_stats_available = 0;
+    // A server that reads the edge accounting exports these itself. Only
+    // synthesise them from the raw file when it did not (an older build, or
+    // one configured without an edge path).
+    const serverPublishesEdgeMetrics = metrics.edge_delivery_stats_available !== undefined;
+    if (!serverPublishesEdgeMetrics) {
+      if (edgeStats) {
+        metrics.hls_active_viewers = edgeStats.totals.viewers;
+        metrics.hls_egress_bytes_total = edgeStats.totals.bytes_total;
+        metrics.hls_egress_bitrate = edgeStats.totals.bitrate_bps;
+        metrics.edge_delivery_stats_available = 1;
+      } else {
+        metrics.edge_delivery_stats_available = 0;
+      }
     }
 
     return { applications: appsResponse.items, streams: withStatus, metrics, health: "online" };
@@ -497,6 +540,10 @@ export class ControlClient {
       this.fetchEdgeStats()
     ]);
     return response.items.map((job) => {
+      // The server reads the same edge accounting now, and reports it per
+      // rendition as well as per job. Re-deriving it here would only replace
+      // correct numbers with a client-side approximation of them.
+      if (job.delivery_stats_available) return job;
       if (!edgeStats) return job;
       const viewers = sourceEdgeValue(edgeStats.viewers, job.application, job.name, job.outputs);
       const delivered = sourceEdgeValue(edgeStats.bytes_total, job.application, job.name, job.outputs);

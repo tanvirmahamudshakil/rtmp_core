@@ -8,10 +8,15 @@
 # Phase 6 adds hls_http_handler.cpp: HLS playlist/segment delivery served by
 # this same bounded HttpServer (chained in front of the management handler),
 # deliberately not a second HTTP stack.
+#
+# edge_viewer_stats.cpp reads the cache edge's per-link viewer accounting
+# (deploy/viewer-estimator) so the server's own API can report real HLS
+# viewer counts, which the Varnish-collapsed origin cannot observe itself.
 add_library(rtmp_server_control STATIC
     http_server.cpp
     management_api.cpp
     hls_http_handler.cpp
+    edge_viewer_stats.cpp
 )
 
 target_include_directories(rtmp_server_control PUBLIC

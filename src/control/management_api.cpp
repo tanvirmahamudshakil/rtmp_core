@@ -557,6 +557,11 @@ HttpResponse ManagementApi::handle_health_ready() {
 HttpResponse ManagementApi::handle_metrics() {
     if (metrics_ == nullptr) return HttpResponse::json(200, "");
 
+    // Composition-root gauges (cache-edge viewer/egress totals) are sampled
+    // here so a scrape and the exposition it renders describe the same
+    // moment.
+    if (metrics_refresher_) metrics_refresher_();
+
     // Phase 7: refresh the derived series at scrape time. Both calls are
     // cheap, bounded and non-blocking (an RSS query and two subtractions) —
     // this handler already runs on the management HTTP thread, never on an
@@ -762,10 +767,20 @@ HttpResponse ManagementApi::handle_status(std::string_view application, std::str
     for (const auto& state : states) {
         if (state.application == application && state.name == name) {
             std::ostringstream os;
+            // viewer_count is the total across delivery protocols; the
+            // breakdown is reported alongside it so a client can show where
+            // an audience actually is, and hls_viewers_measured tells it
+            // whether the HLS half is a cache-edge measurement or only what
+            // this origin could see for itself.
             os << R"({"application":")" << json_escape(state.application) << R"(","name":")"
                << json_escape(state.name) << R"(","is_live":)" << (state.is_live ? "true" : "false")
-               << R"(,"viewer_count":)" << state.viewer_count << R"(,"egress_bytes_total":)"
-               << state.egress_bytes_total << "}";
+               << R"(,"viewer_count":)" << state.viewer_count
+               << R"(,"rtmp_viewer_count":)" << state.rtmp_viewer_count
+               << R"(,"hls_viewer_count":)" << state.hls_viewer_count
+               << R"(,"hls_viewers_measured":)" << (state.hls_viewers_measured ? "true" : "false")
+               << R"(,"egress_bytes_total":)" << state.egress_bytes_total
+               << R"(,"rtmp_egress_bytes_total":)" << state.rtmp_egress_bytes_total
+               << R"(,"hls_egress_bytes_total":)" << state.hls_egress_bytes_total << "}";
             return HttpResponse::json(200, os.str());
         }
     }

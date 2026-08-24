@@ -17,6 +17,11 @@ PacedSegmentPublisher::PacedSegmentPublisher(std::shared_ptr<hls::SegmentStore> 
     if (config_.recovery_buffer < std::chrono::milliseconds::zero()) {
         config_.recovery_buffer = std::chrono::milliseconds::zero();
     }
+    // The drain bound must never sit below the runway the publisher is about
+    // to fill on purpose, or priming would immediately count as a backlog.
+    const auto largest_runway = std::max(config_.startup_buffer, config_.recovery_buffer);
+    if (config_.max_buffer < largest_runway) config_.max_buffer = largest_runway;
+    config_.drain_ratio = std::clamp(config_.drain_ratio, 0.5, 1.0);
     thread_ = std::thread([this] { run(); });
 }
 
@@ -87,7 +92,19 @@ void PacedSegmentPublisher::run() {
         // Schedule from the actual release time. Trying to "catch up" after
         // a delayed wake by emitting several segments together would recreate
         // the exact burst that this class exists to hide.
-        next_publish_ = std::chrono::steady_clock::now() + media_duration;
+        //
+        // While the queue is over its bound, shorten that interval slightly
+        // (drain_ratio) so the surplus is absorbed gradually instead of
+        // becoming permanent viewer latency. Measured against the backlog
+        // that is left after this release, so the last segment over the line
+        // does not itself trigger a faster step.
+        auto interval = media_duration;
+        if (buffered_duration_ > config_.max_buffer) {
+            interval = std::chrono::duration_cast<std::chrono::milliseconds>(
+                media_duration * config_.drain_ratio);
+            interval = std::max(interval, std::chrono::milliseconds(1));
+        }
+        next_publish_ = std::chrono::steady_clock::now() + interval;
     }
 }
 
