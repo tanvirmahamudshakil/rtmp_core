@@ -7,6 +7,10 @@ add_library(rtmp_server_transcoding STATIC
     native/hevc_params.cpp
     native/aac_params.cpp
     native/hls_playlist.cpp
+    # Pure RFC 6381 CODECS derivation for the master playlist. Depends only
+    # on aac_params above, so it compiles and is tested without the codec
+    # libraries even though what it describes is produced by them.
+    native/codec_tags.cpp
 )
 
 target_include_directories(rtmp_server_transcoding PUBLIC

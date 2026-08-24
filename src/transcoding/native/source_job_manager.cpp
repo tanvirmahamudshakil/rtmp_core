@@ -5,6 +5,7 @@
 #include <thread>
 
 #include "rtmp_server/core/error.hpp"
+#include "rtmp_server/transcoding/native/codec_tags.hpp"
 #include "rtmp_server/transcoding/preset.hpp"
 
 namespace rtmp_server::transcoding::native {
@@ -109,7 +110,12 @@ void SourceJobManager::publish_master_locked(const SourceJobConfig& config,
         rendition.uri = "../" + spec.output_stream + "/index.m3u8";
         rendition.average_bandwidth = spec.video_bitrate + spec.audio_bitrate;
         rendition.bandwidth = peak_hls_bandwidth(rendition.average_bandwidth);
-        rendition.codecs = "avc1.64001f,mp4a.40.2";
+        // Declared from this rung's own geometry and audio bitrate. A fixed
+        // string described every rendition as 720p-class High profile with
+        // AAC-LC, which mis-describes a 1080p rung and any rung whose audio
+        // bitrate puts the encoder into HE-AAC -- and a player is entitled
+        // to choose, or refuse, a variant on this attribute alone.
+        rendition.codecs = hls_codecs_attribute(spec.width, spec.height, fps, spec.audio_bitrate);
         rendition.width = spec.width;
         rendition.height = spec.height;
         rendition.frame_rate = static_cast<double>(fps);
