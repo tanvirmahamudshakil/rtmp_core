@@ -87,6 +87,63 @@ if(RTMP_ENABLE_NATIVE_TRANSCODE)
         set(RTMP_LIBYUV_TARGET PkgConfig::LIBYUV)
     endif()
 
+    # Auto-install on Debian/Ubuntu servers: if a dev package is missing and
+    # this configure is running as root with apt-get available (the same
+    # environment scripts/install-linux.sh targets), install the missing
+    # packages once and re-probe, instead of just warning. Anything else
+    # (non-apt distro, non-root configure, no network) silently skips this
+    # and falls through to the graceful-degrade warning below.
+    if(NOT (X265_FOUND AND X264_FOUND AND OPENH264_FOUND AND FDKAAC_FOUND AND LIBCURL_FOUND AND RTMP_LIBYUV_TARGET AND LIBDE265_FOUND))
+        find_program(RTMP_APT_GET_BIN apt-get)
+        if(RTMP_APT_GET_BIN AND CMAKE_HOST_SYSTEM_NAME STREQUAL "Linux")
+            execute_process(COMMAND id -u OUTPUT_VARIABLE RTMP_UID OUTPUT_STRIP_TRAILING_WHITESPACE)
+            if(RTMP_UID STREQUAL "0")
+                set(RTMP_MISSING_APT_PACKAGES "")
+                if(NOT X265_FOUND) list(APPEND RTMP_MISSING_APT_PACKAGES libx265-dev) endif()
+                if(NOT X264_FOUND) list(APPEND RTMP_MISSING_APT_PACKAGES libx264-dev) endif()
+                if(NOT OPENH264_FOUND) list(APPEND RTMP_MISSING_APT_PACKAGES libopenh264-dev) endif()
+                if(NOT FDKAAC_FOUND) list(APPEND RTMP_MISSING_APT_PACKAGES libfdk-aac-dev) endif()
+                if(NOT LIBCURL_FOUND) list(APPEND RTMP_MISSING_APT_PACKAGES libcurl4-openssl-dev) endif()
+                if(NOT RTMP_LIBYUV_TARGET) list(APPEND RTMP_MISSING_APT_PACKAGES libyuv-dev) endif()
+                if(NOT LIBDE265_FOUND) list(APPEND RTMP_MISSING_APT_PACKAGES libde265-dev) endif()
+
+                message(STATUS "Native transcoding dependencies missing (${RTMP_MISSING_APT_PACKAGES}); "
+                                "attempting 'apt-get install' since this configure is running as root on Linux.")
+                execute_process(COMMAND "${RTMP_APT_GET_BIN}" update RESULT_VARIABLE RTMP_APT_UPDATE_RC)
+                execute_process(COMMAND "${RTMP_APT_GET_BIN}" install -y --no-install-recommends ${RTMP_MISSING_APT_PACKAGES}
+                                RESULT_VARIABLE RTMP_APT_INSTALL_RC)
+                if(RTMP_APT_INSTALL_RC EQUAL 0)
+                    message(STATUS "apt-get install succeeded; re-checking native transcoding dependencies.")
+                    pkg_check_modules(X265 IMPORTED_TARGET x265)
+                    pkg_check_modules(X264 IMPORTED_TARGET x264)
+                    pkg_check_modules(OPENH264 IMPORTED_TARGET openh264)
+                    pkg_check_modules(FDKAAC IMPORTED_TARGET fdk-aac)
+                    pkg_check_modules(LIBCURL IMPORTED_TARGET libcurl)
+                    pkg_check_modules(LIBYUV IMPORTED_TARGET libyuv)
+                    pkg_check_modules(LIBDE265 IMPORTED_TARGET libde265)
+                    if(NOT LIBYUV_FOUND)
+                        find_library(LIBYUV_LIBRARY NAMES yuv libyuv)
+                        find_path(LIBYUV_INCLUDE_DIR NAMES libyuv.h)
+                        if(LIBYUV_LIBRARY AND LIBYUV_INCLUDE_DIR AND NOT TARGET rtmp_libyuv)
+                            add_library(rtmp_libyuv UNKNOWN IMPORTED)
+                            set_target_properties(rtmp_libyuv PROPERTIES
+                                IMPORTED_LOCATION "${LIBYUV_LIBRARY}"
+                                INTERFACE_INCLUDE_DIRECTORIES "${LIBYUV_INCLUDE_DIR}")
+                        endif()
+                        if(TARGET rtmp_libyuv)
+                            set(RTMP_LIBYUV_TARGET rtmp_libyuv)
+                        endif()
+                    else()
+                        set(RTMP_LIBYUV_TARGET PkgConfig::LIBYUV)
+                    endif()
+                else()
+                    message(WARNING "apt-get install for native transcoding dependencies failed (exit ${RTMP_APT_INSTALL_RC}); "
+                                     "continuing without them.")
+                endif()
+            endif()
+        endif()
+    endif()
+
     if(X265_FOUND AND X264_FOUND AND OPENH264_FOUND AND FDKAAC_FOUND AND LIBCURL_FOUND AND RTMP_LIBYUV_TARGET AND LIBDE265_FOUND)
         set(RTMP_NATIVE_TRANSCODE_AVAILABLE ON)
         message(STATUS "Native transcoding pipeline: available (Source Transcode/HEVC will be built).")

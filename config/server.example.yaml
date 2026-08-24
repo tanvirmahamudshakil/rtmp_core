@@ -29,10 +29,13 @@ registered_buffer_size: 65536
 provided_buffer_count: 4096
 provided_buffer_size: 65536
 
-maximum_connections: 2000000
-maximum_connections_per_ip: 2000000
-maximum_publishers: 1000
-maximum_viewers_per_stream: 2000000
+# Unbounded (uint32 max) by request -- no admission cap at any of these
+# layers. See ServerConfig in include/rtmp_server/core/config.hpp for the
+# DoS-protection tradeoff this removes.
+maximum_connections: 4294967295
+maximum_connections_per_ip: 4294967295
+maximum_publishers: 4294967295
+maximum_viewers_per_stream: 4294967295
 
 input_chunk_size: 128
 output_chunk_size: 4096

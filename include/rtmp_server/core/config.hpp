@@ -2,6 +2,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <limits>
 #include <string>
 
 #include "rtmp_server/core/error.hpp"
@@ -70,10 +71,17 @@ struct ServerConfig {
     std::uint32_t provided_buffer_count = 4096;
     std::uint32_t provided_buffer_size = 65536;
 
-    std::uint32_t maximum_connections = 10000;
-    std::uint32_t maximum_connections_per_ip = 50;
-    std::uint32_t maximum_publishers = 1000;
-    std::uint32_t maximum_viewers_per_stream = 5000;
+    // Unbounded by request. These were the operator-facing admission caps
+    // (docs/v2_promot.md section 3.5's "remote-controlled resource must have
+    // a real bound") -- setting them to the type maximum removes that
+    // protection: a connection/publish/viewer flood is no longer rejected at
+    // any count, only by whatever the OS/hardware eventually can't sustain.
+    // validate() still requires these to be non-zero, which UINT32_MAX
+    // satisfies.
+    std::uint32_t maximum_connections = std::numeric_limits<std::uint32_t>::max();
+    std::uint32_t maximum_connections_per_ip = std::numeric_limits<std::uint32_t>::max();
+    std::uint32_t maximum_publishers = std::numeric_limits<std::uint32_t>::max();
+    std::uint32_t maximum_viewers_per_stream = std::numeric_limits<std::uint32_t>::max();
 
     std::uint32_t input_chunk_size = 128;
     std::uint32_t output_chunk_size = 4096;
