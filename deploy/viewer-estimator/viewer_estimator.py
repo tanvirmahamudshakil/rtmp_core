@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
 """Measure active HLS viewers and delivery traffic at the cache edge.
 
-Every fresh master/index playlist open receives a random ``viewer_session``
-from the origin. Session-bearing media-playlist polls are visible on Varnish
-cache hits, so one recent session heartbeat equals one active player regardless
-of NAT/shared IP. Shared playlist bodies deliberately omit that session from
-segment URIs; segment bytes are therefore attributed by their path instead.
-Both HIT and MISS body bytes still reflect what the edge actually delivered.
+Every master/index playlist open that has no ``viewer_session`` yet receives
+one from the origin: a fresh random one for a first-time visitor, or the
+value of that visitor's persistent ``rtmp_viewer_id`` cookie when one already
+exists (see HlsHttpHandler's playback-session-minting block) -- so a returning
+viewer re-polling a shared, undecorated rendition link keeps the same session
+instead of minting a new one on every hop. Session-bearing media-playlist
+polls are visible on Varnish cache hits, so one recent session heartbeat
+equals one active player regardless of NAT/shared IP. Shared playlist bodies
+deliberately omit that session from segment URIs; segment bytes are therefore
+attributed by their path instead. Both HIT and MISS body bytes still reflect
+what the edge actually delivered.
 
 Only aggregate counts are persisted; session IDs never leave process memory.
 """

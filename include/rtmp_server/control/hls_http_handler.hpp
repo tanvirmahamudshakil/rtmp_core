@@ -74,6 +74,34 @@ struct HlsHttpOptions {
     // Permissive CORS is required for browser players (hls.js) fetching
     // from a different origin. Empty disables the header.
     std::string cors_allow_origin = "*";
+
+    // Persistent-viewer-identity cookie. The playback-session-minting block
+    // (see hls_http_handler.cpp) uses this to recognise a *returning* viewer
+    // on a request that arrives with no viewer_session query at all — which,
+    // in shared-playlist-cache mode, is every request that follows an
+    // undecorated rendition link out of the cached master body. Without it,
+    // each such hop mints a brand-new random session and the viewer count
+    // becomes inflated/incoherent (see docs on the 2143be4 regression).
+    //
+    // Deliberately never consulted for the *cached* response bodies
+    // themselves (media playlists/segments), only for the private,
+    // never-cached 302 redirect that assigns a session — so it cannot leak
+    // one viewer's identity into another viewer's shared cache entry. The
+    // production VCL (deploy/varnish/streamforge.vcl) only strips
+    // `Cookie` on requests it is about to hash into the shared cache; a bare
+    // `.m3u8` request without `viewer_cache=1` takes the `return (pass)`
+    // branch first and reaches the origin with its Cookie header intact.
+    std::string viewer_cookie_name = "rtmp_viewer_id";
+    // Long enough to survive a normal viewing session (including short
+    // pauses/reconnects), short enough not to function as a long-term
+    // tracking identifier.
+    std::chrono::seconds viewer_cookie_max_age{24 * 60 * 60};
+    // Set true when this handler's responses only ever reach viewers over
+    // TLS (directly or via a proxy that only forwards HTTPS to it) so the
+    // cookie can carry `Secure`. Left false by default because this handler
+    // can be run in plain-HTTP deployments (docs/tls.md), where a `Secure`
+    // cookie would simply never be sent back and defeat its own purpose.
+    bool viewer_cookie_secure = false;
 };
 
 // Serves HLS playlists and segments over the existing Phase 5

@@ -17,7 +17,8 @@
       "inherits": "base",
       "description": "Platform-independent subset: no io_uring transport. Required on non-Linux hosts.",
       "cacheVariables": {
-        "RTMP_SERVER_CORE_ONLY": "ON"
+        "RTMP_SERVER_CORE_ONLY": "ON",
+        "RTMP_ENABLE_NATIVE_TRANSCODE": "OFF"
       }
     },
     {

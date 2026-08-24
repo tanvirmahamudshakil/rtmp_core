@@ -91,6 +91,33 @@ std::string playback_session_from_query(std::string_view query) {
     return it != params.end() && is_playback_session(it->second) ? it->second : std::string{};
 }
 
+// Extracts one named cookie's value from a raw "Cookie" request header, e.g.
+// "a=1; rtmp_viewer_id=deadbeef; b=2". No existing cookie parser lives
+// anywhere in this codebase (checked src/control, src/protocol), so this is
+// a small, deliberately strict one: it only ever runs on the private,
+// never-cached redirect path, so a missed/malformed cookie just falls back
+// to minting a fresh session — never a security or correctness hazard.
+std::string cookie_value(const HttpRequest& request, std::string_view name) {
+    const auto it = request.headers.find("cookie");
+    if (it == request.headers.end()) return {};
+    std::string_view header = it->second;
+    std::size_t pos = 0;
+    while (pos < header.size()) {
+        // Skip leading spaces after ';'.
+        while (pos < header.size() && header[pos] == ' ') ++pos;
+        const auto semi = header.find(';', pos);
+        const std::string_view pair =
+            header.substr(pos, semi == std::string_view::npos ? std::string_view::npos : semi - pos);
+        const auto eq = pair.find('=');
+        if (eq != std::string_view::npos && pair.substr(0, eq) == name) {
+            return std::string(pair.substr(eq + 1));
+        }
+        if (semi == std::string_view::npos) break;
+        pos = semi + 1;
+    }
+    return {};
+}
+
 void append_query_to_playlist_uris(std::string& body, std::string_view query) {
     if (query.empty()) return;
     const std::string suffix = "?" + std::string(query);
@@ -526,9 +553,22 @@ HttpResponse HlsHttpHandler::handle(const HttpRequest& request) {
         const bool valid_cache_route = !options_.enable_shared_playlist_cache ||
                                        (shared_cache_it != params.end() && shared_cache_it->second == "1");
         if (!valid_session || !valid_stream || !valid_cache_route) {
-            const std::string session = options_.playback_session_id_factory
-                ? options_.playback_session_id_factory()
-                : core::generate_secure_token(16);
+            // Recognise a returning viewer by its persistent cookie before
+            // minting a brand-new random session. This request arrives here
+            // precisely because its URL carries no viewer_session — in
+            // shared-cache mode that's true of every hop that follows an
+            // undecorated rendition link out of the cached master body, so
+            // without this check the same returning viewer would mint a
+            // fresh session (and look like a brand-new viewer) on every such
+            // hop. The VCL only strips Cookie on requests it hashes into the
+            // shared cache; this bare-query request takes the pass branch
+            // and reaches here with its Cookie header intact.
+            const std::string existing_cookie = cookie_value(request, options_.viewer_cookie_name);
+            const bool reuse_cookie = is_playback_session(existing_cookie);
+            const std::string session = reuse_cookie ? existing_cookie
+                                       : options_.playback_session_id_factory
+                                             ? options_.playback_session_id_factory()
+                                             : core::generate_secure_token(16);
             if (!is_playback_session(session)) {
                 auto response = plain(500, "playback session generator failed");
                 response.headers["Cache-Control"] = "no-store";
@@ -545,9 +585,35 @@ HttpResponse HlsHttpHandler::handle(const HttpRequest& request) {
             redirect.status = 302;
             redirect.content_type = "text/plain";
             redirect.headers["Location"] = request.path + "?" + query;
+            // Per-viewer state (a Set-Cookie, and the Location itself embeds
+            // this viewer's session) must never end up in the shared cache.
+            // This response is only ever produced on the un-hashed VCL pass
+            // path (see options_.viewer_cookie_name doc comment), so it is
+            // safe here, but keep the header explicit and defensive anyway.
             redirect.headers["Cache-Control"] = "private, no-store";
             if (!options_.cors_allow_origin.empty()) {
                 redirect.headers["Access-Control-Allow-Origin"] = options_.cors_allow_origin;
+            }
+            if (!reuse_cookie) {
+                // Only set the cookie when minting a new session: refreshing
+                // it on every reuse would just be extra bytes for no benefit,
+                // since the value never changes until it expires.
+                // cors_allow_origin being set means cross-origin players
+                // (hls.js embedded on another site) are an expected caller,
+                // and a cross-site fetch only carries a cookie tagged
+                // SameSite=None. None is only legal (browsers accept it) when
+                // paired with Secure, so fall back to Lax whenever the
+                // deployment can't mark the cookie Secure — same-origin
+                // callers still get it, cross-origin ones simply re-mint a
+                // session each time, same as before this fix.
+                const bool cross_origin_capable =
+                    !options_.cors_allow_origin.empty() && options_.viewer_cookie_secure;
+                std::string cookie = options_.viewer_cookie_name + "=" + session +
+                                     "; Path=" + options_.route_prefix + "; HttpOnly; SameSite=" +
+                                     (cross_origin_capable ? "None" : "Lax") +
+                                     "; Max-Age=" + std::to_string(options_.viewer_cookie_max_age.count());
+                if (options_.viewer_cookie_secure) cookie += "; Secure";
+                redirect.headers["Set-Cookie"] = std::move(cookie);
             }
             return redirect;
         }

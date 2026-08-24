@@ -48,6 +48,12 @@ HttpRequest get(const std::string& path, const std::string& query = {}) {
     return request;
 }
 
+HttpRequest get_with_cookie(const std::string& path, const std::string& query, const std::string& cookie_header) {
+    HttpRequest request = get(path, query);
+    request.headers["cookie"] = cookie_header;
+    return request;
+}
+
 std::string header_of(const HttpResponse& response, const std::string& name) {
     const auto it = response.headers.find(name);
     return it == response.headers.end() ? std::string{} : it->second;
@@ -158,6 +164,87 @@ TEST(HlsHttpTest, InvalidCallerSessionIsReplacedInsteadOfTrusted) {
     ASSERT_EQ(response.status, 302);
     EXPECT_EQ(header_of(response, "Location"),
               "/hls/live/demo/index.m3u8?token=x&" + session_query(kSessionB));
+}
+
+// --- Viewer-identity cookie (viewer count regression fix) -----------------
+
+TEST(HlsHttpTest, FreshOpenWithNoCookieMintsSessionAndSetsCookie) {
+    HlsHttpOptions options;
+    options.enable_playback_sessions = true;
+    options.playback_session_id_factory = [] { return std::string(kSessionA); };
+    HlsHttpHandler handler{options};
+    handler.register_stream("live", "demo", populated_store());
+
+    const auto response = handler.handle(get("/hls/live/demo/index.m3u8"));
+    ASSERT_EQ(response.status, 302);
+    EXPECT_NE(header_of(response, "Location").find(std::string("viewer_session=") + kSessionA),
+              std::string::npos);
+    const auto set_cookie = header_of(response, "Set-Cookie");
+    EXPECT_NE(set_cookie.find(std::string("rtmp_viewer_id=") + kSessionA), std::string::npos);
+    EXPECT_NE(set_cookie.find("HttpOnly"), std::string::npos);
+}
+
+// This is the regression test: before the fix, a bare (no viewer_session)
+// request always minted `core::generate_secure_token(16)` regardless of any
+// cookie, so a returning viewer following an undecorated shared-cache
+// rendition link would get a brand-new random session on every such hop --
+// inflating/randomising the reported viewer count. It must now reuse the
+// cookie's value instead of the factory's.
+TEST(HlsHttpTest, ReturningViewerWithCookieReusesCookieSessionInsteadOfMintingNew) {
+    HlsHttpOptions options;
+    options.enable_playback_sessions = true;
+    // If the fix regresses, the handler falls back to this factory and the
+    // test fails by observing kSessionB in the Location instead of kSessionA.
+    options.playback_session_id_factory = [] { return std::string(kSessionB); };
+    HlsHttpHandler handler{options};
+    handler.register_stream("live", "demo", populated_store());
+
+    const auto response = handler.handle(
+        get_with_cookie("/hls/live/demo/index.m3u8", "", std::string("rtmp_viewer_id=") + kSessionA));
+    ASSERT_EQ(response.status, 302);
+    EXPECT_EQ(header_of(response, "Location"), "/hls/live/demo/index.m3u8?" + session_query(kSessionA));
+    // No new cookie needs to be minted: the existing one is still valid.
+    EXPECT_TRUE(header_of(response, "Set-Cookie").empty());
+}
+
+TEST(HlsHttpTest, MalformedCookieFallsBackToMintingFreshSession) {
+    HlsHttpOptions options;
+    options.enable_playback_sessions = true;
+    options.playback_session_id_factory = [] { return std::string(kSessionB); };
+    HlsHttpHandler handler{options};
+    handler.register_stream("live", "demo", populated_store());
+
+    const auto response =
+        handler.handle(get_with_cookie("/hls/live/demo/index.m3u8", "", "rtmp_viewer_id=not-a-valid-token"));
+    ASSERT_EQ(response.status, 302);
+    EXPECT_EQ(header_of(response, "Location"), "/hls/live/demo/index.m3u8?" + session_query(kSessionB));
+    EXPECT_FALSE(header_of(response, "Set-Cookie").empty());
+}
+
+TEST(HlsHttpTest, SharedCacheReturningViewerCookieKeepsCachedBodyIdenticalAndSessionStable) {
+    // Proves the fix does not reintroduce per-viewer cache fragmentation: the
+    // cached media-playlist body must still never vary with the cookie, only
+    // the (uncached) redirect's minted session does.
+    HlsHttpOptions options;
+    options.enable_playback_sessions = true;
+    options.enable_shared_playlist_cache = true;
+    options.playback_session_id_factory = [] { return std::string(kSessionB); };
+    HlsHttpHandler handler{options};
+    handler.register_stream("live", "demo", populated_store(3));
+
+    const auto redirect = handler.handle(
+        get_with_cookie("/hls/live/demo/index.m3u8", "", std::string("rtmp_viewer_id=") + kSessionA));
+    ASSERT_EQ(redirect.status, 302);
+    EXPECT_EQ(header_of(redirect, "Location"),
+              "/hls/live/demo/index.m3u8?" + session_query(kSessionA) + "&viewer_cache=1");
+
+    const auto with_cookie_session =
+        handler.handle(get("/hls/live/demo/index.m3u8", session_query(kSessionA) + "&viewer_cache=1"));
+    const auto other_session =
+        handler.handle(get("/hls/live/demo/index.m3u8", session_query(kSessionB) + "&viewer_cache=1"));
+    ASSERT_EQ(with_cookie_session.status, 200);
+    ASSERT_EQ(other_session.status, 200);
+    EXPECT_EQ(with_cookie_session.body, other_session.body);
 }
 
 TEST(HlsHttpTest, UnknownStreamAndUnknownSegmentReturn404) {

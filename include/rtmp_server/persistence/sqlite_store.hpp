@@ -50,6 +50,10 @@ public:
     core::Result<void> delete_template(std::string_view id) override;
     [[nodiscard]] core::Result<std::vector<TemplateRow>> load_templates() override;
 
+    core::Result<void> upsert_source_job(const SourceJobRow& row) override;
+    core::Result<void> delete_source_job(std::string_view application, std::string_view name) override;
+    [[nodiscard]] core::Result<std::vector<SourceJobRow>> load_source_jobs() override;
+
 private:
     explicit SqliteStore(sqlite3* db) noexcept : db_(db) {}
 

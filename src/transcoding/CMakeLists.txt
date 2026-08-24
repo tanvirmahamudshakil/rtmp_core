@@ -43,6 +43,7 @@ if(RTMP_NATIVE_TRANSCODE_AVAILABLE)
         native/http_client.cpp
         native/paced_segment_publisher.cpp
         native/hls_source_puller.cpp
+        native/source_job_manager.cpp
     )
     target_link_libraries(rtmp_server_transcoding
         PUBLIC

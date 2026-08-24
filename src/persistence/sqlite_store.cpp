@@ -43,6 +43,17 @@ CREATE TABLE IF NOT EXISTS templates (
     name TEXT NOT NULL,
     presets TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS source_jobs (
+    application TEXT NOT NULL,
+    name TEXT NOT NULL,
+    source_url TEXT NOT NULL,
+    template_name TEXT NOT NULL,
+    rules TEXT NOT NULL,
+    auto_restart INTEGER NOT NULL,
+    restart_delay_seconds INTEGER NOT NULL,
+    enabled INTEGER NOT NULL,
+    PRIMARY KEY (application, name)
+);
 )sql";
 
 Error sqlite_error(sqlite3* db, std::string_view context) {
@@ -272,6 +283,62 @@ Result<std::vector<TemplateRow>> SqliteStore::load_templates() {
         rows.push_back(std::move(row));
     }
     if (rc != SQLITE_DONE) return sqlite_error(db_, "step load_templates");
+    return rows;
+}
+
+Result<void> SqliteStore::upsert_source_job(const SourceJobRow& row) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    Statement stmt(db_, "INSERT INTO source_jobs "
+                        "(application, name, source_url, template_name, rules, auto_restart, "
+                        "restart_delay_seconds, enabled) VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+                        "ON CONFLICT(application, name) DO UPDATE SET "
+                        "source_url = excluded.source_url, template_name = excluded.template_name, "
+                        "rules = excluded.rules, auto_restart = excluded.auto_restart, "
+                        "restart_delay_seconds = excluded.restart_delay_seconds, "
+                        "enabled = excluded.enabled");
+    if (!stmt.valid()) return sqlite_error(db_, "prepare upsert_source_job");
+    sqlite3_bind_text(stmt.get(), 1, row.application.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 2, row.name.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 3, row.source_url.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 4, row.template_name.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 5, row.rules.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(stmt.get(), 6, row.auto_restart ? 1 : 0);
+    sqlite3_bind_int(stmt.get(), 7, static_cast<int>(row.restart_delay_seconds));
+    sqlite3_bind_int(stmt.get(), 8, row.enabled ? 1 : 0);
+    if (sqlite3_step(stmt.get()) != SQLITE_DONE) return sqlite_error(db_, "step upsert_source_job");
+    return {};
+}
+
+Result<void> SqliteStore::delete_source_job(std::string_view application, std::string_view name) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    Statement stmt(db_, "DELETE FROM source_jobs WHERE application = ? AND name = ?");
+    if (!stmt.valid()) return sqlite_error(db_, "prepare delete_source_job");
+    sqlite3_bind_text(stmt.get(), 1, application.data(), static_cast<int>(application.size()), SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 2, name.data(), static_cast<int>(name.size()), SQLITE_TRANSIENT);
+    if (sqlite3_step(stmt.get()) != SQLITE_DONE) return sqlite_error(db_, "step delete_source_job");
+    return {};
+}
+
+Result<std::vector<SourceJobRow>> SqliteStore::load_source_jobs() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    Statement stmt(db_, "SELECT application, name, source_url, template_name, rules, auto_restart, "
+                        "restart_delay_seconds, enabled FROM source_jobs ORDER BY application, name");
+    if (!stmt.valid()) return sqlite_error(db_, "prepare load_source_jobs");
+    std::vector<SourceJobRow> rows;
+    int rc = SQLITE_OK;
+    while ((rc = sqlite3_step(stmt.get())) == SQLITE_ROW) {
+        SourceJobRow row;
+        row.application = reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 0));
+        row.name = reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 1));
+        row.source_url = reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 2));
+        row.template_name = reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 3));
+        row.rules = reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 4));
+        row.auto_restart = sqlite3_column_int(stmt.get(), 5) != 0;
+        row.restart_delay_seconds = static_cast<std::uint32_t>(sqlite3_column_int(stmt.get(), 6));
+        row.enabled = sqlite3_column_int(stmt.get(), 7) != 0;
+        rows.push_back(std::move(row));
+    }
+    if (rc != SQLITE_DONE) return sqlite_error(db_, "step load_source_jobs");
     return rows;
 }
 

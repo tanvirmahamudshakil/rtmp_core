@@ -47,14 +47,15 @@ if(NOT RTMP_SERVER_CORE_ONLY AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
     unset(CMAKE_REQUIRED_INCLUDES)
 endif()
 
-# Optional native CPU H.264 -> HEVC transcoding pipeline (openh264 decode,
-# libyuv scale, x265 encode) plus the H.264 source-transcode encode path
-# (openh264 decode, libx264 encode). Off by default so a stock build needs
-# none of these libraries; the pure geometry/parameter logic still compiles
-# and is tested regardless. Enable with -DRTMP_ENABLE_NATIVE_TRANSCODE=ON
-# after installing the dev packages (see docs/native-transcoding.md).
+# Native CPU H.264 <-> HEVC transcoding pipeline (openh264 decode, libyuv
+# scale, x265 encode) plus the H.264/HEVC source-transcode path (openh264/
+# libde265 decode, libx264 encode). On by default so the Source Transcode
+# feature works out of the box; disable with -DRTMP_ENABLE_NATIVE_TRANSCODE=OFF
+# for a stock build that needs none of these libraries (the pure geometry/
+# parameter logic still compiles and is tested regardless either way; see
+# docs/native-transcoding.md for the required dev packages).
 option(RTMP_ENABLE_NATIVE_TRANSCODE
-    "Build the in-process native transcoding pipelines (needs x265, x264, openh264, libyuv)" OFF)
+    "Build the in-process native transcoding pipelines (needs x265, x264, openh264, libde265, libyuv)" ON)
 
 set(RTMP_NATIVE_TRANSCODE_AVAILABLE OFF)
 if(RTMP_ENABLE_NATIVE_TRANSCODE)
@@ -88,11 +89,22 @@ if(RTMP_ENABLE_NATIVE_TRANSCODE)
 
     if(X265_FOUND AND X264_FOUND AND OPENH264_FOUND AND FDKAAC_FOUND AND LIBCURL_FOUND AND RTMP_LIBYUV_TARGET AND LIBDE265_FOUND)
         set(RTMP_NATIVE_TRANSCODE_AVAILABLE ON)
+        message(STATUS "Native transcoding pipeline: available (Source Transcode/HEVC will be built).")
     else()
-        message(FATAL_ERROR
+        # RTMP_ENABLE_NATIVE_TRANSCODE defaults ON, so a plain `cmake -S . -B build`
+        # with no preset and no dev packages installed must not hard-fail configure
+        # -- that would break the first-build experience for anyone not building
+        # the `core-only` preset (which explicitly sets this OFF) or the full
+        # dependency set. Degrade gracefully to unavailable instead; the resulting
+        # binary simply serves 503 transcoding_unavailable for Source Transcode,
+        # same as explicitly setting -DRTMP_ENABLE_NATIVE_TRANSCODE=OFF.
+        set(RTMP_NATIVE_TRANSCODE_AVAILABLE OFF)
+        message(WARNING
             "RTMP_ENABLE_NATIVE_TRANSCODE=ON but dependencies are missing "
             "(x265=${X265_FOUND} x264=${X264_FOUND} openh264=${OPENH264_FOUND} fdk-aac=${FDKAAC_FOUND} "
-            "libcurl=${LIBCURL_FOUND} libyuv=${LIBYUV_FOUND} libde265=${LIBDE265_FOUND}). Install them, e.g. on Ubuntu: "
+            "libcurl=${LIBCURL_FOUND} libyuv=${LIBYUV_FOUND} libde265=${LIBDE265_FOUND}) -- building WITHOUT the "
+            "native transcoding pipeline (Source Transcode/HEVC will be unavailable at runtime). Install them to "
+            "enable it, e.g. on Ubuntu: "
             "sudo apt-get install libx265-dev libx264-dev libopenh264-dev libfdk-aac-dev libcurl4-openssl-dev libyuv-dev libde265-dev")
     endif()
 endif()

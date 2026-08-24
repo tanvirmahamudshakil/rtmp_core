@@ -25,6 +25,10 @@
 #include "rtmp_server/persistence/sqlite_store.hpp"
 #include "rtmp_server/protocol/commands/stream_ids.hpp"
 #include "rtmp_server/protocol/commands/stream_registry.hpp"
+#include "rtmp_server/transcoding/preset.hpp"
+#ifdef RTMP_NATIVE_TRANSCODE
+#include "rtmp_server/transcoding/native/source_job_manager.hpp"
+#endif
 
 namespace {
 
@@ -277,6 +281,132 @@ int main(int argc, char** argv) {
         }
         return states;
     });
+
+#ifdef RTMP_NATIVE_TRANSCODE
+    // Source-transcode jobs: pull an external URL (rtmp:// or an http(s)
+    // .m3u8/.ts) and transcode it in-process via HlsSourcePuller -- no
+    // ffmpeg subprocess. Each rendition writes straight into its own
+    // SegmentStore, which is registered with hls_handler exactly like a
+    // normal published stream's segments, so the existing HLS-serving path
+    // needs no changes to pick up a source job's output.
+    rtmp_server::transcoding::native::SourceJobManager::Hooks source_hooks;
+    source_hooks.set_renditions = [&hls_handler](const std::string& application,
+                                                 const std::string& master,
+                                                 std::vector<rtmp_server::hls::Rendition> renditions) {
+        hls_handler.set_renditions(application, master, std::move(renditions));
+    };
+    source_hooks.register_output = [&hls_handler](const std::string& application,
+                                                   const std::string& stream,
+                                                   std::shared_ptr<rtmp_server::hls::SegmentStore> store) {
+        hls_handler.register_stream(application, stream, std::move(store));
+    };
+    source_hooks.unregister_output = [&hls_handler](const std::string& application,
+                                                     const std::string& stream) {
+        hls_handler.unregister_stream(application, stream);
+    };
+    rtmp_server::transcoding::native::SourceJobManager source_job_manager(std::move(source_hooks), store.get());
+    source_job_manager.load_from_store();
+
+    const auto source_job_json =
+        [&hls_handler](const rtmp_server::transcoding::native::SourceJobSnapshot& job) {
+            // Source-transcode renditions never register with LiveFanout/
+            // StreamManager (no RTMP subscriber exists for a pull-based
+            // job's own output), so this is the only place live bandwidth/
+            // viewer numbers for the job exist -- derived from actual HLS
+            // playlist/segment request traffic, summed across every
+            // rendition (see HlsHttpHandler::aggregate_link_stats).
+            const auto link_stats = hls_handler.aggregate_link_stats(job.application, job.name);
+            std::ostringstream os;
+            os << R"({"id":")" << json_escape(job.application + ":" + job.name) << R"(","application":")"
+               << json_escape(job.application) << R"(","name":")" << json_escape(job.name)
+               << R"(","source_url":")" << json_escape(job.source_url) << R"(","template_name":")"
+               << json_escape(job.template_name) << R"(","master_hls_path":")"
+               << json_escape(job.master_hls_path) << R"(","status":")" << json_escape(job.status)
+               << R"(","detail":")" << json_escape(job.detail) << R"(","enabled":)"
+               << (job.enabled ? "true" : "false") << R"(,"auto_restart":)"
+               << (job.auto_restart ? "true" : "false") << R"(,"restart_delay_seconds":)"
+               << job.restart_delay_seconds << R"(,"bytes_total":)" << link_stats.bytes_total
+               << R"(,"viewer_count":)" << link_stats.viewer_count << R"(,"outputs":[)";
+            for (std::size_t i = 0; i < job.renditions.size(); ++i) {
+                const auto& r = job.renditions[i];
+                if (i) os << ',';
+                os << R"({"name":")" << json_escape(r.name) << R"(","stream":")"
+                   << json_escape(r.output_stream) << R"(","video_codec":"h264","video_bitrate":)"
+                   << r.video_bitrate << R"(,"width":)" << r.width << R"(,"height":)" << r.height << "}";
+            }
+            os << "]}";
+            return os.str();
+        };
+
+    management_api.set_source_job_handlers(
+        [&source_job_manager, source_job_json](std::string_view application)
+            -> rtmp_server::core::Result<std::string> {
+            std::ostringstream os;
+            os << R"({"items":[)";
+            const auto jobs = source_job_manager.list(std::string(application));
+            for (std::size_t i = 0; i < jobs.size(); ++i) {
+                if (i) os << ',';
+                os << source_job_json(jobs[i]);
+            }
+            os << "]}";
+            return os.str();
+        },
+        [&source_job_manager, source_job_json](
+            std::string_view application, std::string_view name, std::string_view source_url,
+            std::string_view template_name, std::string_view rules, bool auto_restart,
+            std::uint32_t restart_delay_seconds) -> rtmp_server::core::Result<std::string> {
+            auto renditions =
+                rtmp_server::transcoding::native::parse_source_job_renditions(rules);
+            if (!renditions) return renditions.error();
+
+            rtmp_server::transcoding::native::SourceJobConfig cfg;
+            cfg.application = std::string(application);
+            cfg.name = std::string(name);
+            cfg.source_url = std::string(source_url);
+            cfg.template_name = std::string(template_name);
+            cfg.rules = std::string(rules);
+            cfg.auto_restart = auto_restart;
+            cfg.restart_delay_seconds = restart_delay_seconds;
+            cfg.renditions = std::move(renditions).value();
+            // Bounds the decode-once/encode-per-rendition fan-out started by
+            // one job; matches the deleted ffmpeg-based manager's intent
+            // without a dedicated config knob (native pipeline has no
+            // per-process ffmpeg cost to size against).
+            constexpr std::size_t kMaxOutputsPerJob = 8;
+            if (cfg.renditions.size() > kMaxOutputsPerJob) {
+                return rtmp_server::core::Error(rtmp_server::core::ErrorCode::InvalidConfiguration,
+                                                rtmp_server::core::ErrorCategory::Configuration,
+                                                "too many renditions for one source job");
+            }
+            auto snapshot = source_job_manager.create(cfg);
+            if (!snapshot) return snapshot.error();
+            return source_job_json(snapshot.value());
+        },
+        [&source_job_manager](std::string_view application,
+                              std::string_view name) -> rtmp_server::core::Result<void> {
+            if (!source_job_manager.remove(std::string(application), std::string(name))) {
+                return rtmp_server::core::Error(rtmp_server::core::ErrorCode::NotFound,
+                                                rtmp_server::core::ErrorCategory::Configuration,
+                                                "no such source job");
+            }
+            return {};
+        },
+        [&source_job_manager, source_job_json](
+            std::string_view application, std::string_view name,
+            bool enabled) -> rtmp_server::core::Result<std::string> {
+            auto snapshot = source_job_manager.set_enabled(std::string(application),
+                                                            std::string(name), enabled);
+            if (!snapshot) return snapshot.error();
+            return source_job_json(snapshot.value());
+        },
+        [&source_job_manager, source_job_json](
+            std::string_view application,
+            std::string_view name) -> rtmp_server::core::Result<std::string> {
+            auto snapshot = source_job_manager.restart(std::string(application), std::string(name));
+            if (!snapshot) return snapshot.error();
+            return source_job_json(snapshot.value());
+        });
+#endif
 
     hls_handler.set_next([&management_api](const rtmp_server::control::HttpRequest& request) {
         return management_api.handle(request);

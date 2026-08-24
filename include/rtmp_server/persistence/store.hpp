@@ -35,6 +35,21 @@ struct TranscodingAssignmentRow {
     std::string rules;
 };
 
+// A source-transcode job: pull an external URL and re-encode it per
+// `template_name`'s presets. `rules` is the same opaque PresetCatalogue JSON
+// shape as TranscodingAssignmentRow::rules, persisted so the job's rendition
+// ladder can be rebuilt on restart without contacting the admin UI again.
+struct SourceJobRow {
+    std::string application;
+    std::string name;
+    std::string source_url;
+    std::string template_name;
+    std::string rules;
+    bool auto_restart = true;
+    std::uint32_t restart_delay_seconds = 5;
+    bool enabled = true;
+};
+
 // A transcoding template as authored in the admin panel: a name plus its list
 // of encoding presets. The preset list is opaque JSON to the store, same as
 // TranscodingAssignmentRow::rules — the control layer encodes/decodes it.
@@ -75,6 +90,16 @@ public:
     [[nodiscard]] virtual core::Result<std::vector<TranscodingAssignmentRow>>
     load_transcoding_assignments() {
         return std::vector<TranscodingAssignmentRow>{};
+    }
+
+    // Optional for storage implementations used by older unit tests. The
+    // production SQLite store overrides all three methods.
+    virtual core::Result<void> upsert_source_job(const SourceJobRow&) { return core::Result<void>{}; }
+    virtual core::Result<void> delete_source_job(std::string_view, std::string_view) {
+        return core::Result<void>{};
+    }
+    [[nodiscard]] virtual core::Result<std::vector<SourceJobRow>> load_source_jobs() {
+        return std::vector<SourceJobRow>{};
     }
 
     // Optional for storage implementations used by older unit tests. The
