@@ -45,6 +45,12 @@ if(RTMP_NATIVE_TRANSCODE_AVAILABLE)
         native/audio_transcoder.cpp
         native/source_transcoder.cpp
         native/http_client.cpp
+        # The native RTMP pull client behind an rtmp:// source URL. Omitting
+        # it still compiled every translation unit -- hls_source_puller.cpp
+        # only needs its header -- and failed at link time instead, which is
+        # why it survived: nothing here catches a missing source until the
+        # final executable is linked.
+        native/rtmp_source_client.cpp
         native/paced_segment_publisher.cpp
         native/hls_source_puller.cpp
         native/source_job_manager.cpp
