@@ -96,6 +96,16 @@ struct SourceJobOptions {
     std::uint32_t retention_grace_segments = 6;
     std::uint64_t max_total_bytes_per_rendition = 128u * 1024u * 1024u;
     std::uint32_t target_duration_seconds = 2;
+    // Percentage (0-100) of the machine's cores reserved exclusively for
+    // source-transcode work (scale+encode, including the internal threads
+    // libx264/libx265 spawn for a job's own encoders). 0 (the default)
+    // disables the reservation: jobs size themselves from every core on the
+    // box, sharing it with RTMP ingest/HTTP/admin threads exactly as before
+    // this option existed. A non-zero value confines every job's render
+    // pool/puller thread to that core subset (see core::CpuPartition), so a
+    // busy control-plane can never steal cycles from an in-flight encode and
+    // vice versa.
+    std::uint32_t transcode_cpu_reservation_percent = 0;
 };
 
 // Owns the lifecycle of source-transcode jobs: for each job it builds one

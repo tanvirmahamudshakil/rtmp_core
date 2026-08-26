@@ -261,6 +261,10 @@ HttpResponse ManagementApi::route(const HttpRequest& request, const std::string&
     if (request.method == "GET" && request.path == "/v1/transcoding/status") {
         return handle_transcoding_status();
     }
+    if (request.path == "/v1/settings") {
+        if (request.method == "GET") return handle_get_settings();
+        if (request.method == "POST" || request.method == "PATCH") return handle_update_settings(request);
+    }
 
     auto parts = split_path(request.path);
     if (parts.size() >= 3 && parts[0] == "v1" && parts[1] == "transcoding" &&
@@ -339,6 +343,31 @@ HttpResponse ManagementApi::handle_transcoding_status() {
         return HttpResponse::json(200, R"({"enabled":false,"capabilities":[],"jobs":[]})");
     }
     return HttpResponse::json(200, transcoding_status_provider_());
+}
+
+HttpResponse ManagementApi::handle_get_settings() {
+    if (!settings_provider_) return HttpResponse::json(503, R"({"error":"settings_unavailable"})");
+    auto result = settings_provider_();
+    if (!result) return HttpResponse::json(500, error_body("request_failed", result.error().message(), ""));
+    return HttpResponse::json(200, std::move(result).value());
+}
+
+HttpResponse ManagementApi::handle_update_settings(const HttpRequest& request) {
+    if (!settings_updater_) return HttpResponse::json(503, R"({"error":"settings_unavailable"})");
+    if (request.body.empty()) {
+        return HttpResponse::json(400, error_body("validation_error", "request body is empty", ""));
+    }
+    auto fields = parse_flat_json(request.body);
+    if (fields.empty()) {
+        return HttpResponse::json(400, error_body("validation_error", "no recognized fields in body", ""));
+    }
+    auto result = settings_updater_(fields);
+    audit("update_settings", "", "", result.ok());
+    if (!result) {
+        return HttpResponse::json(http_status_for(result.error().code()),
+                                  error_body("validation_error", result.error().message(), ""));
+    }
+    return HttpResponse::json(200, std::move(result).value());
 }
 
 HttpResponse ManagementApi::handle_list_transcoding_assignments(const HttpRequest& request) {

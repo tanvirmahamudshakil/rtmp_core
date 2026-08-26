@@ -28,9 +28,10 @@ ScalePlan plan_for(const RenditionSpec& spec, std::uint32_t src_w, std::uint32_t
 } // namespace
 
 SourceTranscoder::SourceTranscoder(std::vector<RenditionSpec> renditions, std::uint32_t fps,
-                                   SourceVideoCodec video_codec, std::uint32_t cpu_budget)
+                                   SourceVideoCodec video_codec, std::uint32_t cpu_budget,
+                                   std::vector<unsigned> pinned_cores)
     : specs_(std::move(renditions)), fps_(std::max<std::uint32_t>(fps, 1)),
-      video_codec_(video_codec), cpu_budget_(cpu_budget) {
+      video_codec_(video_codec), cpu_budget_(cpu_budget), pinned_cores_(std::move(pinned_cores)) {
     if (video_codec_ == SourceVideoCodec::Hevc) {
         video_decoder_.emplace<HevcDecoder>();
     }
@@ -92,7 +93,7 @@ core::Result<void> SourceTranscoder::start() {
     // only the spare part of the same core budget calculated above.
     const std::size_t pool_size =
         std::min(renditions_.size(), core_budget);
-    if (pool_size > 1) render_pool_ = std::make_unique<core::ThreadPool>(pool_size);
+    if (pool_size > 1) render_pool_ = std::make_unique<core::ThreadPool>(pool_size, pinned_cores_);
     started_ = true;
     return {};
 }

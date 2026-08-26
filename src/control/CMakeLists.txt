@@ -17,6 +17,8 @@ add_library(rtmp_server_control STATIC
     management_api.cpp
     hls_http_handler.cpp
     edge_viewer_stats.cpp
+    settings_schema.cpp
+    settings_codec.cpp
 )
 
 target_include_directories(rtmp_server_control PUBLIC

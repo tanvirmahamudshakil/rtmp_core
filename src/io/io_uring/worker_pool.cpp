@@ -3,6 +3,7 @@
 #include <pthread.h>
 #include <sched.h>
 
+#include "rtmp_server/core/cpu_partition.hpp"
 #include "rtmp_server/observability/logger.hpp"
 
 namespace rtmp_server::io::io_uring {
@@ -71,11 +72,23 @@ core::Result<void> WorkerPool::run() {
     if (hardware == 0) hardware = 1;
     bool pin = config_.worker_cpu_pinning_enabled;
 
+    // A configured reservation confines ingest workers to the cores left
+    // over for "everything else" so they can never contend with
+    // source-transcode encoder threads for the same core -- independent of
+    // worker_cpu_pinning_enabled, which only controls the round-robin
+    // cache-locality spread below when no reservation is set. See
+    // SourceJobManager's mirrored transcode_cpu_reservation_percent, which
+    // confines the transcode side to the complementary set.
+    const auto partition = core::compute_cpu_partition(config_.transcode_cpu_reservation_percent);
+    const bool reserved = !partition.other_cores.empty();
+
     for (std::uint32_t i = 0; i < count; ++i) {
         IoUringEventLoop* loop_ptr = workers_[i].loop.get();
         if (stop_requested_.load(std::memory_order_acquire)) loop_ptr->stop();
-        workers_[i].thread = std::thread([loop_ptr, i, pin, hardware]() {
-            if (pin) {
+        workers_[i].thread = std::thread([loop_ptr, i, pin, hardware, reserved, other_cores = partition.other_cores]() {
+            if (reserved) {
+                core::pin_current_thread_to_cores({other_cores[i % other_cores.size()]});
+            } else if (pin) {
                 // Task 12 ("may be configurable but must not be mandatory"):
                 // best-effort only — a failure here (e.g. cgroup-restricted
                 // cpuset on a container host) must not prevent the worker

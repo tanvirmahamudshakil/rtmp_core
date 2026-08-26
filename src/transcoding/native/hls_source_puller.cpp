@@ -8,6 +8,7 @@
 #include <thread>
 #include <vector>
 
+#include "rtmp_server/core/cpu_partition.hpp"
 #include "rtmp_server/media/aac/adts.hpp"
 #include "rtmp_server/media/h264/avc.hpp"
 #include "rtmp_server/media/hevc/hevc.hpp"
@@ -56,9 +57,9 @@ constexpr std::uint64_t kSeenSequenceHistory = 64;
 // segments so it means the same thing for a 2-second and a 15-second source.
 constexpr double kMaxCatchUpSeconds = 60.0;
 
-constexpr auto kInputProgressTimeout = std::chrono::seconds(45);
-constexpr auto kOutputStartupTimeout = std::chrono::seconds(90);
-constexpr auto kOutputProgressTimeout = std::chrono::seconds(45);
+constexpr auto kInputProgressTimeout = std::chrono::seconds(30);
+constexpr auto kOutputStartupTimeout = std::chrono::seconds(60);
+constexpr auto kOutputProgressTimeout = std::chrono::seconds(30);
 
 bool is_rtmp_source(std::string_view url) { return url.starts_with("rtmp://"); }
 
@@ -202,18 +203,28 @@ private:
 } // namespace
 
 HlsSourcePuller::HlsSourcePuller(std::string source_url, std::vector<PullerRendition> renditions,
-                                 std::uint32_t fps, std::uint32_t cpu_budget)
+                                 std::uint32_t fps, std::uint32_t cpu_budget,
+                                 std::vector<unsigned> pinned_cores)
     : source_url_(std::move(source_url)),
       renditions_(std::move(renditions)),
       fps_(std::max<std::uint32_t>(fps, 1)),
-      cpu_budget_(cpu_budget) {}
+      cpu_budget_(cpu_budget),
+      pinned_cores_(std::move(pinned_cores)) {}
 
 HlsSourcePuller::~HlsSourcePuller() { stop(); }
 
 void HlsSourcePuller::start() {
     if (running_.exchange(true)) return;
     status_.store(PullerStatus::Starting);
-    thread_ = std::thread([this] { run(); });
+    thread_ = std::thread([this] {
+        // Pinned before run() touches the transcoder: a single-rendition job
+        // has no internal render pool and opens its encoder directly on this
+        // thread, so this is the only pinning point that reaches it. A
+        // multi-rendition job's own ThreadPool is pinned separately (see
+        // SourceTranscoder::start()); both end up confined to the same set.
+        core::pin_current_thread_to_cores(pinned_cores_);
+        run();
+    });
 }
 
 void HlsSourcePuller::stop() {
@@ -348,8 +359,8 @@ void HlsSourcePuller::run() {
         // A recovered pipeline already has a complete live window available
         // in its retained store. Re-prime with the shorter recovery runway so
         // playback resumes before that window drains.
-        publisher_config.startup_buffer = resuming ? std::chrono::seconds(10)
-                                                   : std::chrono::seconds(30);
+        publisher_config.startup_buffer = resuming ? std::chrono::seconds(6)
+                                                   : std::chrono::seconds(20);
         publisher_config.fallback_interval = base_segmenter_config.target_duration;
         auto publisher = std::make_shared<PacedSegmentPublisher>(store, publisher_config);
         auto segmenter_config = base_segmenter_config;
@@ -375,7 +386,7 @@ void HlsSourcePuller::run() {
     // resolving it moments later) is a no-op.
     auto ensure_transcoder = [&](SourceVideoCodec codec) -> core::Result<void> {
         if (transcoder) return {};
-        transcoder.emplace(specs, fps_, codec, cpu_budget_);
+        transcoder.emplace(specs, fps_, codec, cpu_budget_, pinned_cores_);
         transcoder->set_video_output([&](std::size_t i, const EncodedAccessUnit& au) {
             feeds[i]->push_video(au.annexb, au.pts_90k, au.dts_90k, au.keyframe);
         });
@@ -459,7 +470,7 @@ void HlsSourcePuller::run() {
         }
 
         if (now - last_input_progress >= kInputProgressTimeout) {
-            set_detail("source stalled: no media segment progress for 45 seconds");
+            set_detail("source stalled: no media segment progress for 30 seconds");
             status_.store(PullerStatus::Error);
             return true;
         }
@@ -468,8 +479,8 @@ void HlsSourcePuller::run() {
                 published_output ? kOutputProgressTimeout : kOutputStartupTimeout;
             if (now - last_output_progress >= output_timeout) {
                 set_detail(published_output
-                               ? "transcoder stalled: no output segment for 45 seconds"
-                               : "transcoder startup stalled: no output segment for 90 seconds");
+                               ? "transcoder stalled: no output segment for 30 seconds"
+                               : "transcoder startup stalled: no output segment for 60 seconds");
                 status_.store(PullerStatus::Error);
                 return true;
             }

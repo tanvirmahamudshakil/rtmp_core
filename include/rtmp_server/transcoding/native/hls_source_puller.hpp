@@ -37,8 +37,13 @@ public:
     // (0 = the whole machine). Passed straight to SourceTranscoder; see its
     // constructor for why a per-job share matters once more than one job
     // runs in the same process.
+    // `pinned_cores` is forwarded to SourceTranscoder and is also applied to
+    // this puller's own worker thread, which is what actually calls into the
+    // transcoder (and, for a single-rendition job with no internal render
+    // pool, is the thread that opens the encoder directly).
     HlsSourcePuller(std::string source_url, std::vector<PullerRendition> renditions,
-                    std::uint32_t fps = 30, std::uint32_t cpu_budget = 0);
+                    std::uint32_t fps = 30, std::uint32_t cpu_budget = 0,
+                    std::vector<unsigned> pinned_cores = {});
     ~HlsSourcePuller();
     HlsSourcePuller(const HlsSourcePuller&) = delete;
     HlsSourcePuller& operator=(const HlsSourcePuller&) = delete;
@@ -62,6 +67,7 @@ private:
     std::vector<PullerRendition> renditions_;
     std::uint32_t fps_;
     std::uint32_t cpu_budget_ = 0;
+    std::vector<unsigned> pinned_cores_;
 
     std::thread thread_;
     std::atomic<bool> running_{false};

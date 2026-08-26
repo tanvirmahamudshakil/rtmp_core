@@ -8,6 +8,8 @@
 #include <thread>
 #include <vector>
 
+#include "rtmp_server/core/cpu_partition.hpp"
+
 namespace rtmp_server::core {
 
 // Fixed-size worker pool for synchronous fan-out/fan-in of CPU-bound work
@@ -17,7 +19,11 @@ namespace rtmp_server::core {
 // Only one parallel_for call may be in flight at a time per pool instance.
 class ThreadPool {
 public:
-    explicit ThreadPool(std::size_t worker_count);
+    // `pinned_cores` restricts every worker thread's affinity to that core
+    // set (best-effort, see core::pin_current_thread_to_cores). Empty (the
+    // default) leaves workers unpinned, exactly as before this parameter
+    // existed.
+    explicit ThreadPool(std::size_t worker_count, std::vector<unsigned> pinned_cores = {});
     ~ThreadPool();
     ThreadPool(const ThreadPool&) = delete;
     ThreadPool& operator=(const ThreadPool&) = delete;
@@ -30,6 +36,7 @@ public:
 private:
     void worker_loop();
 
+    std::vector<unsigned> pinned_cores_;
     std::vector<std::thread> workers_;
     std::mutex mutex_;
     std::condition_variable task_cv_;

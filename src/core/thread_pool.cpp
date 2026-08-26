@@ -2,10 +2,19 @@
 
 namespace rtmp_server::core {
 
-ThreadPool::ThreadPool(std::size_t worker_count) {
+ThreadPool::ThreadPool(std::size_t worker_count, std::vector<unsigned> pinned_cores)
+    : pinned_cores_(std::move(pinned_cores)) {
     workers_.reserve(worker_count);
     for (std::size_t i = 0; i < worker_count; ++i) {
-        workers_.emplace_back([this] { worker_loop(); });
+        workers_.emplace_back([this] {
+            // Pinned before this thread does any work, so a library the
+            // caller invokes from inside worker_loop (e.g. an encoder opened
+            // lazily on first use) spawns its own internal threads, if any,
+            // already confined to the same core set via clone()'s affinity
+            // inheritance -- see pin_current_thread_to_cores's doc comment.
+            pin_current_thread_to_cores(pinned_cores_);
+            worker_loop();
+        });
     }
 }
 

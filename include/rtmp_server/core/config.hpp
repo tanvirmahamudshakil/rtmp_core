@@ -59,6 +59,15 @@ struct ServerConfig {
     // with noisy-neighbour scheduling.
     bool worker_cpu_pinning_enabled = false;
 
+    // Percentage (0-100) of the machine's cores reserved exclusively for
+    // source-transcode work; the remainder is what RTMP ingest workers pin
+    // to. 0 (the default) disables the split -- ingest workers keep pinning
+    // (if worker_cpu_pinning_enabled) across every core, unchanged from
+    // before this option existed. Mirrors
+    // transcoding::native::SourceJobOptions::transcode_cpu_reservation_percent;
+    // main() reads one operator-facing value and threads it to both.
+    std::uint32_t transcode_cpu_reservation_percent = 0;
+
     bool enable_multishot_accept = true;
     bool enable_multishot_recv = true;
     bool enable_registered_buffers = true;

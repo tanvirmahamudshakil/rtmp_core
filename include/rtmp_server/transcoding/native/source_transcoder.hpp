@@ -70,9 +70,14 @@ public:
     // meant four two-rendition jobs on an 8-core box asked for ~32 encoder
     // threads, and the resulting oversubscription pushed *every* job behind
     // real time instead of only the one that was over budget.
+    // `pinned_cores` confines this job's render pool (and, transitively, any
+    // encoder-internal threads libx264/libx265 spawn from it) to that core
+    // set (empty = unpinned, the historical behaviour). See
+    // core::pin_current_thread_to_cores for why this reaches library-internal
+    // threads without the library's cooperation.
     SourceTranscoder(std::vector<RenditionSpec> renditions, std::uint32_t fps,
                      SourceVideoCodec video_codec = SourceVideoCodec::H264,
-                     std::uint32_t cpu_budget = 0);
+                     std::uint32_t cpu_budget = 0, std::vector<unsigned> pinned_cores = {});
     ~SourceTranscoder();
     SourceTranscoder(const SourceTranscoder&) = delete;
     SourceTranscoder& operator=(const SourceTranscoder&) = delete;
@@ -135,6 +140,7 @@ private:
     // 0 = use every core the machine reports; otherwise the ceiling this job
     // was allocated by its manager.
     std::uint32_t cpu_budget_ = 0;
+    std::vector<unsigned> pinned_cores_;
     // The H.264 branch (video_decoder_.emplace<H264Decoder>()) is unchanged
     // from before this variant existed: same type, same calls, same order.
     // HevcDecoder is a parallel alternative selected once at construction,

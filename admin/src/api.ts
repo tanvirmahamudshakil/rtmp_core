@@ -3,6 +3,23 @@ export type Application = {
   enabled: boolean;
 };
 
+// One core::ServerConfig field as described by settings_schema() and
+// rendered by GET /v1/settings. `value` is present for non-sensitive fields;
+// sensitive fields (secrets) only ever report `has_value`, never the secret
+// itself. Every field takes effect only after the process is restarted --
+// there is no live field here because nothing on the backend is live.
+export type SettingField = {
+  key: string;
+  section: string;
+  label: string;
+  description: string;
+  type: "string" | "bool" | "u16" | "u32" | "u64" | "duration_ms" | "percent";
+  restart_required: boolean;
+  sensitive: boolean;
+  value?: string;
+  has_value?: boolean;
+};
+
 export type Stream = {
   application: string;
   name: string;
@@ -428,6 +445,22 @@ export class ControlClient {
     }
     await this.request<{ deleted: boolean }>(`/v1/applications/${encodeURIComponent(application)}`, {
       method: "DELETE"
+    });
+  }
+
+  // Settings management has no meaningful demo-mode story (there is no real
+  // config file to show/edit), so demo mode reports no fields rather than
+  // fabricating ones a demo viewer could believe they changed something real.
+  async listSettings(): Promise<SettingField[]> {
+    if (this.demo) return [];
+    return this.request<SettingField[]>("/v1/settings");
+  }
+
+  async updateSettings(values: Record<string, string>): Promise<SettingField[]> {
+    if (this.demo) throw new ApiError("Settings cannot be changed in demo mode.", 403);
+    return this.request<SettingField[]>("/v1/settings", {
+      method: "POST",
+      body: JSON.stringify(values)
     });
   }
 

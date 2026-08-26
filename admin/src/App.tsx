@@ -38,7 +38,7 @@ import {
   Zap
 } from "lucide-react";
 import { FormEvent, ReactNode, useCallback, useEffect, useRef, useState } from "react";
-import { Application, ControlClient, Snapshot, SourceTranscodeJob, Stream, TemplateRecord, TranscodingOutput } from "./api";
+import { Application, ControlClient, SettingField, Snapshot, SourceTranscodeJob, Stream, TemplateRecord, TranscodingOutput } from "./api";
 
 type Page = "home" | "applications" | "transcode" | "server";
 type VideoCodec = "H.263" | "H.264" | "H.265" | "VP8" | "VP9" | "Passthrough" | "Disabled";
@@ -1205,9 +1205,186 @@ function SystemPage({ snapshot }: { snapshot: Snapshot }) {
       </div>
       <section className="panel config-note">
         <Settings2 size={21} />
-        <div><strong>Server-owned configuration</strong><span>Kernel limits, listener queues, worker count and interface shaping are managed by the Linux installer in <code>/etc/rtmp-server</code>.</span></div>
+        <div><strong>Server configuration</strong><span>Most server settings (network, CPU/worker tuning, limits, HLS delivery, recording, security) are editable below in the Settings panel. Every field there takes effect only after the server is restarted.</span></div>
       </section>
     </>
+  );
+}
+
+// One core::ServerConfig field, editable inline. `pendingValue` is the
+// staged (not yet saved) value if the operator has touched this field since
+// the last load/save; falls back to the server's current value. A sensitive
+// field's current value is never known to this component (the backend never
+// sends it) -- it starts blank and "(currently set)"/"(not set)" is the only
+// signal of whether a secret already exists.
+function SettingRow({
+  field,
+  pendingValue,
+  onChange
+}: {
+  field: SettingField;
+  pendingValue?: string;
+  onChange: (value: string) => void;
+}) {
+  const dirty = pendingValue !== undefined;
+  if (field.type === "bool") {
+    const current = (pendingValue ?? field.value) === "true";
+    return (
+      <div className={`settings-row${dirty ? " dirty" : ""}`}>
+        <div><strong>{field.label}</strong><small>{field.description}</small></div>
+        <label className="settings-toggle">
+          <input type="checkbox" checked={current} onChange={(event) => onChange(event.target.checked ? "true" : "false")} />
+          <span />
+        </label>
+      </div>
+    );
+  }
+  if (field.sensitive) {
+    return (
+      <div className={`settings-row${dirty ? " dirty" : ""}`}>
+        <div><strong>{field.label}</strong><small>{field.description} — {field.has_value ? "currently set" : "not set"}.</small></div>
+        <input
+          type="password"
+          autoComplete="new-password"
+          placeholder="Leave blank to keep unchanged"
+          value={pendingValue ?? ""}
+          onChange={(event) => onChange(event.target.value)}
+        />
+      </div>
+    );
+  }
+  const numeric = field.type === "u16" || field.type === "u32" || field.type === "u64" ||
+    field.type === "duration_ms" || field.type === "percent";
+  return (
+    <div className={`settings-row${dirty ? " dirty" : ""}`}>
+      <div><strong>{field.label}</strong><small>{field.description}</small></div>
+      <input
+        type={numeric ? "number" : "text"}
+        min={numeric ? 0 : undefined}
+        max={field.type === "percent" ? 100 : undefined}
+        value={pendingValue ?? field.value ?? ""}
+        onChange={(event) => onChange(event.target.value)}
+      />
+    </div>
+  );
+}
+
+// Admin Settings page: loads the schema-joined-with-current-values list from
+// GET /v1/settings, stages edits locally, and only sends the fields that
+// were actually touched to POST /v1/settings on Save. Nothing here is live —
+// every field is a boot-time core::ServerConfig value, so the save bar's
+// copy is explicit that a restart is required for anything to take effect.
+function SettingsPage({ client, notify }: { client: ControlClient; notify: (type: "success" | "error", message: string) => void }) {
+  const [fields, setFields] = useState<SettingField[]>([]);
+  const [pending, setPending] = useState<Record<string, string>>({});
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    try {
+      setFields(await client.listSettings());
+      setPending({});
+    } catch (error) {
+      notify("error", error instanceof Error ? error.message : "Could not load settings.");
+    } finally {
+      setLoading(false);
+    }
+  }, [client, notify]);
+
+  useEffect(() => {
+    load();
+  }, [load]);
+
+  const changedCount = Object.keys(pending).length;
+
+  const save = async () => {
+    if (changedCount === 0) return;
+    // A sensitive field left blank means "no change" for that field, not
+    // "set the secret to an empty string" -- the backend would reject an
+    // empty secret anyway (validate() requires one), but dropping it here
+    // avoids staging a save that looks successful for other fields while
+    // silently failing on a secret nobody meant to touch.
+    const payload = Object.fromEntries(
+      Object.entries(pending).filter(([key, value]) => {
+        const field = fields.find((f) => f.key === key);
+        return !(field?.sensitive && value === "");
+      })
+    );
+    if (Object.keys(payload).length === 0) {
+      setPending({});
+      return;
+    }
+    setSaving(true);
+    try {
+      const updated = await client.updateSettings(payload);
+      setFields(updated);
+      setPending({});
+      notify("success", "Settings saved. Restart the server for the changes to take effect.");
+    } catch (error) {
+      notify("error", error instanceof Error ? error.message : "Could not save settings.");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  if (loading) {
+    return (
+      <section className="panel">
+        <p>Loading settings…</p>
+      </section>
+    );
+  }
+  if (fields.length === 0) {
+    return (
+      <section className="panel config-note">
+        <Settings2 size={21} />
+        <div><strong>Settings unavailable</strong><span>This build's server does not expose the settings API, or you're viewing the demo.</span></div>
+      </section>
+    );
+  }
+
+  const sections = [...new Set(fields.map((f) => f.section))];
+
+  return (
+    <div className="workspace-stack">
+      <section className={`panel settings-save-bar${changedCount > 0 ? " active" : ""}`}>
+        <div>
+          <strong>{changedCount > 0 ? `${changedCount} unsaved change${changedCount === 1 ? "" : "s"}` : "No unsaved changes"}</strong>
+          <span>Every setting below only takes effect after you restart the server process.</span>
+        </div>
+        <div className="modal-actions">
+          <button type="button" className="secondary-button" onClick={() => load()} disabled={saving}>
+            <RefreshCw size={16} /> Reload
+          </button>
+          {changedCount > 0 && (
+            <>
+              <button type="button" className="secondary-button" onClick={() => setPending({})} disabled={saving}>Discard</button>
+              <button type="button" className="primary-button" onClick={save} disabled={saving}>
+                <Check size={16} /> {saving ? "Saving…" : "Save changes"}
+              </button>
+            </>
+          )}
+        </div>
+      </section>
+      {sections.map((section) => (
+        <section className="panel" key={section}>
+          <div className="panel-heading"><div><span className="eyebrow">{section.toUpperCase()}</span></div></div>
+          <div className="settings-field-list">
+            {fields
+              .filter((f) => f.section === section)
+              .map((field) => (
+                <SettingRow
+                  key={field.key}
+                  field={field}
+                  pendingValue={pending[field.key]}
+                  onChange={(value) => setPending((prev) => ({ ...prev, [field.key]: value }))}
+                />
+              ))}
+          </div>
+        </section>
+      ))}
+    </div>
   );
 }
 
@@ -1995,6 +2172,8 @@ function App() {
                 measuredBitrateMbps={measuredBitrateMbps}
                 measuredBitrateSource={measuredBitrateSource}
               />
+              <div className="workspace-divider"><span>SETTINGS</span><strong>Server configuration</strong><p>Edit the server's config file directly from here. Restart the service after saving for changes to apply.</p></div>
+              <SettingsPage client={client} notify={notify} />
             </div>
           )}
         </div>

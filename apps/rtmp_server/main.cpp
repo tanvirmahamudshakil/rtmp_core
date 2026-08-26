@@ -16,6 +16,7 @@
 #include "rtmp_server/control/hls_http_handler.hpp"
 #include "rtmp_server/control/http_server.hpp"
 #include "rtmp_server/control/management_api.hpp"
+#include "rtmp_server/control/settings_codec.hpp"
 #include "rtmp_server/core/config.hpp"
 #include "rtmp_server/core/error.hpp"
 #include "rtmp_server/io/io_uring/worker_pool.hpp"
@@ -259,6 +260,18 @@ int main(int argc, char** argv) {
     management_api.set_audit_log(&audit_log);
     management_api.set_metrics(&metrics);
     management_api.set_stream_id_registry(&stream_id_registry);
+    // Admin Settings page: reads/writes config_path directly. Every field
+    // only takes effect on the next restart (see settings_codec.hpp) -- the
+    // operator is expected to restart the service after saving, exactly as
+    // editing the YAML file by hand and restarting always required.
+    management_api.set_settings_handlers(
+        [&config_path]() -> rtmp_server::core::Result<std::string> {
+            return rtmp_server::control::settings_to_json(config_path);
+        },
+        [&config_path](const std::unordered_map<std::string, std::string>& updates)
+            -> rtmp_server::core::Result<std::string> {
+            return rtmp_server::control::apply_settings_updates(config_path, updates);
+        });
     management_api.set_stream_deleted_handler(
         [&hls_handler](std::string_view application, std::string_view stream) {
             hls_handler.unregister_stream(std::string(application), std::string(stream));
@@ -360,7 +373,15 @@ int main(int argc, char** argv) {
                                                      const std::string& stream) {
         hls_handler.unregister_stream(application, stream);
     };
-    rtmp_server::transcoding::native::SourceJobManager source_job_manager(std::move(source_hooks), store.get());
+    rtmp_server::transcoding::native::SourceJobManager::Options source_job_options;
+    // Same operator-facing knob as the ingest side (config.transcode_cpu_
+    // reservation_percent): confines every job's scale+encode work (and its
+    // encoders' own internal threads) to the reserved slice so RTMP ingest/
+    // HTTP/admin traffic can never starve an in-flight transcode, and vice
+    // versa. 0 (default) keeps today's behaviour of sizing from every core.
+    source_job_options.transcode_cpu_reservation_percent = config.transcode_cpu_reservation_percent;
+    rtmp_server::transcoding::native::SourceJobManager source_job_manager(std::move(source_hooks), store.get(),
+                                                                          source_job_options);
     source_job_manager.load_from_store();
 
     const auto source_job_json =

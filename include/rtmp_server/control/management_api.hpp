@@ -79,6 +79,16 @@ public:
         std::string_view application, std::string_view name, bool enabled)>;
     using SourceJobRestarter = std::function<core::Result<std::string>(
         std::string_view application, std::string_view name)>;
+    // Settings page: reads/writes the on-disk server config file. The
+    // provider returns the schema-joined-with-current-values JSON body
+    // (secrets never included, only a has_value flag); the updater takes the
+    // flat {"key":"value",...} request body, validates and atomically
+    // rewrites the config file, and returns the same freshly-reloaded JSON
+    // shape on success. Every setting here only takes effect on the next
+    // server restart -- the updater does not mutate the running process.
+    using SettingsProvider = std::function<core::Result<std::string>()>;
+    using SettingsUpdater =
+        std::function<core::Result<std::string>(const std::unordered_map<std::string, std::string>&)>;
 
     ManagementApi(management::StreamManager& manager, ManagementApiOptions options);
 
@@ -119,6 +129,10 @@ public:
         source_job_enabled_setter_ = std::move(enabled_setter);
         source_job_restarter_ = std::move(restarter);
     }
+    void set_settings_handlers(SettingsProvider provider, SettingsUpdater updater) {
+        settings_provider_ = std::move(provider);
+        settings_updater_ = std::move(updater);
+    }
 
     // Suitable for HttpServer::set_handler directly.
     [[nodiscard]] HttpResponse handle(const HttpRequest& request);
@@ -157,6 +171,8 @@ private:
                                                                   const HttpRequest& request);
     [[nodiscard]] HttpResponse handle_delete_transcoding_assignment(std::string_view application,
                                                                      std::string_view source_stream);
+    [[nodiscard]] HttpResponse handle_get_settings();
+    [[nodiscard]] HttpResponse handle_update_settings(const HttpRequest& request);
     [[nodiscard]] HttpResponse handle_list_templates();
     [[nodiscard]] HttpResponse handle_put_template(std::string_view id, const HttpRequest& request);
     [[nodiscard]] HttpResponse handle_delete_template(std::string_view id);
@@ -183,6 +199,8 @@ private:
     SourceJobRemover source_job_remover_;
     SourceJobEnabledSetter source_job_enabled_setter_;
     SourceJobRestarter source_job_restarter_;
+    SettingsProvider settings_provider_;
+    SettingsUpdater settings_updater_;
 
     struct FailureWindow {
         std::size_t count = 0;

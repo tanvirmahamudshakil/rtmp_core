@@ -185,6 +185,10 @@ Result<void> ServerConfig::validate() const {
         return Error(ErrorCode::InvalidConfiguration, ErrorCategory::Configuration,
                       "chunk sizes must be positive");
     }
+    if (transcode_cpu_reservation_percent > 100) {
+        return Error(ErrorCode::InvalidConfiguration, ErrorCategory::Configuration,
+                      "transcode_cpu_reservation_percent must be between 0 and 100");
+    }
     // --- Phase 8 release gate: "required configuration is missing" and
     // "unsupported insecure defaults are used" must both fail startup, not
     // warn. Everything below is enforced at load_config() time, so a
@@ -293,6 +297,7 @@ Result<ServerConfig> load_config(const std::string& path) {
     u32("worker_ring_count", cfg.worker_ring_count);
     u32("max_worker_ring_count", cfg.max_worker_ring_count);
     boolean("worker_cpu_pinning_enabled", cfg.worker_cpu_pinning_enabled);
+    u32("transcode_cpu_reservation_percent", cfg.transcode_cpu_reservation_percent);
 
     boolean("enable_multishot_accept", cfg.enable_multishot_accept);
     boolean("enable_multishot_recv", cfg.enable_multishot_recv);

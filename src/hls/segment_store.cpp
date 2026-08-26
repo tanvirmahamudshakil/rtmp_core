@@ -82,13 +82,31 @@ void SegmentStore::append_fallback_if_due_locked() {
     const auto initial_grace =
         fallback_active_ ? std::chrono::milliseconds::zero()
                          : std::min(interval / 4, std::chrono::milliseconds(500));
-    if (std::chrono::steady_clock::now() - *last_segment_added_at_ < interval + initial_grace) {
+    const auto elapsed = std::chrono::steady_clock::now() - *last_segment_added_at_;
+    if (elapsed < interval + initial_grace) {
         return;
     }
 
-    const auto next = segments_.back()->sequence + 1;
-    auto fallback = copy_with_sequence(*segments_.back(), next, /*force_discontinuity=*/true);
-    append_locked(std::move(fallback), /*fallback=*/true);
+    // A playlist poll can arrive long after the outage started (slow/rare
+    // pollers), so one stall may span many segment intervals. append_locked()
+    // stamps last_segment_added_at_ with the real wall clock on every append,
+    // so re-checking "elapsed since last append" after each synthetic segment
+    // would immediately read ~0 and stop after a single one -- understating
+    // the outage. Compute how many intervals have actually passed up front
+    // and backfill that many, each still carrying the real segment cadence in
+    // its EXTINF/duration metadata. Bounded by the store's own retention so a
+    // stall much longer than the window cannot grow memory or fallback count
+    // unboundedly -- eviction drops the excess immediately after each append.
+    const std::size_t max_backfill =
+        std::max<std::size_t>(1, config_.live_window_segments + config_.retention_grace_segments);
+    const auto missed_intervals = static_cast<std::size_t>(elapsed.count() / interval.count());
+    const std::size_t backfill_count = std::min(std::max<std::size_t>(1, missed_intervals), max_backfill);
+
+    for (std::size_t appended = 0; appended < backfill_count; ++appended) {
+        const auto next = segments_.back()->sequence + 1;
+        auto fallback = copy_with_sequence(*segments_.back(), next, /*force_discontinuity=*/true);
+        append_locked(std::move(fallback), /*fallback=*/true);
+    }
 }
 
 void SegmentStore::evict_locked() {

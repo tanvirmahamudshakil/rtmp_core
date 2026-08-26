@@ -4,6 +4,7 @@
 #include <limits>
 #include <thread>
 
+#include "rtmp_server/core/cpu_partition.hpp"
 #include "rtmp_server/core/error.hpp"
 #include "rtmp_server/transcoding/native/codec_tags.hpp"
 #include "rtmp_server/transcoding/preset.hpp"
@@ -198,8 +199,17 @@ void SourceJobManager::unregister_outputs_locked(const Job& job) {
 }
 
 std::uint32_t SourceJobManager::cpu_budget_locked() const {
-    const auto hardware = std::thread::hardware_concurrency();
-    const std::uint32_t cores = hardware > 0 ? hardware : 1;
+    // When a reservation is configured, jobs divide only the reserved slice
+    // (not the whole machine) so their combined thread requests can never
+    // spill onto the cores that RTMP ingest/HTTP/admin threads are confined
+    // to -- otherwise a busy job could still oversubscribe the box even
+    // though it would eventually be pinned away from the other side.
+    const auto partition = core::compute_cpu_partition(options_.transcode_cpu_reservation_percent);
+    const std::uint32_t cores = !partition.transcode_cores.empty()
+                                    ? static_cast<std::uint32_t>(partition.transcode_cores.size())
+                                    : (std::thread::hardware_concurrency() > 0
+                                           ? std::thread::hardware_concurrency()
+                                           : 1);
     std::uint32_t active = 0;
     for (const auto& [key, job] : jobs_) {
         (void)key;
@@ -222,8 +232,9 @@ void SourceJobManager::start_locked(Job& job) {
     // count independently (see SourceTranscoder's constructor). The split is
     // recomputed whenever a job starts, so adding a job narrows the share
     // for jobs started after it and a restart re-levels the rest.
-    job.puller = std::make_unique<HlsSourcePuller>(job.config.source_url, job.renditions,
-                                                   job.config.fps, cpu_budget_locked());
+    job.puller = std::make_unique<HlsSourcePuller>(
+        job.config.source_url, job.renditions, job.config.fps, cpu_budget_locked(),
+        core::compute_cpu_partition(options_.transcode_cpu_reservation_percent).transcode_cores);
     job.puller->start();
     job.enabled = true;
     job.detail_override.clear();
