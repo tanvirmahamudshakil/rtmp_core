@@ -6,8 +6,6 @@ import {
   ArrowUpRight,
   Check,
   ChevronRight,
-  CircleGauge,
-  CloudOff,
   Copy,
   Cpu,
   Database,
@@ -22,7 +20,6 @@ import {
   Radio,
   RadioTower,
   RefreshCw,
-  Router,
   Server,
   Settings2,
   ShieldCheck,
@@ -508,6 +505,9 @@ function Overview({
   const hlsEgress = edgeStatsAvailable ? metric(snapshot, "hls_egress_bitrate") : sourceEgress;
   const egress = metric(snapshot, "egress_bitrate") + hlsEgress;
   const utilization = Math.min((egress / (bandwidth * 1e6)) * 100, 999);
+  const coresAvailable = metric(snapshot, "cpu_cores_available") || 1;
+  const cpuCoresUsed = metric(snapshot, "worker_cpu_usage") / 1000;
+  const cpuPercent = Math.min((cpuCoresUsed / coresAvailable) * 100, 999);
   const links = buildLinkRows(snapshot.streams, sourceJobs, streamBandwidth, sourceBandwidth);
   return (
     <>
@@ -520,9 +520,10 @@ function Overview({
           helper={`${configuredLinks} playback links configured`} tone="teal" />
         <MetricCard icon={<ArrowUpRight size={20} />} label="Bandwidth out" value={bitrate(egress)}
           helper={`${utilization.toFixed(1)}% uplink · ${edgeStatsAvailable ? "cache hits included" : "origin traffic only"}`} tone="blue" />
-        <MetricCard icon={<Cpu size={20} />} label="Server load"
-          value={`${(metric(snapshot, "worker_cpu_usage") / 1000).toFixed(2)} / ${compact(metric(snapshot, "cpu_cores_available") || 1)} cores`}
-          helper={`${bytes(metric(snapshot, "process_memory_bytes"))} resident memory`} tone="purple" />
+        <MetricCard icon={<Cpu size={20} />} label="CPU load"
+          value={`${cpuPercent.toFixed(0)}%`}
+          helper={`${cpuCoresUsed.toFixed(2)} / ${compact(coresAvailable)} cores · ${bytes(metric(snapshot, "process_memory_bytes"))} RSS`}
+          tone="purple" />
       </section>
 
       <section className="overview-grid">
@@ -559,7 +560,7 @@ function Overview({
             <Signal size={18} />
             <div>
               <strong>{utilization > 80 ? "Scale pressure detected" : "Delivery headroom is healthy"}</strong>
-              <span>{Math.max(0, bandwidth - egress / 1e6).toFixed(0)} Mbps remains before line rate. Keep at least 10–20% for bursts and TCP recovery.</span>
+              <span>{Math.max(0, bandwidth - egress / 1e6).toFixed(0)} Mbps free before line rate</span>
             </div>
           </div>
         </article>
@@ -570,11 +571,11 @@ function Overview({
             <StatusPill live={snapshot.health === "online"} label={snapshot.health === "online" ? "Operational" : "Degraded"} />
           </div>
           <div className="health-list">
-            <div><span className="health-icon good"><ShieldCheck size={18} /></span><p><strong>Connection limits</strong><small>Per-IP and per-stream safety limits</small></p><b>Active</b></div>
-            <div><span className="health-icon good"><Database size={18} /></span><p><strong>SQLite control store</strong><small>Readiness check passed</small></p><b>Ready</b></div>
+            <div><span className="health-icon good"><ShieldCheck size={18} /></span><p><strong>Connection limits</strong></p><b>Active</b></div>
+            <div><span className="health-icon good"><Database size={18} /></span><p><strong>SQLite control store</strong></p><b>Ready</b></div>
             <div><span className="health-icon good"><HardDrive size={18} /></span><p><strong>Outbound queue</strong><small>{bytes(metric(snapshot, "outbound_queue_bytes"))} pending</small></p><b>Stable</b></div>
-            <div><span className={`health-icon ${metric(snapshot, "slow_viewer_evictions") > 10 ? "warn" : "good"}`}><Unplug size={18} /></span><p><strong>Slow viewers</strong><small>Automatic backpressure policy</small></p><b>{compact(metric(snapshot, "slow_viewer_evictions"))} evicted</b></div>
-            <div><span className={`health-icon ${edgeStatsAvailable ? "good" : "warn"}`}><Network size={18} /></span><p><strong>Cache-edge accounting</strong><small>HLS viewers and HIT/MISS delivery bytes</small></p><b>{edgeStatsAvailable ? "Reporting" : "Unavailable"}</b></div>
+            <div><span className={`health-icon ${metric(snapshot, "slow_viewer_evictions") > 10 ? "warn" : "good"}`}><Unplug size={18} /></span><p><strong>Slow viewers</strong></p><b>{compact(metric(snapshot, "slow_viewer_evictions"))} evicted</b></div>
+            <div><span className={`health-icon ${edgeStatsAvailable ? "good" : "warn"}`}><Network size={18} /></span><p><strong>Cache-edge accounting</strong></p><b>{edgeStatsAvailable ? "Reporting" : "Unavailable"}</b></div>
           </div>
         </article>
       </section>
@@ -898,7 +899,7 @@ function ApplicationDetailPage({
     return (
         <section className="assignment-workspace">
           <div className="source-workspace-heading">
-            <div><span className="eyebrow">PULL · TRANSCODE · RE-SERVE</span><h2>Source Transcode</h2><p>Point at an RTMP or HTTP(S) HLS/TS source carrying H.264/AAC. The native pipeline detects the source by protocol/content, transcodes the chosen ladder, and serves one adaptive master .m3u8.</p></div>
+            <div><span className="eyebrow">PULL · TRANSCODE · RE-SERVE</span><h2>Source Transcode</h2></div>
             <span className="panel-count">{sourceJobs.length} jobs</span>
           </div>
           <article className="assignment-card source-form">
@@ -1092,7 +1093,6 @@ function CapacityPage({
     <div className="capacity-grid">
       <section className="panel planner-panel">
         <div className="panel-heading"><div><span className="eyebrow">LINK BUDGET</span><h2>Direct-delivery calculator</h2></div><Network size={22} /></div>
-        <p className="panel-lead">Estimate concurrent viewers when every byte leaves this VPS directly. This is a network ceiling—not a benchmark guarantee.</p>
         <div className="range-field">
           <div>
             <label htmlFor="bandwidth-number">Committed VPS bandwidth</label>
@@ -1155,13 +1155,7 @@ function CapacityPage({
         <div className="result-row"><span>Per-viewer budget</span><b>{perViewer > 0 ? `${perViewer.toFixed(3)} Mbps` : "Waiting"}</b></div>
         <div className="result-row"><span>Current viewers</span><b>{viewers.toLocaleString()}</b></div>
         <div className="result-row"><span>Current uplink use</span><b>{currentUse.toFixed(1)}%</b></div>
-        <div className="capacity-warning"><Activity size={18} /><span>CPU, kernel send cost, socket memory and NIC PPS can become the limit before bandwidth. Validate with the included load generator.</span></div>
       </aside>
-      <section className="panel capacity-guidance">
-        <div><span className="guidance-icon"><Router size={20} /></span><h3>Fair queueing</h3><p>The installer applies CAKE on the detected public interface using the detected or declared link rate.</p></div>
-        <div><span className="guidance-icon"><CircleGauge size={20} /></span><h3>Keep headroom</h3><p>The high-density default reserves 10%. Use 15–25% when traffic is bursty or the provider's bandwidth is not guaranteed.</p></div>
-        <div><span className="guidance-icon"><CloudOff size={20} /></span><h3>No CDN multiplier</h3><p>Every viewer consumes origin egress. Ten thousand viewers require sub-1 Mbps delivery on a 10Gbps link.</p></div>
-      </section>
     </div>
   );
 }
@@ -1177,7 +1171,7 @@ function SystemPage({ snapshot }: { snapshot: Snapshot }) {
     <>
       <section className="system-banner">
         <div className="system-orb"><Server size={28} /></div>
-        <div><span className="eyebrow">ORIGIN NODE</span><h2>RTMP server is {snapshot.health === "online" ? "operational" : "degraded"}</h2><p>Management plane and telemetry are responding from this node.</p></div>
+        <div><span className="eyebrow">ORIGIN NODE</span><h2>RTMP server is {snapshot.health === "online" ? "operational" : "degraded"}</h2></div>
         <StatusPill live={snapshot.health === "online"} label={snapshot.health === "online" ? "All systems normal" : "Check service"} />
       </section>
       <div className="system-grid">
@@ -1766,7 +1760,7 @@ function TranscodePage({
         </section>
         <section className="preset-workspace">
           <div className="preset-workspace-heading">
-            <div><span className="eyebrow">OUTPUT PROFILES</span><h2>Encoding Presets</h2><p>Create one preset for every outgoing stream rendition.</p></div>
+            <div><span className="eyebrow">OUTPUT PROFILES</span><h2>Encoding Presets</h2></div>
             <div className="row-actions">
               <button className="secondary-button" disabled={busy} onClick={addFullLadder}><Workflow size={17} /> Add Full Ladder</button>
               <button className="primary-button" disabled={busy} onClick={() => setShowPresetModal(true)}><Plus size={17} /> Add Preset</button>
@@ -1844,7 +1838,7 @@ function TranscodePage({
   return (
     <div className="transcode-template-page">
       <div className="section-intro">
-        <div><span className="eyebrow">TRANSCODING</span><h2>Templates</h2><p>Create reusable encoding presets for your outgoing streams.</p></div>
+        <div><span className="eyebrow">TRANSCODING</span><h2>Templates</h2></div>
         <button className="primary-button" disabled={busy} onClick={() => setShowTemplateModal(true)}><Plus size={17} /> Add New Template</button>
       </div>
       <section className="template-grid">
@@ -2163,7 +2157,7 @@ function App() {
           {page === "server" && (
             <div className="workspace-stack">
               <SystemPage snapshot={snapshot} />
-              <div className="workspace-divider"><span>CAPACITY</span><strong>Delivery planner</strong><p>Estimate safe direct-origin viewer capacity from the available uplink.</p></div>
+              <div className="workspace-divider"><span>CAPACITY</span><strong>Delivery planner</strong></div>
               <CapacityPage
                 bandwidth={bandwidth}
                 setBandwidth={setBandwidth}
@@ -2172,7 +2166,7 @@ function App() {
                 measuredBitrateMbps={measuredBitrateMbps}
                 measuredBitrateSource={measuredBitrateSource}
               />
-              <div className="workspace-divider"><span>SETTINGS</span><strong>Server configuration</strong><p>Edit the server's config file directly from here. Restart the service after saving for changes to apply.</p></div>
+              <div className="workspace-divider"><span>SETTINGS</span><strong>Server configuration</strong></div>
               <SettingsPage client={client} notify={notify} />
             </div>
           )}
