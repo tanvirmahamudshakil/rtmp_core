@@ -14,14 +14,18 @@ submission_batch_size: 64
 # below); set explicitly to pin the worker count instead.
 worker_ring_count: 0
 max_worker_ring_count: 64
-worker_cpu_pinning_enabled: true
+# Safe cloud/VPS default. The installer enables pinning automatically only
+# on bare metal, where the scheduler topology is stable.
+worker_cpu_pinning_enabled: false
 
 enable_multishot_accept: true
 enable_multishot_recv: true
 enable_registered_buffers: true
 enable_provided_buffer_ring: true
 enable_send_zero_copy: true
-enable_sqpoll: true
+# Avoid one dedicated polling thread per ring on shared/virtual CPUs. The
+# installer enables SQPOLL automatically on bare metal.
+enable_sqpoll: false
 sqpoll_idle_ms: 1000
 
 registered_buffer_count: 1024
@@ -55,8 +59,10 @@ gop_cache_max_duration: 10s
 gop_cache_max_bytes: 16777216
 gop_cache_max_packets: 2000
 
-subscriber_queue_max_bytes: 8388608
-subscriber_queue_max_packets: 1000
+# About 3-6 seconds at common live bitrates: enough burst absorption without
+# allowing thousands of slow viewers to retain many GiB before recovery.
+subscriber_queue_max_bytes: 4194304
+subscriber_queue_max_packets: 512
 
 recording_directory: "./recordings"
 recording_enabled: false

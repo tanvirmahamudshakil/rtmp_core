@@ -50,10 +50,6 @@ core::Result<void> SourceTranscoder::start() {
         rendition->spec = spec;
         renditions_.push_back(std::move(rendition));
     }
-    // Give large encoders enough slices to consume the cores that become idle
-    // as smaller renditions finish their work for this frame. Treating encoder
-    // thread counts as an additive fixed budget left the 1080p barrier with
-    // only two cores even though its 720p/360p peers finish much earlier.
     const auto hardware = std::thread::hardware_concurrency();
     const std::size_t machine_cores = static_cast<std::size_t>(hardware > 0 ? hardware : 1);
     // A caller-supplied budget is this job's share of the machine, not the
@@ -63,31 +59,8 @@ core::Result<void> SourceTranscoder::start() {
     // can never ask for more threads than cores.
     const std::size_t core_budget =
         cpu_budget_ > 0 ? std::min<std::size_t>(cpu_budget_, machine_cores) : machine_cores;
-    // A resolution-tiered baseline alone left a low-res job (720p and below
-    // -- most source-transcode jobs, which are typically one or two low-
-    // bitrate renditions) pinned to 1-2 encoder threads regardless of how
-    // many cores the box actually has, since desired was never more than
-    // that below 1080p. fair_share spreads the box's cores evenly across
-    // however many renditions this job has instead, so a single-rendition
-    // job on a 24-core box gets a real slice of it rather than the
-    // resolution tier's fixed floor; higher tiers still get at least their
-    // own floor on a box with more renditions than cores to go around.
-    const std::size_t fair_share =
-        std::max<std::size_t>(1, core_budget / std::max<std::size_t>(renditions_.size(), 1));
-    for (auto& rendition : renditions_) {
-        const auto pixels =
-            static_cast<std::uint64_t>(rendition->spec.width) * rendition->spec.height;
-        std::size_t desired = fair_share;
-        if (pixels >= 3840ULL * 2160ULL) {
-            desired = std::max(fair_share, std::size_t{8});
-        } else if (pixels >= 1920ULL * 1080ULL) {
-            desired = std::max(fair_share, std::size_t{4});
-        } else if (pixels >= 1280ULL * 720ULL) {
-            desired = std::max(fair_share, std::size_t{2});
-        }
-        rendition->video_threads =
-            static_cast<std::uint32_t>(std::clamp<std::size_t>(desired, 1, core_budget));
-    }
+    effective_core_budget_ = static_cast<std::uint32_t>(core_budget);
+    frame_errors_.resize(renditions_.size());
 
     // Fan separate renditions out in parallel. Internal encoder threads use
     // only the spare part of the same core budget calculated above.
@@ -222,29 +195,34 @@ core::Result<void> SourceTranscoder::on_video(std::span<const std::byte> annexb,
     // when an upstream HLS source reconnects or resets its timestamp base.
     decoded_.pts_90k = next_output_video_pts_90k_;
 
+    if (!video_threads_configured_) {
+        const auto allocation = allocate_rendition_video_threads(
+            specs_, decoded_.width, decoded_.height, effective_core_budget_);
+        for (std::size_t i = 0; i < renditions_.size(); ++i) {
+            renditions_[i]->video_threads = allocation[i];
+        }
+        video_threads_configured_ = true;
+    }
+
     // Each rendition writes only to its own Rendition (scaler/encoder/scaled
     // buffer) and its own video_output_ index, so running them concurrently
     // is safe: no shared mutable state besides the read-only decoded_ frame.
-    std::vector<core::Error> errors(renditions_.size());
-    std::vector<bool> failed(renditions_.size(), false);
+    for (auto& error : frame_errors_) error.reset();
 
     auto process = [&](std::size_t i) {
         auto& rendition = *renditions_[i];
         if (auto r = ensure_video(rendition, decoded_.width, decoded_.height); !r) {
-            errors[i] = r.error();
-            failed[i] = true;
+            frame_errors_[i] = r.error();
             return;
         }
         const ScalePlan plan = plan_for(rendition.spec, decoded_.width, decoded_.height);
         if (auto r = rendition.scaler.scale(decoded_, plan, rendition.scaled); !r) {
-            errors[i] = r.error();
-            failed[i] = true;
+            frame_errors_[i] = r.error();
             return;
         }
         std::vector<EncodedAccessUnit> encoded;
         if (auto r = rendition.video_encoder.encode(rendition.scaled, encoded); !r) {
-            errors[i] = r.error();
-            failed[i] = true;
+            frame_errors_[i] = r.error();
             return;
         }
         if (video_output_)
@@ -258,7 +236,7 @@ core::Result<void> SourceTranscoder::on_video(std::span<const std::byte> annexb,
     }
 
     for (std::size_t i = 0; i < renditions_.size(); ++i) {
-        if (failed[i]) return errors[i];
+        if (frame_errors_[i]) return *frame_errors_[i];
     }
     return {};
 }

@@ -11,8 +11,9 @@ For playback media, the server now:
 1. keeps the ingested payload in one immutable `SharedMediaFrame`;
 2. encodes a stateless, always-valid RTMP fmt0 wire buffer once per
    `(frame, chunk size, chunk-stream ID, message-stream ID)`;
-3. shares that immutable encoded allocation across every matching viewer
-   queue, including viewers on other io_uring workers;
+3. serves the common cached wire representation through an immutable,
+   lock-free read path and shares that allocation across every matching
+   viewer queue, including viewers on other io_uring workers;
 4. uses `IORING_OP_SEND_ZC` for buffers of at least 16 KiB when both config
    and the running kernel support it;
 5. retains the source allocation through the SEND_ZC notification CQE, then
@@ -25,6 +26,19 @@ zero-copy setup and notification overhead is not worthwhile for small
 buffers. Every connection still has byte and packet queue caps, and the
 keyframe-aware slow-viewer policy prevents a slow socket from growing memory
 without bound.
+
+Cross-worker media queues signal their destination only when changing from
+empty to non-empty. Further frames in the same burst reuse that wakeup, and a
+bounded drain re-signals if work remains. This removes one `eventfd` syscall
+per destination per frame without adding polling latency. Fan-out also reuses
+its delivery records for post-callback backpressure results instead of
+allocating a second vector for every frame.
+
+The VPS installer sets a 4 MiB / 512-message slow-viewer queue. At common live
+bitrates this absorbs several seconds of jitter while bounding worst-case RAM.
+Varnish cache HITs remain unconstrained by origin concurrency; only concurrent
+cache MISSes are capped to the origin's CPU-sized HTTP pool, preventing a
+restart/join stampede from starving current playlists or media ingest.
 
 Always-fmt0 media adds a few RTMP header bytes per frame. That deliberate
 trade saves a payload-sized allocation/copy and stateful encode for every

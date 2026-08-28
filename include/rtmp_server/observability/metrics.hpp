@@ -95,8 +95,11 @@ namespace rtmp_server::observability {
     X(ProcessMemoryBytes, "process_memory_bytes", Gauge, "Resident set size of this process")                         \
     X(WorkerCpuUsage, "worker_cpu_usage", Gauge, "This process's CPU utilisation since the previous sample, in "     \
                                                  "milli-cores (1000 = 1 core fully busy)")                            \
-    X(CpuCoresAvailable, "cpu_cores_available", Gauge, "CPU cores visible to this process "                          \
-                                                        "(std::thread::hardware_concurrency())")                      \
+    X(SystemCpuUsageMilliPercent, "system_cpu_usage_milli_percent", Gauge,                                           \
+      "CPU utilisation across the logical cores available to this process, in thousandths of a percent "             \
+      "(100000 = 100%)")                                                                                            \
+    X(CpuCoresAvailable, "cpu_cores_available", Gauge, "Logical CPU cores available to this process "                \
+                                                        "(Linux affinity mask when available)")                       \
     /* -- registry self-observability ---------------------------------------- */                                    \
     X(MetricsRejectedNames, "metrics_rejected_names_total", Counter,                                                  \
       "Dynamic metric writes rejected for an invalid or over-budget name")
@@ -159,6 +162,17 @@ public:
     // Ignores worker indices >= kMaxWorkers rather than growing.
     void set_connections_for_worker(std::size_t worker_index, std::int64_t connections) noexcept;
     [[nodiscard]] std::int64_t connections_for_worker(std::size_t worker_index) const noexcept;
+
+    struct CpuCoreUsage {
+        std::uint32_t core = 0;
+        std::int64_t milli_percent = 0;
+    };
+
+    // One bounded sample per logical CPU visible to this process. Linux data
+    // comes from consecutive /proc/stat counters, filtered through the
+    // process affinity mask, so these are kernel measurements rather than a
+    // frontend estimate. Empty on platforms where those counters are absent.
+    [[nodiscard]] std::vector<CpuCoreUsage> cpu_core_usage_snapshot() const;
 
     // ---- viewers-per-stream aggregation ------------------------------------
 
@@ -229,6 +243,11 @@ private:
     std::chrono::steady_clock::time_point last_cpu_sample_{};
     std::int64_t last_cpu_ticks_ = 0;
     bool has_cpu_baseline_ = false;
+    // {logical CPU id, active jiffies, total jiffies}; only touched while
+    // cpu_mutex_ is held.
+    std::vector<std::array<std::uint64_t, 3>> last_system_cpu_times_;
+    std::vector<CpuCoreUsage> cpu_core_usage_;
+    std::chrono::steady_clock::time_point last_system_cpu_sample_{};
 
     mutable std::mutex mutex_;
     std::map<std::string, std::uint64_t> counters_;

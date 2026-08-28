@@ -64,6 +64,12 @@ public:
     // [1, config.max_worker_ring_count].
     [[nodiscard]] static std::uint32_t effective_worker_count(const core::ServerConfig& config);
 
+    // Divide the process-wide admission budget between SO_REUSEPORT workers.
+    // This is intentionally public for a small arithmetic unit test: uint32
+    // "unlimited" (UINT32_MAX) must not wrap while calculating ceil(limit/n).
+    [[nodiscard]] static std::uint32_t per_worker_connection_limit(std::uint32_t process_limit,
+                                                                   std::uint32_t worker_count);
+
 private:
     struct Worker {
         std::unique_ptr<IoUringEventLoop> loop;

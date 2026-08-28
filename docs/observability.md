@@ -71,6 +71,7 @@ would be unbounded:
 |---|---|---|
 | `viewers_per_stream` | `viewers_per_stream_max`, `viewers_per_stream_mean_milli`, `active_streams` | Stream count is unbounded and stream keys are publish secrets. `LiveFanout::sample_gauges()` feeds one sample per live stream via `observe_viewers_per_stream()`, then `commit_viewers_per_stream()` publishes the aggregate. |
 | `connections_per_worker` | `connections_per_worker{worker="N"}` | Worker count is bounded by *configuration* (`kMaxWorkers` = 64), never by client behaviour, so a label is safe here. Only populated slots are exported. |
+| per-core CPU | `system_cpu_core_usage_milli_percent{core="N"}` | Logical CPU count is bounded by the Linux scheduler affinity mask. Values are thousandths of a percent (`100000` = 100%). |
 
 This behaviour is asserted in
 `tests/unit/observability/metrics_test.cpp`
@@ -85,8 +86,12 @@ computed by `refresh_derived()` from the byte counters and the wall time since
 the previous call — two samples are required, so the first call only
 establishes a baseline and reports 0. `process_memory_bytes` is sampled by
 `refresh_process_metrics()` (mach `task_info` on Darwin, `/proc/self/statm` on
-Linux). Both are called from the `/metrics` handler and from the test server's
-periodic sampler — **never** from a network worker.
+Linux). On Linux the same refresh reads consecutive `/proc/self/stat` and
+`/proc/stat` counters for process milli-cores, total host CPU, and every
+logical core allowed by `sched_getaffinity()`. Guest time is excluded because
+the kernel already includes it in user time. Sampling is called from the
+`/metrics` handler and from the test server's periodic sampler — **never**
+from a network worker.
 
 ### 2.4 Where each metric is incremented
 
@@ -109,7 +114,8 @@ periodic sampler — **never** from a network worker.
 | `provided_buffer_exhaustion` | `IoUringEventLoop::submit_receive` pool-exhausted branch | ❌ Linux only |
 | `io_uring_cq_overflow` | **registered, not yet fed** — see §2.5 | ❌ |
 | `inter_worker_queue_depth`, `inter_worker_queue_drops` | **registered, not yet fed** — see §2.5 | ❌ |
-| `worker_cpu_usage` | **registered, not yet fed** — see §2.5 | ❌ |
+| `worker_cpu_usage` | `Metrics::refresh_process_metrics()` from `/proc/self/stat` | ❌ Linux only |
+| `system_cpu_usage_milli_percent`, `system_cpu_core_usage_milli_percent{core="N"}` | `Metrics::refresh_process_metrics()` from `/proc/stat` | ❌ Linux only |
 | `process_memory_bytes` | `Metrics::refresh_process_metrics()` | ✅ |
 
 ### 2.5 Honestly declared gaps
@@ -121,8 +127,6 @@ increments them yet**:
   ring's flags after `io_uring_submit_and_wait`. Not wired.
 * `inter_worker_queue_depth` / `inter_worker_queue_drops` — `CrossWorkerRouter`
   (Phase 4) has the queue but does not yet report depth or drops.
-* `worker_cpu_usage` — needs per-thread `clock_gettime(CLOCK_THREAD_CPUTIME_ID)`
-  sampling in `WorkerPool`.
 
 They are declared rather than omitted so the exposition surface is stable and
 a dashboard can be built against the complete set; a reader must treat a `0`

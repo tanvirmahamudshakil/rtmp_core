@@ -76,6 +76,7 @@ void CrossWorkerRouter::forward(WorkerId source_worker, StreamId stream_id, cons
 
         PerWorkerQueue& queue = *queues_[destination];
         bool pushed = false;
+        bool should_wake = false;
         std::uint64_t dropped = 0;
         {
             std::lock_guard<std::mutex> lock(queue.mutex);
@@ -139,6 +140,7 @@ void CrossWorkerRouter::forward(WorkerId source_worker, StreamId stream_id, cons
                 }
 
                 if (!would_overflow() && (is_sticky || !queue.waiting_for_keyframe.contains(stream_raw))) {
+                    should_wake = queue.frames.empty();
                     queue.queued_bytes += frame_bytes;
                     queue.frames.push_back(QueuedFrame{stream_id, frame, kind, is_sticky, is_keyframe});
                     pushed = true;
@@ -155,7 +157,10 @@ void CrossWorkerRouter::forward(WorkerId source_worker, StreamId stream_id, cons
         if (!pushed) {
             continue;
         }
-        if (queue.wake_fd.valid()) {
+        // eventfd is level-triggered for this queue: once a non-empty queue
+        // has signalled its worker, one syscall per additional media frame is
+        // pure overhead. Signal only on the empty -> non-empty transition.
+        if (should_wake && queue.wake_fd.valid()) {
             const std::uint64_t one = 1;
             [[maybe_unused]] auto written = ::write(queue.wake_fd.get(), &one, sizeof(one));
         }

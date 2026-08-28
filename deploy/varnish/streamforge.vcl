@@ -7,10 +7,10 @@ backend default {
     .connect_timeout = 1s;
     .first_byte_timeout = 5s;
     .between_bytes_timeout = 5s;
-    # Unbounded by request (0 = no ceiling in Varnish). Previously capped at
-    # 4096 as a burst ceiling; removing it means a cache-miss storm can open
-    # as many backend connections as the origin will accept.
-    .max_connections = 0;
+    # Installer replaces this with the origin's CPU-sized HTTP worker count.
+    # Cache HIT traffic is unaffected; only concurrent MISSes are bounded so
+    # a join/restart stampede cannot starve playlists, health, or ingest.
+    .max_connections = 256;
 }
 
 sub vcl_recv {

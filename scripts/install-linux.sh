@@ -11,9 +11,10 @@
 #                                Optional -- empty (default) serves over HTTP on
 #                                the server's primary IP; a domain later pointed
 #                                at that IP works too, no reinstall needed.
-#   RTMP_BANDWIDTH_MBIT          Defaults to a flat 20000 (20 Gbps). Set "auto"
-#                                to read the NIC-reported link speed instead, or
-#                                a specific Mbps number for a provider cap.
+#   RTMP_BANDWIDTH_MBIT          "auto" (default) reads the NIC-reported link
+#                                speed. Virtual NICs that hide it use a 20 Gbps
+#                                planning fallback; set the provider's actual
+#                                Mbps value for exact capacity/shaping.
 #   RTMP_EXPECTED_STREAM_MBIT    "auto" (default) keeps OBS/transcoder bitrate
 #                                unchanged and measures it while live. A numeric
 #                                value only overrides install-time capacity sizing.
@@ -43,6 +44,16 @@
 #   RTMP_WORKERS                 Worker count; default = every detected CPU
 #                                core (no artificial cap besides the core count
 #                                itself and the 4096 io_uring ring ceiling).
+#   RTMP_ADMISSION_MODE          "unlimited" (default) removes application-level
+#                                connection/publisher/viewer caps. "capacity"
+#                                applies the install-time link budget as a hard
+#                                admission ceiling. Kernel/RAM/network limits
+#                                always remain finite in either mode.
+#   RTMP_WORKER_CPU_PINNING      "auto" (default) disables pinning on a VPS and
+#                                enables it on bare metal. Also accepts 0 or 1.
+#   RTMP_ENABLE_SQPOLL           "auto" (default) avoids dedicated polling
+#                                threads on a VPS and enables them on bare metal.
+#                                Also accepts 0 or 1.
 #   RTMP_MAX_CONNECTIONS_PER_IP  Per-source connection cap. Unbounded (uint32
 #                                max) by default -- no per-IP admission limit.
 #   RTMP_FRESH_INSTALL           1 (default) removes every prior StreamForge
@@ -106,10 +117,7 @@ case "${ID:-}" in
 esac
 
 DOMAIN="${RTMP_DOMAIN:-}"
-# Default to a flat 20 Gbps instead of NIC auto-detection -- set
-# RTMP_BANDWIDTH_MBIT=auto explicitly to go back to reading the NIC's
-# reported link speed, or a specific number for a provider-capped link.
-BANDWIDTH_MBIT="${RTMP_BANDWIDTH_MBIT:-20000}"
+BANDWIDTH_MBIT="${RTMP_BANDWIDTH_MBIT:-auto}"
 EXPECTED_STREAM_MBIT="${RTMP_EXPECTED_STREAM_MBIT:-auto}"
 # Pre-live capacity-sizing floor, used only until a real bitrate is measured
 # from live traffic. 0.5 Mbps under-sized socket/buffer reservations for a
@@ -122,6 +130,9 @@ LINK_UTILIZATION_PERCENT="${RTMP_LINK_UTILIZATION_PERCENT:-90}"
 # cost more accurately for this delivery path.
 PROTOCOL_OVERHEAD_PERCENT="${RTMP_PROTOCOL_OVERHEAD_PERCENT:-8}"
 MAX_CONNECTIONS_PER_IP="${RTMP_MAX_CONNECTIONS_PER_IP:-4294967295}"
+ADMISSION_MODE="${RTMP_ADMISSION_MODE:-unlimited}"
+WORKER_CPU_PINNING="${RTMP_WORKER_CPU_PINNING:-auto}"
+ENABLE_SQPOLL="${RTMP_ENABLE_SQPOLL:-auto}"
 ENABLE_FAIR_QUEUE="${RTMP_ENABLE_FAIR_QUEUE:-1}"
 CONFIGURE_FIREWALL="${RTMP_CONFIGURE_FIREWALL:-1}"
 CONFIGURE_DNS="${RTMP_CONFIGURE_DNS:-1}"
@@ -163,6 +174,12 @@ fi
   die "RTMP_MAX_CONNECTIONS_PER_IP must be a positive integer."
 (( MAX_CONNECTIONS_PER_IP <= 4294967295 )) ||
   die "RTMP_MAX_CONNECTIONS_PER_IP is outside the supported range (uint32)."
+[[ "${ADMISSION_MODE}" == "unlimited" || "${ADMISSION_MODE}" == "capacity" ]] ||
+  die "RTMP_ADMISSION_MODE must be 'unlimited' or 'capacity'."
+[[ "${WORKER_CPU_PINNING}" == "auto" || "${WORKER_CPU_PINNING}" =~ ^[01]$ ]] ||
+  die "RTMP_WORKER_CPU_PINNING must be 'auto', 0 or 1."
+[[ "${ENABLE_SQPOLL}" == "auto" || "${ENABLE_SQPOLL}" =~ ^[01]$ ]] ||
+  die "RTMP_ENABLE_SQPOLL must be 'auto', 0 or 1."
 [[ "${ENABLE_FAIR_QUEUE}" =~ ^[01]$ ]] || die "RTMP_ENABLE_FAIR_QUEUE must be 0 or 1."
 [[ "${CONFIGURE_FIREWALL}" =~ ^[01]$ ]] || die "RTMP_CONFIGURE_FIREWALL must be 0 or 1."
 [[ "${CONFIGURE_DNS}" =~ ^[01]$ ]] || die "RTMP_CONFIGURE_DNS must be 0 or 1."
@@ -501,6 +518,26 @@ if [[ "${NODE_OK}" != "1" ]]; then
 fi
 
 CPU_COUNT="$(nproc)"
+MEM_TOTAL_KB="$(awk '/^MemTotal:/ { print $2 }' /proc/meminfo)"
+[[ "${MEM_TOTAL_KB}" =~ ^[0-9]+$ ]] || die "Could not determine total system memory."
+
+VIRTUALIZATION_KIND="$(systemd-detect-virt 2>/dev/null || true)"
+[[ -n "${VIRTUALIZATION_KIND}" ]] || VIRTUALIZATION_KIND="none"
+IS_VIRTUALIZED=0
+if [[ "${VIRTUALIZATION_KIND}" != "none" ]]; then IS_VIRTUALIZED=1; fi
+if [[ "${WORKER_CPU_PINNING}" == "auto" ]]; then
+  WORKER_CPU_PINNING=$((1 - IS_VIRTUALIZED))
+fi
+if [[ "${ENABLE_SQPOLL}" == "auto" ]]; then
+  ENABLE_SQPOLL=$((1 - IS_VIRTUALIZED))
+fi
+log "Detected ${CPU_COUNT} CPU cores, $((MEM_TOTAL_KB / 1024)) MB RAM, virtualization=${VIRTUALIZATION_KIND}"
+if [[ "${IS_VIRTUALIZED}" == "1" ]]; then
+  log "VPS profile: scheduler-managed workers and no SQPOLL busy thread"
+else
+  log "Bare-metal profile: CPU-pinned workers and SQPOLL enabled"
+fi
+
 # Must match ServerConfig::max_worker_ring_count (include/rtmp_server/core/config.hpp).
 MAX_WORKER_RING_COUNT=4096
 # No artificial 16-worker ceiling: default to one worker per core. Still
@@ -537,14 +574,23 @@ if [[ "${BANDWIDTH_MBIT}" == "auto" ]]; then
         exit
       }')"
   fi
-  [[ "${DETECTED_BANDWIDTH}" =~ ^[1-9][0-9]*$ ]] ||
-    die "NIC ${PRIMARY_INTERFACE} does not report link speed; rerun with RTMP_BANDWIDTH_MBIT=<provider Mbps>."
-  (( DETECTED_BANDWIDTH >= 10 && DETECTED_BANDWIDTH <= 1000000 )) ||
-    die "NIC-reported speed ${DETECTED_BANDWIDTH} Mbps is outside the supported range."
-  BANDWIDTH_MBIT="${DETECTED_BANDWIDTH}"
-  BANDWIDTH_SOURCE="NIC-reported link speed (verify against the provider plan)"
-  BANDWIDTH_SOURCE_KIND="nic"
-  log "Auto-detected ${BANDWIDTH_MBIT} Mbps on ${PRIMARY_INTERFACE}; provider shaping may be lower"
+  if [[ "${DETECTED_BANDWIDTH}" =~ ^[1-9][0-9]*$ ]] &&
+     (( DETECTED_BANDWIDTH >= 10 && DETECTED_BANDWIDTH <= 1000000 )); then
+    BANDWIDTH_MBIT="${DETECTED_BANDWIDTH}"
+    BANDWIDTH_SOURCE="NIC-reported link speed (verify against the provider plan)"
+    BANDWIDTH_SOURCE_KIND="nic"
+    log "Auto-detected ${BANDWIDTH_MBIT} Mbps on ${PRIMARY_INTERFACE}; provider shaping may be lower"
+  else
+    # Virtio/cloud NICs commonly hide the provider policer's speed. Do not
+    # make a one-command VPS install fail for missing metadata: retain a
+    # generous planning value so the application is not artificially capped.
+    # Operators should supply their committed provider Mbps for exact fair
+    # queue shaping and viewer-capacity reporting.
+    BANDWIDTH_MBIT=20000
+    BANDWIDTH_SOURCE="20 Gbps virtual-NIC fallback (set RTMP_BANDWIDTH_MBIT to the provider rate)"
+    BANDWIDTH_SOURCE_KIND="fallback"
+    log "NIC ${PRIMARY_INTERFACE} hides link speed; using a 20000 Mbps planning fallback"
+  fi
 fi
 
 MAX_VIEWERS="$(awk -v bw="${BANDWIDTH_MBIT}" -v rate="${CAPACITY_STREAM_MBIT}" \
@@ -554,6 +600,13 @@ MAX_VIEWERS="$(awk -v bw="${BANDWIDTH_MBIT}" -v rate="${CAPACITY_STREAM_MBIT}" \
     if (value < 1) value=1;
     print value
   }')"
+# Bound the edge estimator's in-memory session table independently of the
+# unlimited application admission value. Keep generous headroom above this
+# node's physical link estimate without allowing fabricated session IDs to
+# consume arbitrary RAM.
+TRACKED_VIEWER_LIMIT=$((MAX_VIEWERS * 2))
+if (( TRACKED_VIEWER_LIMIT < 200000 )); then TRACKED_VIEWER_LIMIT=200000; fi
+if (( TRACKED_VIEWER_LIMIT > 2000000 )); then TRACKED_VIEWER_LIMIT=2000000; fi
 CONNECTION_RESERVE=$((MAX_VIEWERS / 10))
 if (( CONNECTION_RESERVE < 2048 )); then CONNECTION_RESERVE=2048; fi
 MAX_CONNECTIONS=$((MAX_VIEWERS + CONNECTION_RESERVE))
@@ -566,11 +619,41 @@ PER_WORKER_CONNECTIONS=$(((MAX_CONNECTIONS + WORKERS - 1) / WORKERS))
 BUFFER_RESERVE=$((PER_WORKER_CONNECTIONS / 10))
 if (( BUFFER_RESERVE < 256 )); then BUFFER_RESERVE=256; fi
 PROVIDED_BUFFER_COUNT=$((PER_WORKER_CONNECTIONS + BUFFER_RESERVE))
-NOFILE=$((MAX_CONNECTIONS + 65536))
-if (( NOFILE < 65536 )); then NOFILE=65536; fi
-if (( NOFILE > 1048576 )); then NOFILE=1048576; fi
-(( MAX_CONNECTIONS < NOFILE )) ||
-  die "Calculated ${MAX_CONNECTIONS} sockets exceed this single-node file-descriptor ceiling; use multiple origin nodes."
+PROVIDED_BUFFER_SIZE=16384
+# Receive buffers are allocated eagerly once per media worker. Bound their
+# combined footprint to 10% of detected RAM so a low-memory VPS cannot OOM
+# during startup merely because its virtual NIC advertises a fast link.
+BUFFER_MEMORY_BUDGET_BYTES=$((MEM_TOTAL_KB * 1024 / 10))
+MAX_TOTAL_PROVIDED_BUFFERS=$((BUFFER_MEMORY_BUDGET_BYTES / PROVIDED_BUFFER_SIZE))
+MIN_TOTAL_PROVIDED_BUFFERS=$((WORKERS * 256))
+if (( MAX_TOTAL_PROVIDED_BUFFERS < MIN_TOTAL_PROVIDED_BUFFERS )); then
+  MAX_TOTAL_PROVIDED_BUFFERS="${MIN_TOTAL_PROVIDED_BUFFERS}"
+fi
+MAX_PER_WORKER_PROVIDED_BUFFERS=$((MAX_TOTAL_PROVIDED_BUFFERS / WORKERS))
+if (( PROVIDED_BUFFER_COUNT > MAX_PER_WORKER_PROVIDED_BUFFERS )); then
+  PROVIDED_BUFFER_COUNT="${MAX_PER_WORKER_PROVIDED_BUFFERS}"
+  log "RAM-aware receive pool: capped at ${PROVIDED_BUFFER_COUNT} x ${PROVIDED_BUFFER_SIZE} bytes per worker"
+fi
+
+# Remove the application's artificial admission ceiling in unlimited mode,
+# while retaining the calculated values for resource sizing and the panel's
+# honest physical-capacity estimate.
+UINT32_MAX=4294967295
+ADMISSION_MAX_CONNECTIONS="${MAX_CONNECTIONS}"
+ADMISSION_MAX_PUBLISHERS="${MAX_PUBLISHERS}"
+ADMISSION_MAX_VIEWERS="${MAX_VIEWERS}"
+if [[ "${ADMISSION_MODE}" == "unlimited" ]]; then
+  ADMISSION_MAX_CONNECTIONS="${UINT32_MAX}"
+  ADMISSION_MAX_PUBLISHERS="${UINT32_MAX}"
+  ADMISSION_MAX_VIEWERS="${UINT32_MAX}"
+fi
+
+KERNEL_NR_OPEN="$(cat /proc/sys/fs/nr_open 2>/dev/null || true)"
+if [[ ! "${KERNEL_NR_OPEN}" =~ ^[1-9][0-9]*$ ]]; then KERNEL_NR_OPEN=1048576; fi
+NOFILE="${KERNEL_NR_OPEN}"
+if (( MAX_CONNECTIONS >= NOFILE )); then
+  log "Physical connection estimate ${MAX_CONNECTIONS} exceeds per-process FD limit ${NOFILE}; HLS caching/CDN or multiple origins are required at that scale"
+fi
 
 log "Building hardened C++ server with ${WORKERS} media workers"
 export CC="${CLANG_BIN}"
@@ -647,7 +730,9 @@ cat > /var/www/streamforge/runtime-config.json <<EOF
   "resource_sizing_stream_mbps": ${CAPACITY_STREAM_MBIT},
   "utilization_percent": ${LINK_UTILIZATION_PERCENT},
   "protocol_overhead_percent": ${PROTOCOL_OVERHEAD_PERCENT},
-  "viewer_budget": ${MAX_VIEWERS}
+  "viewer_budget": ${MAX_VIEWERS},
+  "admission_mode": "${ADMISSION_MODE}",
+  "file_descriptor_limit": ${NOFILE}
 }
 EOF
 chown -R root:root /var/www/streamforge
@@ -684,14 +769,20 @@ RTMP_SERVER_RTMP_PORT=1935
 RTMP_SERVER_API_BIND_ADDRESS=127.0.0.1
 RTMP_SERVER_API_PORT=8080
 RTMP_SERVER_PUBLIC_RTMP_HOSTNAME=${PUBLIC_HOST}
-RTMP_SERVER_MAXIMUM_CONNECTIONS=${MAX_CONNECTIONS}
+RTMP_SERVER_MAXIMUM_CONNECTIONS=${ADMISSION_MAX_CONNECTIONS}
 RTMP_SERVER_MAXIMUM_CONNECTIONS_PER_IP=${MAX_CONNECTIONS_PER_IP}
-RTMP_SERVER_MAXIMUM_PUBLISHERS=${MAX_PUBLISHERS}
-RTMP_SERVER_MAXIMUM_VIEWERS_PER_STREAM=${MAX_VIEWERS}
+RTMP_SERVER_MAXIMUM_PUBLISHERS=${ADMISSION_MAX_PUBLISHERS}
+RTMP_SERVER_MAXIMUM_VIEWERS_PER_STREAM=${ADMISSION_MAX_VIEWERS}
 RTMP_SERVER_WORKER_RING_COUNT=${WORKERS}
+RTMP_SERVER_MAX_WORKER_RING_COUNT=${MAX_WORKER_RING_COUNT}
+RTMP_SERVER_WORKER_CPU_PINNING_ENABLED=$([[ "${WORKER_CPU_PINNING}" == "1" ]] && echo true || echo false)
+RTMP_SERVER_ENABLE_SQPOLL=$([[ "${ENABLE_SQPOLL}" == "1" ]] && echo true || echo false)
 RTMP_SERVER_ENABLE_HLS_FAST_JOIN=$([[ "${ENABLE_FAST_JOIN}" == "1" ]] && echo true || echo false)
 RTMP_SERVER_PROVIDED_BUFFER_COUNT=${PROVIDED_BUFFER_COUNT}
-RTMP_SERVER_PROVIDED_BUFFER_SIZE=16384
+RTMP_SERVER_PROVIDED_BUFFER_SIZE=${PROVIDED_BUFFER_SIZE}
+RTMP_SERVER_SUBSCRIBER_QUEUE_MAX_BYTES=4194304
+RTMP_SERVER_SUBSCRIBER_QUEUE_MAX_PACKETS=512
+STREAMFORGE_MAX_TRACKED_VIEWERS_PER_STREAM=${TRACKED_VIEWER_LIMIT}
 RTMP_SERVER_DATABASE_TYPE=sqlite
 RTMP_SERVER_DATABASE_CONNECTION=/var/lib/rtmp-server/rtmp.db
 RTMP_SERVER_TRANSCODING_ENABLED=false
@@ -724,7 +815,9 @@ Admin URL: $(if [[ -n "${DOMAIN}" ]]; then printf 'https://%s' "${DOMAIN}"; else
 RTMP origin: rtmp://${PUBLIC_HOST}:1935
 Capacity bandwidth: ${BANDWIDTH_MBIT} Mbps (${BANDWIDTH_SOURCE})
 Bitrate mode: $(if [[ "${BITRATE_MODE}" == "auto" ]]; then printf 'OBS/transcoder passthrough, measured while live'; else printf 'manual capacity override (%s Mbps)' "${EXPECTED_STREAM_MBIT}"; fi)
-Pre-live viewer safety ceiling: ${MAX_VIEWERS}
+Estimated physical viewer capacity: ${MAX_VIEWERS}
+Application admission: ${ADMISSION_MODE}$(if [[ "${ADMISSION_MODE}" == "unlimited" ]]; then printf ' (no artificial connection/publisher/viewer cap)'; fi)
+Per-process file-descriptor ceiling: ${NOFILE}
 Generated: $(date -u +%Y-%m-%dT%H:%M:%SZ)
 
 The admin panel, RTMP playback, and HLS playback are open and require no access token.
@@ -801,8 +894,10 @@ WantedBy=multi-user.target
 EOF
 
 log "Applying measured-workload Linux network baselines"
-cat > /etc/sysctl.d/60-streamforge.conf <<'EOF'
-fs.file-max = 2097152
+SYSTEM_FILE_MAX=$((NOFILE * 4))
+if (( SYSTEM_FILE_MAX < 2097152 )); then SYSTEM_FILE_MAX=2097152; fi
+cat > /etc/sysctl.d/60-streamforge.conf <<EOF
+fs.file-max = ${SYSTEM_FILE_MAX}
 net.core.somaxconn = 65535
 net.ipv4.tcp_max_syn_backlog = 65535
 net.core.netdev_max_backlog = 65536
@@ -958,16 +1053,19 @@ log "Configuring Varnish shared HLS cache"
 # strings are normalized by the public high-scale VCL to prevent cache-key
 # fragmentation.
 # Bound to loopback only: never exposed directly to the internet.
-MEM_TOTAL_KB="$(awk '/^MemTotal:/ { print $2 }' /proc/meminfo)"
-[[ "${MEM_TOTAL_KB}" =~ ^[0-9]+$ ]] || die "Could not determine total system memory."
 VARNISH_CACHE_MB=$(( MEM_TOTAL_KB / 1024 / 5 ))
 if (( VARNISH_CACHE_MB < 128 )); then VARNISH_CACHE_MB=128; fi
 if (( VARNISH_CACHE_MB > 16384 )); then VARNISH_CACHE_MB=16384; fi
 VARNISH_THREAD_POOLS=$(( (WORKERS + 3) / 4 ))
 if (( VARNISH_THREAD_POOLS < 2 )); then VARNISH_THREAD_POOLS=2; fi
 if (( VARNISH_THREAD_POOLS > 8 )); then VARNISH_THREAD_POOLS=8; fi
+VARNISH_BACKEND_CONNECTIONS=$((WORKERS * 16))
+if (( VARNISH_BACKEND_CONNECTIONS < 64 )); then VARNISH_BACKEND_CONNECTIONS=64; fi
+if (( VARNISH_BACKEND_CONNECTIONS > 256 )); then VARNISH_BACKEND_CONNECTIONS=256; fi
 
 install -m 0644 "${SOURCE_DIR}/deploy/varnish/streamforge.vcl" /etc/varnish/streamforge.vcl
+sed -i "s/^[[:space:]]*\.max_connections = 256;/    .max_connections = ${VARNISH_BACKEND_CONNECTIONS};/" \
+  /etc/varnish/streamforge.vcl
 
 install -d -m 0755 /etc/systemd/system/varnish.service.d
 cat > /etc/systemd/system/varnish.service.d/streamforge.conf <<EOF
@@ -1141,7 +1239,13 @@ printf '  Install mode:     %s\n' "$(if [[ "${FRESH_INSTALL}" == "1" ]]; then pr
 printf '  Network device:   %s\n' "${PRIMARY_INTERFACE}"
 printf '  Link bandwidth:   %s Mbps — %s\n' "${BANDWIDTH_MBIT}" "${BANDWIDTH_SOURCE}"
 printf '  Media workers:    %s\n' "${WORKERS}"
+printf '  Admission mode:   %s\n' "$(if [[ "${ADMISSION_MODE}" == "unlimited" ]]; then printf 'unlimited (no application cap; physical capacity still applies)'; else printf 'capacity-capped'; fi)"
+printf '  VPS CPU profile:  pinning=%s, SQPOLL=%s, FD limit=%s\n' \
+  "$([[ "${WORKER_CPU_PINNING}" == "1" ]] && printf on || printf off)" \
+  "$([[ "${ENABLE_SQPOLL}" == "1" ]] && printf on || printf off)" "${NOFILE}"
 printf '  HLS shared cache:  Varnish, %s MB RAM, 127.0.0.1:6081 (.ts 1h; media playlists 1s; masters 30s)\n' "${VARNISH_CACHE_MB}"
+printf '  Origin protection: %s concurrent Varnish cache misses; cache hits remain unlimited\n' \
+  "${VARNISH_BACKEND_CONNECTIONS}"
 if [[ "${ENABLE_DISK_GUARD}" == "1" ]]; then
   printf '  Disk guard:        every 5m; cleanup at %s%% or <%s MB free, target %s%%\n' \
     "${DISK_TRIGGER_PERCENT}" "${DISK_MIN_FREE_MB}" "${DISK_TARGET_PERCENT}"
@@ -1155,10 +1259,10 @@ else
 fi
 if [[ "${BITRATE_MODE}" == "auto" ]]; then
   printf '  Bitrate source:   OBS/transcoder traffic, measured after publishing starts\n'
-  printf '  Safety ceiling:   %s viewers (resources sized at %s Mbps; media is not altered)\n' \
+  printf '  Capacity estimate: %s viewers (resources sized at %s Mbps; media is not altered)\n' \
     "${MAX_VIEWERS}" "${CAPACITY_STREAM_MBIT}"
 else
-  printf '  Capacity ceiling: %s viewers at %s Mbps (%s%% link, %s%% overhead)\n' \
+  printf '  Capacity estimate: %s viewers at %s Mbps (%s%% link, %s%% overhead)\n' \
     "${MAX_VIEWERS}" "${CAPACITY_STREAM_MBIT}" "${LINK_UTILIZATION_PERCENT}" "${PROTOCOL_OVERHEAD_PERCENT}"
 fi
 if [[ "${ENABLE_FAIR_QUEUE}" == "1" ]]; then

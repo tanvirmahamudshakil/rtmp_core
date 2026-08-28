@@ -17,6 +17,7 @@
 #include <unistd.h>
 
 #include <chrono>
+#include <limits>
 #include <string>
 #include <thread>
 #include <vector>
@@ -87,6 +88,18 @@ TEST(WorkerPoolTest, EffectiveWorkerCountClampsToConfiguredMaximum) {
     config.worker_ring_count = 100;
     config.max_worker_ring_count = 4;
     EXPECT_EQ(WorkerPool::effective_worker_count(config), 4u);
+}
+
+TEST(WorkerPoolTest, UnlimitedConnectionLimitDoesNotOverflowWhenSplitAcrossWorkers) {
+    constexpr auto unlimited = std::numeric_limits<std::uint32_t>::max();
+    EXPECT_EQ(WorkerPool::per_worker_connection_limit(unlimited, 1), unlimited);
+    EXPECT_EQ(WorkerPool::per_worker_connection_limit(unlimited, 2), 2147483648U);
+    EXPECT_EQ(WorkerPool::per_worker_connection_limit(unlimited, 8), 536870912U);
+}
+
+TEST(WorkerPoolTest, ConnectionLimitUsesCeilingDivision) {
+    EXPECT_EQ(WorkerPool::per_worker_connection_limit(10, 3), 4U);
+    EXPECT_EQ(WorkerPool::per_worker_connection_limit(1, 0), 1U);
 }
 
 TEST(WorkerPoolTest, RunAcceptsRealConnectionsThenStopsGracefully) {

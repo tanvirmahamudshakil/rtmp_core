@@ -99,8 +99,19 @@ void SegmentStore::append_fallback_if_due_locked() {
     // unboundedly -- eviction drops the excess immediately after each append.
     const std::size_t max_backfill =
         std::max<std::size_t>(1, config_.live_window_segments + config_.retention_grace_segments);
-    const auto missed_intervals = static_cast<std::size_t>(elapsed.count() / interval.count());
-    const std::size_t backfill_count = std::min(std::max<std::size_t>(1, missed_intervals), max_backfill);
+    // steady_clock's native tick is commonly nanoseconds while Segment::duration
+    // is milliseconds. Dividing the raw counts treated a 35ms outage as tens
+    // of thousands of missed 20ms segments and immediately filled/evicted an
+    // entire live window with fallback copies. Convert to one unit first so
+    // the playlist advances by the number of media intervals that actually
+    // elapsed.
+    const auto elapsed_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(elapsed);
+    const auto initial_cadence = interval + initial_grace;
+    const auto missed_intervals = static_cast<std::size_t>(
+        elapsed_ms.count() / std::max<std::int64_t>(1, initial_cadence.count()));
+    const std::size_t backfill_count =
+        std::min(std::max<std::size_t>(1, missed_intervals), max_backfill);
 
     for (std::size_t appended = 0; appended < backfill_count; ++appended) {
         const auto next = segments_.back()->sequence + 1;

@@ -13,13 +13,23 @@ core::SharedBuffer SharedMediaFrame::wire_bytes(std::uint32_t chunk_size,
     // a GOP cache from multiplying its memory footprint under adversarial
     // message-stream IDs.
     constexpr std::size_t kMaximumCachedEncodings = 2;
+    const auto matches = [=](const WireEncoding& entry) {
+        return entry.chunk_size == chunk_size && entry.chunk_stream_id == chunk_stream_id &&
+               entry.message_stream_id == message_stream_id;
+    };
+
+    // Lock-free dominant hit path. The entry is immutable and WireCache owns
+    // it until no SharedMediaFrame can call this function anymore.
+    if (const auto* primary = wire_cache_->primary.load(std::memory_order_acquire);
+        primary != nullptr && matches(*primary)) {
+        return primary->bytes;
+    }
+
     std::lock_guard lock(wire_cache_->mutex);
 
     for (const auto& entry : wire_cache_->entries) {
-        if (entry.chunk_size == chunk_size &&
-            entry.chunk_stream_id == chunk_stream_id &&
-            entry.message_stream_id == message_stream_id) {
-            return entry.bytes;
+        if (matches(*entry)) {
+            return entry->bytes;
         }
     }
 
@@ -32,8 +42,13 @@ core::SharedBuffer SharedMediaFrame::wire_bytes(std::uint32_t chunk_size,
                                              timestamp, payload.view(), encoded);
     auto shared = core::SharedBuffer::adopt(std::move(encoded));
     if (wire_cache_->entries.size() < kMaximumCachedEncodings) {
-        wire_cache_->entries.push_back(
+        auto entry = std::make_unique<WireEncoding>(
             WireEncoding{chunk_size, chunk_stream_id, message_stream_id, shared});
+        const auto* published = entry.get();
+        wire_cache_->entries.push_back(std::move(entry));
+        if (wire_cache_->primary.load(std::memory_order_relaxed) == nullptr) {
+            wire_cache_->primary.store(published, std::memory_order_release);
+        }
     }
     return shared;
 }

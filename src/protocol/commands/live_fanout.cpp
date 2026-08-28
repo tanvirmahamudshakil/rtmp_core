@@ -48,18 +48,20 @@ std::vector<LiveFanout::PendingDelivery> LiveFanout::dispatch_locked(StreamState
                                                                       bool is_video, bool is_audio, bool is_keyframe,
                                                                       StreamId stream_id) {
     std::vector<PendingDelivery> deliveries;
-    std::vector<std::uint64_t> evict_ids;
     deliveries.reserve(state.subscribers.size());
 
     PendingDelivery::Kind kind = is_video   ? PendingDelivery::Kind::Video
                                   : is_audio ? PendingDelivery::Kind::Audio
                                              : PendingDelivery::Kind::Metadata;
 
-    for (auto& [id, sub] : state.subscribers) {
+    for (auto it = state.subscribers.begin(); it != state.subscribers.end();) {
+        const auto id = it->first;
+        auto& sub = it->second;
         auto decision = sub.queue.offer(0, frame.payload.size(), is_video, is_keyframe);
         switch (decision) {
             case ViewerQueue::Decision::Deliver:
                 deliveries.push_back(PendingDelivery{id, sub.sink, kind, std::nullopt, std::nullopt, &frame});
+                ++it;
                 break;
             case ViewerQueue::Decision::DeliverResumed: {
                 // This viewer was stalled in WaitingForKeyframe and just got
@@ -69,6 +71,7 @@ std::vector<LiveFanout::PendingDelivery> LiveFanout::dispatch_locked(StreamState
                 if (state.video_sequence_header) delivery.resend_video_seq_header = state.video_sequence_header;
                 if (state.audio_sequence_header) delivery.resend_audio_seq_header = state.audio_sequence_header;
                 deliveries.push_back(std::move(delivery));
+                ++it;
                 break;
             }
             case ViewerQueue::Decision::DropAndWait:
@@ -85,25 +88,22 @@ std::vector<LiveFanout::PendingDelivery> LiveFanout::dispatch_locked(StreamState
                     metrics_->increment(is_video ? observability::MetricId::DroppedVideoFrames
                                                  : observability::MetricId::DroppedAudioFrames);
                 }
+                ++it;
                 break;
-            case ViewerQueue::Decision::Evict:
-                evict_ids.push_back(id);
+            case ViewerQueue::Decision::Evict: {
+                auto* sink = sub.sink;
+                deliveries.push_back(PendingDelivery{id, sink, PendingDelivery::Kind::Evict, std::nullopt,
+                                                      std::nullopt, nullptr});
+                it = state.subscribers.erase(it);
+                if (metrics_ != nullptr) {
+                    metrics_->increment(observability::MetricId::SlowViewerEvictions);
+                    metrics_->increment(observability::MetricId::ViewerDisconnects);
+                    metrics_->add(observability::MetricId::ActiveViewers, -1);
+                }
+                if (subscription_hook_) subscription_hook_(stream_id, -1);
                 break;
+            }
         }
-    }
-
-    for (auto id : evict_ids) {
-        auto it = state.subscribers.find(id);
-        if (it == state.subscribers.end()) continue;
-        deliveries.push_back(PendingDelivery{id, it->second.sink, PendingDelivery::Kind::Evict, std::nullopt,
-                                              std::nullopt, nullptr});
-        state.subscribers.erase(it);
-        if (metrics_ != nullptr) {
-            metrics_->increment(observability::MetricId::SlowViewerEvictions);
-            metrics_->increment(observability::MetricId::ViewerDisconnects);
-            metrics_->add(observability::MetricId::ActiveViewers, -1);
-        }
-        if (subscription_hook_) subscription_hook_(stream_id, -1);
     }
 
     return deliveries;
@@ -116,15 +116,6 @@ void LiveFanout::run_deliveries(StreamId stream_id, const std::shared_ptr<Stream
     // frame — at 1,000 viewers that is the difference between 1 and 1,000
     // contended RMWs on the same cache line per media frame.
     std::uint64_t egress_bytes = 0;
-    struct DeliveryResult {
-        std::uint64_t subscriber_id;
-        PlaybackSink* sink;
-        PendingDelivery::Kind kind;
-        bool delivered;
-    };
-    std::vector<DeliveryResult> results;
-    results.reserve(deliveries.size());
-
     for (auto& delivery : deliveries) {
         if (delivery.resend_video_seq_header) {
             if (delivery.sink->on_video(*delivery.resend_video_seq_header)) {
@@ -153,7 +144,7 @@ void LiveFanout::run_deliveries(StreamId stream_id, const std::shared_ptr<Stream
         }
         if (delivery.kind != PendingDelivery::Kind::Evict) {
             if (delivered) egress_bytes += delivery.frame->payload.size();
-            results.push_back(DeliveryResult{delivery.subscriber_id, delivery.sink, delivery.kind, delivered});
+            delivery.delivered = delivered;
         }
     }
 
@@ -163,7 +154,8 @@ void LiveFanout::run_deliveries(StreamId stream_id, const std::shared_ptr<Stream
     std::vector<PlaybackSink*> transport_evictions;
     {
         std::lock_guard<std::mutex> lock(state->mutex);
-        for (const auto& result : results) {
+        for (const auto& result : deliveries) {
+            if (result.kind == PendingDelivery::Kind::Evict) continue;
             auto it = state->subscribers.find(result.subscriber_id);
             // A callback may unsubscribe itself. Subscriber IDs are
             // generation-unique, and checking the pointer also prevents a

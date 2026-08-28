@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -60,8 +61,11 @@ private:
         core::SharedBuffer bytes;
     };
     struct WireCache {
+        // Dominant encoding reads happen once per viewer per frame. Publish
+        // an immutable pointer owned by entries so cache hits need no mutex.
+        std::atomic<const WireEncoding*> primary{nullptr};
         std::mutex mutex;
-        std::vector<WireEncoding> entries;
+        std::vector<std::unique_ptr<WireEncoding>> entries;
     };
 
     // shared_ptr preserves cache identity when a frame is copied into the

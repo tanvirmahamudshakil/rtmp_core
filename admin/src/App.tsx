@@ -507,7 +507,17 @@ function Overview({
   const utilization = Math.min((egress / (bandwidth * 1e6)) * 100, 999);
   const coresAvailable = metric(snapshot, "cpu_cores_available") || 1;
   const cpuCoresUsed = metric(snapshot, "worker_cpu_usage") / 1000;
-  const cpuPercent = Math.min((cpuCoresUsed / coresAvailable) * 100, 999);
+  const processCpuPercent = Math.min((cpuCoresUsed / coresAvailable) * 100, 999);
+  const cpuCoreUsage = Object.entries(snapshot.metrics)
+    .flatMap(([name, value]) => {
+      const match = name.match(/^system_cpu_core_usage_milli_percent:(\d+)$/);
+      return match ? [{ core: Number(match[1]), percent: Math.min(value / 1000, 100) }] : [];
+    })
+    .sort((left, right) => left.core - right.core);
+  const hostCpuMeasured = cpuCoreUsage.length > 0;
+  const cpuPercent = hostCpuMeasured
+    ? Math.min(metric(snapshot, "system_cpu_usage_milli_percent") / 1000, 100)
+    : processCpuPercent;
   const links = buildLinkRows(snapshot.streams, sourceJobs, streamBandwidth, sourceBandwidth);
   return (
     <>
@@ -521,9 +531,37 @@ function Overview({
         <MetricCard icon={<ArrowUpRight size={20} />} label="Bandwidth out" value={bitrate(egress)}
           helper={`${utilization.toFixed(1)}% uplink · ${edgeStatsAvailable ? "cache hits included" : "origin traffic only"}`} tone="blue" />
         <MetricCard icon={<Cpu size={20} />} label="CPU load"
-          value={`${cpuPercent.toFixed(0)}%`}
-          helper={`${cpuCoresUsed.toFixed(2)} / ${compact(coresAvailable)} cores · ${bytes(metric(snapshot, "process_memory_bytes"))} RSS`}
+          value={`${cpuPercent.toFixed(1)}%`}
+          helper={hostCpuMeasured
+            ? `Host total · process ${processCpuPercent.toFixed(1)}% (${cpuCoresUsed.toFixed(2)} cores)`
+            : `Process ${cpuCoresUsed.toFixed(2)} / ${compact(coresAvailable)} cores · host counters unavailable`}
           tone="purple" />
+      </section>
+
+      <section className="panel cpu-panel">
+        <div className="panel-heading">
+          <div><span className="eyebrow">LIVE CPU</span><h2>Usage by logical core</h2></div>
+          <span className="cpu-summary">
+            {hostCpuMeasured ? `${cpuPercent.toFixed(1)}% total · ${cpuCoreUsage.length} cores` : "Linux kernel counters unavailable"}
+          </span>
+        </div>
+        {hostCpuMeasured ? (
+          <div className="cpu-core-grid">
+            {cpuCoreUsage.map(({ core, percent }) => (
+              <div className="cpu-core" key={core} aria-label={`CPU core ${core}: ${percent.toFixed(1)} percent`}>
+                <div><span>Core {core}</span><strong>{percent.toFixed(1)}%</strong></div>
+                <span className="cpu-core-track" aria-hidden="true">
+                  <span style={{ width: `${percent}%` }} />
+                </span>
+              </div>
+            ))}
+          </div>
+        ) : (
+          <p className="cpu-empty">Per-core data appears on Linux after the first metrics sample.</p>
+        )}
+        <div className="cpu-footnote">
+          <Activity size={14} /> Kernel scheduler counters over the latest dashboard sampling window; process CPU is shown separately above.
+        </div>
       </section>
 
       <section className="overview-grid">
@@ -1161,6 +1199,9 @@ function CapacityPage({
 }
 
 function SystemPage({ snapshot }: { snapshot: Snapshot }) {
+  const coresAvailable = metric(snapshot, "cpu_cores_available") || 1;
+  const processCpuPercent = metric(snapshot, "worker_cpu_usage") / (coresAvailable * 10);
+  const hostCpuPercent = metric(snapshot, "system_cpu_usage_milli_percent") / 1000;
   const items = [
     ["RTMP transport", "io_uring / SO_REUSEPORT", "Operational", <Zap size={19} />],
     ["Control database", "SQLite WAL · local disk", "Ready", <Database size={19} />],
@@ -1186,8 +1227,9 @@ function SystemPage({ snapshot }: { snapshot: Snapshot }) {
         <section className="panel">
           <div className="panel-heading"><div><span className="eyebrow">RESOURCE SNAPSHOT</span><h2>Process telemetry</h2></div></div>
           <div className="telemetry-grid">
-            <div><span>CPU usage</span><strong>{(metric(snapshot, "worker_cpu_usage") / ((metric(snapshot, "cpu_cores_available") || 1) * 10)).toFixed(1)}%</strong></div>
-            <div><span>CPU cores</span><strong>{compact(metric(snapshot, "cpu_cores_available") || 1)}</strong></div>
+            <div><span>Host CPU</span><strong>{hostCpuPercent.toFixed(1)}%</strong></div>
+            <div><span>Process CPU</span><strong>{processCpuPercent.toFixed(1)}%</strong></div>
+            <div><span>CPU cores</span><strong>{compact(coresAvailable)}</strong></div>
             <div><span>Memory RSS</span><strong>{bytes(metric(snapshot, "process_memory_bytes"))}</strong></div>
             <div><span>GOP cache</span><strong>{bytes(metric(snapshot, "gop_cache_bytes"))}</strong></div>
             <div><span>Egress total</span><strong>{bytes(metric(snapshot, "egress_bytes_total"))}</strong></div>

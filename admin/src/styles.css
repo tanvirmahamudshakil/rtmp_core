@@ -593,6 +593,49 @@ button:focus-visible, input:focus-visible, select:focus-visible {
 .metric-copy small { color: #98a2b3; font-size: 10px; }
 .sparkline { position: absolute; right: 0; bottom: 0; width: 45%; height: 48px; opacity: .62; }
 
+.cpu-panel { margin-bottom: 18px; }
+.cpu-summary { color: var(--muted); font-size: 11px; font-weight: 700; }
+.cpu-core-grid {
+  padding: 18px 22px;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(118px, 1fr));
+  gap: 11px;
+}
+.cpu-core {
+  min-width: 0;
+  padding: 12px;
+  background: var(--surface-2);
+  border: 1px solid #edf0f4;
+  border-radius: 10px;
+}
+.cpu-core > div { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.cpu-core span { color: var(--muted); font-size: 10px; font-weight: 700; }
+.cpu-core strong { font-size: 12px; }
+.cpu-core-track {
+  height: 6px;
+  margin-top: 9px;
+  display: block;
+  overflow: hidden;
+  background: #e9e5f5;
+  border-radius: 999px;
+}
+.cpu-core-track > span {
+  height: 100%;
+  display: block;
+  background: linear-gradient(90deg, #8b5cf6, #6941c6);
+  border-radius: inherit;
+  transition: width .45s ease;
+}
+.cpu-footnote {
+  padding: 0 22px 17px;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  color: #98a2b3;
+  font-size: 9px;
+}
+.cpu-empty { margin: 0; padding: 22px; color: var(--muted); font-size: 11px; }
+
 .overview-grid {
   display: grid;
   grid-template-columns: minmax(0, 1.55fr) minmax(330px, 1fr);

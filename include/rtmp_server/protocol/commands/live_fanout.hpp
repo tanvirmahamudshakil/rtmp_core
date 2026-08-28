@@ -241,6 +241,9 @@ private:
         // outlives every callback. This avoids one shared_ptr refcount RMW per
         // viewer on the hottest fan-out path.
         const SharedMediaFrame* frame; // null for Evict
+        // Reuse this delivery record for post-callback backpressure folding;
+        // avoids allocating a second result vector for every media frame.
+        bool delivered = false;
     };
 
     // Looks up (or creates) the StreamState node for `id`. The returned

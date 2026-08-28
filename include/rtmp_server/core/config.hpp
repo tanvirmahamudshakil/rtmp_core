@@ -115,8 +115,11 @@ struct ServerConfig {
     std::uint64_t gop_cache_max_bytes = 16 * 1024 * 1024;
     std::uint32_t gop_cache_max_packets = 2000;
 
-    std::uint64_t subscriber_queue_max_bytes = 8 * 1024 * 1024;
-    std::uint32_t subscriber_queue_max_packets = 1000;
+    // A few seconds of common live-video bitrate: enough for transient
+    // jitter, but small enough that thousands of slow viewers cannot retain
+    // many GiB before keyframe recovery/eviction activates.
+    std::uint64_t subscriber_queue_max_bytes = 4 * 1024 * 1024;
+    std::uint32_t subscriber_queue_max_packets = 512;
 
     std::string recording_directory = "./recordings";
     bool recording_enabled = false;

@@ -2,10 +2,13 @@
 
 #include <algorithm>
 #include <array>
+#include <numeric>
 
 #include "rtmp_server/transcoding/native/aac_params.hpp"
+#include "rtmp_server/transcoding/native/frame.hpp"
 #include "rtmp_server/transcoding/native/geometry.hpp"
 #include "rtmp_server/transcoding/native/hevc_params.hpp"
+#include "rtmp_server/transcoding/native/source_transcoder.hpp"
 #include "rtmp_server/transcoding/preset.hpp"
 #ifdef RTMP_NATIVE_TRANSCODE
 #include <cmath>
@@ -13,12 +16,10 @@
 
 #include "rtmp_server/transcoding/native/aac_decoder.hpp"
 #include "rtmp_server/transcoding/native/aac_encoder.hpp"
-#include "rtmp_server/transcoding/native/frame.hpp"
 #include "rtmp_server/transcoding/native/h264_decoder.hpp"
 #include "rtmp_server/transcoding/native/h264_encoder.hpp"
 #include "rtmp_server/transcoding/native/hevc_encoder.hpp"
 #include "rtmp_server/transcoding/native/scaler.hpp"
-#include "rtmp_server/transcoding/native/source_transcoder.hpp"
 #endif
 
 namespace {
@@ -180,6 +181,56 @@ TEST(NativeAacParams, RespectsExplicitProfileWhenAutoDisabled) {
     quality.allow_auto_profile = false;
     const auto set = build_aac_param_set(preset, quality, 44100, 2);
     EXPECT_EQ(set.profile, AacProfile::LowComplexity);
+}
+
+TEST(YuvFrameTest, ReusesSameGeometryWithoutClearingTheHotBuffer) {
+    YuvFrame frame;
+    frame.allocate(1920, 1080);
+    ASSERT_FALSE(frame.y.empty());
+    auto* const y_storage = frame.y.data();
+    frame.y.front() = 91;
+    frame.u.front() = 37;
+
+    frame.allocate(1920, 1080);
+
+    EXPECT_EQ(frame.y.data(), y_storage);
+    EXPECT_EQ(frame.y.front(), 91);
+    EXPECT_EQ(frame.u.front(), 37);
+}
+
+TEST(NativeSourceTranscoderThreads, RespectsTheWholeJobBudgetAcrossRenditions) {
+    const std::vector<RenditionSpec> renditions = {
+        {"1080p-a", "a", 1920, 1080},
+        {"1080p-b", "b", 1920, 1080},
+        {"1080p-c", "c", 1920, 1080},
+    };
+
+    const auto threads = allocate_rendition_video_threads(renditions, 1920, 1080, 8);
+    ASSERT_EQ(threads.size(), 3U);
+    EXPECT_EQ(std::accumulate(threads.begin(), threads.end(), 0U), 8U);
+    EXPECT_LE(*std::max_element(threads.begin(), threads.end()) -
+                  *std::min_element(threads.begin(), threads.end()),
+              1U);
+}
+
+TEST(NativeSourceTranscoderThreads, ResolvesMatchSourceGeometryBeforeWeighting) {
+    const std::vector<RenditionSpec> renditions = {
+        {"source", "source", 0, 0},
+        {"360p", "small", 640, 360},
+    };
+
+    const auto threads = allocate_rendition_video_threads(renditions, 1920, 1080, 6);
+    ASSERT_EQ(threads.size(), 2U);
+    EXPECT_EQ(std::accumulate(threads.begin(), threads.end(), 0U), 6U);
+    EXPECT_GT(threads[0], threads[1]);
+}
+
+TEST(NativeSourceTranscoderThreads, UsesOuterPoolAsTheLimitWhenRenditionsExceedCores) {
+    const std::vector<RenditionSpec> renditions(6, RenditionSpec{});
+    const auto threads = allocate_rendition_video_threads(renditions, 1280, 720, 4);
+    EXPECT_TRUE(std::all_of(threads.begin(), threads.end(), [](std::uint32_t value) {
+        return value == 1;
+    }));
 }
 
 #ifdef RTMP_NATIVE_TRANSCODE

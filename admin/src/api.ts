@@ -203,6 +203,15 @@ const demoMetrics: Record<string, number> = {
   slow_viewer_evictions: 2,
   process_memory_bytes: 1288490188,
   worker_cpu_usage: 6720,
+  system_cpu_usage_milli_percent: 62800,
+  "system_cpu_core_usage_milli_percent:0": 71000,
+  "system_cpu_core_usage_milli_percent:1": 58400,
+  "system_cpu_core_usage_milli_percent:2": 82200,
+  "system_cpu_core_usage_milli_percent:3": 49700,
+  "system_cpu_core_usage_milli_percent:4": 66300,
+  "system_cpu_core_usage_milli_percent:5": 54100,
+  "system_cpu_core_usage_milli_percent:6": 73800,
+  "system_cpu_core_usage_milli_percent:7": 47000,
   cpu_cores_available: 8,
   gop_cache_bytes: 38482944
 };
@@ -211,10 +220,17 @@ function parsePrometheus(text: string): Record<string, number> {
   const metrics: Record<string, number> = {};
   for (const line of text.split("\n")) {
     if (!line || line.startsWith("#")) continue;
-    const match = line.match(/^([a-zA-Z_:][a-zA-Z0-9_:]*)(?:\{[^}]*\})?\s+(-?(?:\d+\.?\d*|\.\d+))/);
+    const match = line.match(/^([a-zA-Z_:][a-zA-Z0-9_:]*)(?:\{([^}]*)\})?\s+(-?(?:\d+\.?\d*|\.\d+))/);
     if (!match) continue;
-    const value = Number(match[2]);
+    const value = Number(match[3]);
     if (!Number.isFinite(value)) continue;
+    if (match[1] === "system_cpu_core_usage_milli_percent" && match[2]) {
+      const core = match[2].match(/(?:^|,)core="(\d+)"(?:,|$)/);
+      if (core) {
+        metrics[`${match[1]}:${core[1]}`] = value;
+        continue;
+      }
+    }
     metrics[match[1]] = (metrics[match[1]] ?? 0) + value;
   }
   return metrics;

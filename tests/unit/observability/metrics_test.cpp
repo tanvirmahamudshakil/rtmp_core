@@ -243,6 +243,9 @@ TEST(MetricsExportTest, PrometheusRenderingHasHelpTypeAndValueForEveryMetric) {
     EXPECT_NE(text.find("connections_per_worker{worker=\"2\"} 9"), std::string::npos);
     EXPECT_EQ(text.find("connections_per_worker{worker=\"5\"}"), std::string::npos);
 
+    EXPECT_NE(text.find("# TYPE system_cpu_usage_milli_percent gauge"), std::string::npos);
+    EXPECT_NE(text.find("# TYPE system_cpu_core_usage_milli_percent gauge"), std::string::npos);
+
     EXPECT_NE(text.find("\nmanagement_create_stream_total 4\n"), std::string::npos);
 
     // No metric line may contain a raw identifier-looking label.

@@ -7,6 +7,10 @@ add_library(rtmp_server_transcoding STATIC
     native/hevc_params.cpp
     native/aac_params.cpp
     native/hls_playlist.cpp
+    # Pure CPU-budget allocation for a source rendition ladder. Kept outside
+    # the codec-library gate so oversubscription policy is unit-tested even on
+    # development hosts without libyuv/x264.
+    native/source_thread_budget.cpp
     # Pure RFC 6381 CODECS derivation for the master playlist. Depends only
     # on aac_params above, so it compiles and is tested without the codec
     # libraries even though what it describes is produced by them.

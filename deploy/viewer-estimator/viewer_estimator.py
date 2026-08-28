@@ -30,10 +30,10 @@ WRITE_INTERVAL_SECONDS = 2
 BITRATE_WINDOW_SECONDS = 10
 try:
     MAX_SESSIONS_PER_STREAM = max(
-        1, min(10_000_000, int(os.environ.get("RTMP_SERVER_MAXIMUM_VIEWERS_PER_STREAM", "2000000")))
+        1, min(2_000_000, int(os.environ.get("STREAMFORGE_MAX_TRACKED_VIEWERS_PER_STREAM", "200000")))
     )
 except ValueError:
-    MAX_SESSIONS_PER_STREAM = 2_000_000
+    MAX_SESSIONS_PER_STREAM = 200_000
 OUTPUT_PATH = "/var/www/streamforge/internal/viewer_estimate.json"
 PATH_RE = re.compile(r"^/hls/([^/]+)/([^/]+)/(index\.m3u8|segment-[^/]+\.ts)$")
 SESSION_RE = re.compile(r"^[0-9a-f]{32}$")

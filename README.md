@@ -16,7 +16,7 @@ Ubuntu 24.04+ or Debian 13+ with systemd:
 ```bash
 git clone https://github.com/tanvirmahamudshakil/rtmp_core.git
 cd rtmp_core
-sudo env RTMP_BANDWIDTH_MBIT=auto bash scripts/install-linux.sh
+sudo bash scripts/install-linux.sh
 ```
 
 The installer performs a full clean install by default. On every run it stops
@@ -33,7 +33,11 @@ is ready to let Caddy provision HTTPS automatically.
 The installer builds the hardened production binary and admin panel, installs
 Caddy with automatic HTTPS, creates an isolated system user, generates
 secrets, configures systemd and conservative kernel networking baselines,
-detects the public network interface, and runs a readiness check.
+detects CPU, RAM, virtualization, the public network interface and link speed,
+then runs a readiness check. On a virtual VPS it leaves CPU placement to the
+hypervisor-aware scheduler and disables SQPOLL's dedicated polling threads; on
+bare metal it enables pinning and SQPOLL. Receive-buffer memory, Varnish cache,
+worker count and file-descriptor limits are derived from the detected host.
 
 On dedicated VPS hosts it disables per-request Varnish log consumers. Reading
 every segment hit is itself expensive at large audience sizes; aggregate
@@ -66,10 +70,11 @@ sudo env \
 Use `RTMP_ENABLE_FAST_JOIN=0` when that deployment does not have a dedicated
 startup rendition.
 
-`RTMP_BANDWIDTH_MBIT=auto` reads the primary NIC's reported link speed using
-Linux sysfs/ethtool. On virtual VPS interfaces that number can be higher than
-the bandwidth purchased from the provider, so set the committed Mbps
-explicitly whenever it differs.
+Bandwidth detection is automatic. The installer reads the primary NIC's link
+speed using Linux sysfs/ethtool; a virtual NIC that hides it gets a non-blocking
+20 Gbps planning fallback. Virtual-interface speeds can also be higher than
+the bandwidth purchased from the provider, so set the committed Mbps with
+`RTMP_BANDWIDTH_MBIT` whenever it differs.
 
 Stream bitrate is automatic by default. The server is a media passthrough: it
 does not re-encode or force a bitrate, so viewers receive the bitrate sent by
@@ -79,17 +84,20 @@ measured ingress per active publisher. The live estimate refreshes with the
 server metrics.
 
 Before the first publisher connects there is no bitrate to measure, but the
-installer still has to create finite socket, buffer and file-descriptor safety
-limits. It uses `RTMP_RESOURCE_SIZING_MBIT=0.50` only for that pre-live
-resource ceiling; this value never alters the media. An advanced operator can
-change that sizing floor, or supply a numeric `RTMP_EXPECTED_STREAM_MBIT` as a
-backward-compatible capacity override. The capacity relationship is:
+installer still has to size finite RAM, socket and file-descriptor resources.
+It uses `RTMP_RESOURCE_SIZING_MBIT=3` only for that pre-live capacity estimate;
+this value never alters the media. Application admission is unlimited by
+default (`RTMP_ADMISSION_MODE=unlimited`), so the calculated value is not an
+artificial user cap. Use `RTMP_ADMISSION_MODE=capacity` only when the link
+estimate should also be enforced as a hard admission limit. An advanced
+operator can change the sizing floor, or supply a numeric
+`RTMP_EXPECTED_STREAM_MBIT` as a capacity override. The relationship is:
 
 ```text
 viewer budget = bandwidth × utilization ÷ (per-viewer bitrate × protocol overhead)
 ```
 
-The default high-density target uses 90% link utilization and 5% overhead;
+The default high-density target uses 90% link utilization and 8% overhead;
 both are configurable. Fair egress shaping is enabled by default so the queue
 stays on the VPS, existing viewers cannot consume the last part of the uplink,
 and a new viewer's playlist/first segment receives a fair turn. It uses CAKE

@@ -81,6 +81,17 @@ public:
         return write_queue_.size();
     }
 
+    struct WriteBacklog {
+        std::size_t bytes = 0;
+        std::size_t packets = 0;
+    };
+    // Hot playback path needs both values for every viewer/frame. Snapshot
+    // them under one mutex acquisition instead of calling both accessors.
+    [[nodiscard]] WriteBacklog pending_write_backlog() const noexcept {
+        std::lock_guard<std::mutex> lock(write_mutex_);
+        return WriteBacklog{queued_bytes_, write_queue_.size()};
+    }
+
     // Pops the next queued buffer for submission, or an empty SharedBuffer
     // if the queue is empty. The event loop drives one send at a time per
     // connection to preserve RTMP message/chunk order.

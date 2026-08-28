@@ -229,6 +229,22 @@ TEST(CrossWorkerRouterTest, WakeFdBecomesReadableAfterForward) {
     EXPECT_TRUE(fd_is_readable(fd));
 }
 
+TEST(CrossWorkerRouterTest, CoalescesWakeSignalsWhileDestinationQueueIsAlreadyNonEmpty) {
+    CrossWorkerRouter router(2);
+    StreamId stream = StreamId::next();
+    router.note_subscription(1, stream, +1);
+
+    router.forward(0, stream, make_frame(1), true, false);
+    router.forward(0, stream, make_frame(2), true, false);
+    router.forward(0, stream, make_frame(3), true, false);
+
+    std::uint64_t wake_count = 0;
+    ASSERT_EQ(::read(router.wake_fd(1), &wake_count, sizeof(wake_count)),
+              static_cast<ssize_t>(sizeof(wake_count)));
+    EXPECT_EQ(wake_count, 1u);
+    EXPECT_EQ(router.drain(1).size(), 3u);
+}
+
 TEST(CrossWorkerRouterTest, OutOfRangeWorkerIdsAreIgnoredNotUb) {
     CrossWorkerRouter router(2);
     StreamId stream = StreamId::next();

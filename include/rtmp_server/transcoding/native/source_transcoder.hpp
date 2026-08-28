@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <variant>
@@ -42,6 +43,16 @@ struct RenditionSpec {
     std::uint32_t audio_bitrate = 128'000;
     FitMode fit_mode = FitMode::Stretch;
 };
+
+// Splits one job's hard CPU budget across its rendition encoders. The sum is
+// never above core_budget when all renditions can run concurrently; if there
+// are more renditions than cores, every encoder stays single-threaded and the
+// outer render pool limits how many run at once. Output geometry is resolved
+// from the real source size so a match-source rendition is not accidentally
+// treated as a tiny/zero-resolution output.
+[[nodiscard]] std::vector<std::uint32_t> allocate_rendition_video_threads(
+    std::span<const RenditionSpec> renditions, std::uint32_t source_width,
+    std::uint32_t source_height, std::uint32_t core_budget);
 
 // The FFmpeg-free source transcoder core. It decodes a source's H.264/AAC
 // elementary units once, then fans the decoded picture/PCM out to every
@@ -140,6 +151,7 @@ private:
     // 0 = use every core the machine reports; otherwise the ceiling this job
     // was allocated by its manager.
     std::uint32_t cpu_budget_ = 0;
+    std::uint32_t effective_core_budget_ = 1;
     std::vector<unsigned> pinned_cores_;
     // The H.264 branch (video_decoder_.emplace<H264Decoder>()) is unchanged
     // from before this variant existed: same type, same calls, same order.
@@ -167,6 +179,12 @@ private:
     // it as an unflagged discontinuity instead of waiting out the full
     // tolerance (see on_video's comment on the gate itself).
     std::int64_t consecutive_backward_drops_ = 0;
+
+    // Reused per-frame result slots. vector<bool> is intentionally avoided:
+    // separate rendition workers writing adjacent proxy bits can touch the
+    // same backing word and race.
+    std::vector<std::optional<core::Error>> frame_errors_;
+    bool video_threads_configured_ = false;
 
     // Scale+encode is CPU-bound per rendition; fanning renditions across a
     // pool (rather than looping them serially on this call's thread) is what

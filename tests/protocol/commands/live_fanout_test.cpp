@@ -555,6 +555,27 @@ TEST_F(LiveFanoutTest, WireEncodingIsComputedOnceAndSharedAcrossThousandsOfViewe
     EXPECT_NE(other_stream.view().data(), shared_address);
 }
 
+TEST_F(LiveFanoutTest, SharedWireEncodingIsStableUnderConcurrentFanoutReads) {
+    SharedMediaFrame frame = frame_of(
+        make_video(std::vector<std::byte>(32 * 1024, std::byte{0x3C}), 4321));
+    auto first = frame.wire_bytes(4096, 5, 1);
+    ASSERT_FALSE(first.empty());
+    const void* shared_address = first.view().data();
+
+    std::atomic<bool> mismatch{false};
+    std::vector<std::thread> readers;
+    for (int worker = 0; worker < 8; ++worker) {
+        readers.emplace_back([frame, shared_address, &mismatch] {
+            for (int viewer = 0; viewer < 2000; ++viewer) {
+                auto encoded = frame.wire_bytes(4096, 5, 1);
+                if (encoded.view().data() != shared_address) mismatch.store(true);
+            }
+        });
+    }
+    for (auto& reader : readers) reader.join();
+    EXPECT_FALSE(mismatch.load());
+}
+
 TEST_F(LiveFanoutTest, PermanentlySlowViewerDoesNotGrowMemoryUnboundedly) {
     // A viewer that never sends another keyframe-recoverable state: once
     // evicted, it must stay evicted (subscriber_count stays 0) no matter

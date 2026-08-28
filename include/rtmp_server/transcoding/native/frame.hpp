@@ -23,17 +23,26 @@ struct YuvFrame {
     std::int64_t pts_90k = 0; // presentation timestamp on the 90 kHz clock
 
     // Sizes the planes for a width x height I420 image with tightly packed
-    // strides (chroma dimensions rounded up). Existing capacity is reused.
+    // strides (chroma dimensions rounded up). Existing storage is reused and
+    // deliberately left untouched when the geometry is unchanged: every
+    // decoder/scaler caller overwrites the complete destination, so clearing
+    // a multi-megabyte 1080p/4K frame before writing it again only burns
+    // memory bandwidth on the live hot path.
     void allocate(std::uint32_t w, std::uint32_t h) {
+        const int next_y_stride = static_cast<int>(w);
+        const int next_uv_stride = static_cast<int>((w + 1) / 2);
+        const std::size_t chroma_h = (h + 1) / 2;
+        const std::size_t y_size = static_cast<std::size_t>(next_y_stride) * h;
+        const std::size_t uv_size = static_cast<std::size_t>(next_uv_stride) * chroma_h;
+
         width = w;
         height = h;
-        y_stride = static_cast<int>(w);
-        u_stride = static_cast<int>((w + 1) / 2);
+        y_stride = next_y_stride;
+        u_stride = next_uv_stride;
         v_stride = u_stride;
-        const std::size_t chroma_h = (h + 1) / 2;
-        y.assign(static_cast<std::size_t>(y_stride) * h, 0);
-        u.assign(static_cast<std::size_t>(u_stride) * chroma_h, 0);
-        v.assign(static_cast<std::size_t>(v_stride) * chroma_h, 0);
+        y.resize(y_size);
+        u.resize(uv_size);
+        v.resize(uv_size);
     }
 
     [[nodiscard]] bool empty() const noexcept { return width == 0 || height == 0; }

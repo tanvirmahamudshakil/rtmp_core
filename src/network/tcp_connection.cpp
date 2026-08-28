@@ -49,10 +49,11 @@ void TcpConnection::async_write(core::SharedBuffer buffer) {
         }
     }
     if (queue_overflow) {
+        const auto backlog = pending_write_backlog();
         RTMP_LOG(LogLevel::Warn, "tcp_connection", "write_queue_limit_exceeded",
                  {{"connection_id", std::to_string(connection_id_)},
-                  {"queued_bytes", std::to_string(pending_write_bytes())},
-                  {"queued_packets", std::to_string(pending_write_packets())}});
+                  {"queued_bytes", std::to_string(backlog.bytes)},
+                  {"queued_packets", std::to_string(backlog.packets)}});
         close();
         return;
     }

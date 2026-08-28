@@ -764,8 +764,9 @@ void IoUringEventLoop::start_rtmp_session(const std::shared_ptr<TcpConnection>& 
     // viewer's queue growth is visible to the drop decision.
     session->set_pending_queue_provider([weak_connection]() -> protocol::commands::QueueBacklog {
         auto conn = weak_connection.lock();
-        return conn ? protocol::commands::QueueBacklog{conn->pending_write_bytes(), conn->pending_write_packets()}
-                    : protocol::commands::QueueBacklog{};
+        if (!conn) return {};
+        const auto backlog = conn->pending_write_backlog();
+        return protocol::commands::QueueBacklog{backlog.bytes, backlog.packets};
     });
 
     protocol::session::RtmpConnectionSession* raw_session = session.get();

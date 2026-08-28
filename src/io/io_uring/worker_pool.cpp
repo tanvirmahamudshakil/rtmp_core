@@ -30,6 +30,13 @@ std::uint32_t WorkerPool::effective_worker_count(const core::ServerConfig& confi
     return count;
 }
 
+std::uint32_t WorkerPool::per_worker_connection_limit(std::uint32_t process_limit,
+                                                       std::uint32_t worker_count) {
+    if (worker_count == 0) worker_count = 1;
+    const auto wide_limit = static_cast<std::uint64_t>(process_limit);
+    return static_cast<std::uint32_t>((wide_limit + worker_count - 1U) / worker_count);
+}
+
 core::Result<void> WorkerPool::run() {
     std::uint32_t count = effective_worker_count(config_);
     router_ = std::make_unique<CrossWorkerRouter>(count);
@@ -60,7 +67,7 @@ core::Result<void> WorkerPool::run() {
         // maximum_connections is a process-level operator budget. Each loop
         // owns a private registry, so handing the full value to every worker
         // would multiply the advertised cap by worker count.
-        worker_config.maximum_connections = (config_.maximum_connections + count - 1) / count;
+        worker_config.maximum_connections = per_worker_connection_limit(config_.maximum_connections, count);
         auto loop = std::make_unique<IoUringEventLoop>(
             std::move(context_result).value(), std::move(worker_config), stream_registry_, stream_id_registry_,
             static_cast<CrossWorkerRouter::WorkerId>(i), router_.get(), /*enable_reuseport=*/true, services_);
