@@ -635,7 +635,7 @@ if [[ -n "${TRANSCODING_RULES}" ]]; then
   chmod 0640 /etc/rtmp-server/transcoding.conf
 fi
 install -m 0644 -o root -g root "${SOURCE_DIR}/docs/deployment.md" /usr/share/doc/rtmp-server/deployment.md
-install -m 0644 -o root -g root "${SOURCE_DIR}/docs/transcoding.md" /usr/share/doc/rtmp-server/transcoding.md
+install -m 0644 -o root -g root "${SOURCE_DIR}/docs/native-transcoding.md" /usr/share/doc/rtmp-server/transcoding.md
 cp -a "${SOURCE_DIR}/admin/dist/." /var/www/streamforge/
 install -d -m 0755 -o root -g root /var/www/streamforge/internal
 cat > /var/www/streamforge/runtime-config.json <<EOF
