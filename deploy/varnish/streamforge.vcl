@@ -64,8 +64,31 @@ sub vcl_backend_response {
         return (abandon);
     }
 
+    # Per-viewer responses stay uncacheable no matter their status: the
+    # session-assigning 302 redirect carries a Location/Set-Cookie unique to
+    # one player and must never be served to another.
+    if (beresp.http.Cache-Control ~ "(?i)(no-store|private)") {
+        set beresp.uncacheable = true;
+        set beresp.ttl = 0s;
+        return (deliver);
+    }
+
+    # Everything else that is NOT a 200 (404 for a segment that scrolled out
+    # of retention, 5xx during an origin hiccup) MUST get a short positive
+    # TTL, not `uncacheable = true`. An uncacheable object disables Varnish
+    # request coalescing for that URL, so during a 404/5xx burst every single
+    # player request is forwarded to the origin individually -- the exact
+    # thundering herd the cache exists to prevent. A 1s cache lets one origin
+    # request answer the whole burst.
+    if (beresp.status != 200) {
+        set beresp.ttl = 1s;
+        set beresp.grace = 1s;
+        set beresp.keep = 0s;
+        return (deliver);
+    }
+
     if (bereq.url ~ "/master\.m3u8(?:\?.*)?$") {
-        if (beresp.status == 200 && beresp.http.Cache-Control ~ "(?i)public") {
+        if (beresp.http.Cache-Control ~ "(?i)public") {
             set beresp.ttl = 30s;
             set beresp.grace = 1m;
             set beresp.keep = 5m;
@@ -75,7 +98,7 @@ sub vcl_backend_response {
             set beresp.uncacheable = true;
         }
     } elseif (bereq.url ~ "\.m3u8(?:\?.*)?$") {
-        if (beresp.status == 200 && beresp.http.Cache-Control ~ "(?i)public") {
+        if (beresp.http.Cache-Control ~ "(?i)public") {
             set beresp.ttl = 1s;
             set beresp.grace = 5s;
             set beresp.keep = 30s;
@@ -86,16 +109,11 @@ sub vcl_backend_response {
             set beresp.uncacheable = true;
         }
     } elseif (bereq.url ~ "\.ts(?:\?.*)?$") {
-        if (beresp.status == 200) {
-            set beresp.ttl = 1h;
-            set beresp.grace = 5m;
-            set beresp.keep = 1h;
-            # Coalesce a hot segment's initial burst into one origin fetch.
-            set beresp.do_stream = false;
-        } else {
-            set beresp.ttl = 0s;
-            set beresp.uncacheable = true;
-        }
+        set beresp.ttl = 1h;
+        set beresp.grace = 5m;
+        set beresp.keep = 1h;
+        # Coalesce a hot segment's initial burst into one origin fetch.
+        set beresp.do_stream = false;
     } else {
         set beresp.ttl = 0s;
         set beresp.uncacheable = true;

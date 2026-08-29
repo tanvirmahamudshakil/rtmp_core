@@ -953,6 +953,12 @@ net.ipv4.tcp_fastopen = 3
 # Global RFS flow table (per-queue slices are set by rtmp-network-tune). Sized
 # from core count; harmless on hosts where RPS/RFS is never engaged.
 net.core.rps_sock_flow_entries = $(( CPU_COUNT * 4096 ))
+# The Varnish HLS cache lives in RAM. Never let the kernel page it out to
+# swap to satisfy a transient allocation -- a swapped cache object is slower
+# than going back to the origin.
+vm.swappiness = 10
+vm.dirty_ratio = 40
+vm.dirty_background_ratio = 10
 EOF
 # Connection tracking, when the module is loaded (nftables/iptables present),
 # is a hidden per-viewer ceiling: the default table silently drops new flows
@@ -1086,6 +1092,12 @@ fi
 # Larger rx/tx rings absorb short bursts (viewer stampede, keyframe spikes)
 # without drops. Not all drivers/providers honour this value; ignored if not.
 ethtool -G "${RTMP_INTERFACE}" rx 4096 tx 4096 >/dev/null 2>&1 || true
+# Interrupt coalescing: at a large audience's packet rate, one IRQ per packet
+# burns a core on interrupt handling alone. Let the NIC batch them (adaptive
+# where supported, otherwise a fixed small delay). Best-effort; virtio often
+# ignores it.
+ethtool -C "${RTMP_INTERFACE}" adaptive-rx on adaptive-tx on >/dev/null 2>&1 ||
+  ethtool -C "${RTMP_INTERFACE}" rx-usecs 64 tx-usecs 64 >/dev/null 2>&1 || true
 
 # RPS/RFS: software packet steering. On a virtio VPS the NIC usually has one
 # hardware rx queue, so every packet's softirq lands on a single core -- that
