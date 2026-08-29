@@ -128,7 +128,12 @@ struct MetricDescriptor {
 // Upper bound on worker slots for the per-worker `connections_per_worker`
 // gauge. Bounded by configuration, never by remote input, so labelling by
 // worker index does not create unbounded cardinality.
-inline constexpr std::size_t kMaxWorkers = 64;
+// Upper bound only for the per-worker metrics array below; the server runs
+// one worker per logical core, so this must stay >= the largest host it can
+// be deployed on. 256 covers current high-core-count servers; a machine with
+// more cores still runs correctly, only its highest worker indices are
+// omitted from the per-worker connection gauge.
+inline constexpr std::size_t kMaxWorkers = 256;
 
 // Upper bound on distinct names the dynamic string-keyed path will hold.
 inline constexpr std::size_t kMaxDynamicMetrics = 256;

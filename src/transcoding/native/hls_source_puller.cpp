@@ -330,17 +330,19 @@ void HlsSourcePuller::run() {
     segmenters.reserve(renditions_.size());
     feeds.reserve(renditions_.size());
     publishers.reserve(renditions_.size());
-    // Source-transcode jobs cut much shorter segments than the 4s default:
-    // pulling from an upstream that publishes in irregular 9-12s chunks
-    // means every second waiting for a *segment* (not just for the source)
-    // adds latency and makes a stall/catch-up more visible when it happens.
-    // 1s segments (the segmenter can only actually cut on a keyframe, so
-    // real durations round up to the source's own keyframe spacing) get
-    // smaller pieces of already-decoded video in front of viewers sooner,
-    // and give PacedSegmentPublisher finer-grained steps to release instead
-    // of a few large ones.
+    // Output segment length for pulled/transcoded sources. This must match
+    // the SegmentStore's target_duration_seconds (SourceJobManager::Options,
+    // wired in apps/rtmp_server/main.cpp) so #EXT-X-TARGETDURATION and the
+    // live-window math agree with the pieces actually produced. 6s is chosen
+    // for single-box scale: it cuts each viewer's playlist+segment request
+    // rate to a third of what 1-2s segments produce (far fewer packets,
+    // connections and conntrack entries per viewer) and keeps every fetch in
+    // bulk TCP transfer. The cost is added latency, which a rebroadcast
+    // audience does not notice. The segmenter still only cuts on a keyframe,
+    // so a source with sparse keyframes rounds up toward max_segment_duration.
     hls::SegmenterConfig base_segmenter_config;
-    base_segmenter_config.target_duration = std::chrono::milliseconds(1000);
+    base_segmenter_config.target_duration = std::chrono::milliseconds(6000);
+    base_segmenter_config.max_segment_duration = std::chrono::milliseconds(12000);
     // Segment URLs are immutable at the CDN. A whole server process restart
     // loses the in-memory store, so starting again at segment-0.ts would make
     // active sessions receive stale cached bytes. A wall-clock floor keeps

@@ -9,7 +9,7 @@ backend default {
     .between_bytes_timeout = 5s;
     # No .max_connections: the Varnish->origin fan-in is deliberately
     # uncapped. The origin's own HTTP worker pool (apps/rtmp_server/main.cpp,
-    # sized CPU*256 with an unbounded accept queue) is the single
+    # sized from the core count with an unbounded accept queue) is the single
     # backpressure point; a cap here would only convert a join stampede into
     # 503s while every segment/playlist body is already cache-hot.
 }
@@ -99,8 +99,11 @@ sub vcl_backend_response {
         }
     } elseif (bereq.url ~ "\.m3u8(?:\?.*)?$") {
         if (beresp.http.Cache-Control ~ "(?i)public") {
-            set beresp.ttl = 1s;
-            set beresp.grace = 5s;
+            # Media playlist changes once per segment (6 s). A 3 s TTL is
+            # always within one segment of fresh yet halves origin playlist
+            # fetches versus a 1 s TTL; grace covers a slow origin refresh.
+            set beresp.ttl = 3s;
+            set beresp.grace = 9s;
             set beresp.keep = 30s;
             # Collapse synchronized player polls into one complete response.
             set beresp.do_stream = false;

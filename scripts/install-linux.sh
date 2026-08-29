@@ -785,6 +785,11 @@ RTMP_SERVER_MAXIMUM_PUBLISHERS=${ADMISSION_MAX_PUBLISHERS}
 RTMP_SERVER_MAXIMUM_VIEWERS_PER_STREAM=${ADMISSION_MAX_VIEWERS}
 RTMP_SERVER_WORKER_RING_COUNT=${WORKERS}
 RTMP_SERVER_MAX_WORKER_RING_COUNT=${MAX_WORKER_RING_COUNT}
+# io_uring submission-ring depth per worker. 4096 (up from the 1024 default)
+# gives each worker headroom for many concurrent in-flight recv/send ops
+# before submission back-pressures; power of two, safe on every supported
+# kernel.
+RTMP_SERVER_RING_QUEUE_DEPTH=4096
 RTMP_SERVER_WORKER_CPU_PINNING_ENABLED=$([[ "${WORKER_CPU_PINNING}" == "1" ]] && echo true || echo false)
 RTMP_SERVER_ENABLE_SQPOLL=$([[ "${ENABLE_SQPOLL}" == "1" ]] && echo true || echo false)
 RTMP_SERVER_ENABLE_HLS_FAST_JOIN=$([[ "${ENABLE_FAST_JOIN}" == "1" ]] && echo true || echo false)
@@ -802,7 +807,11 @@ RTMP_SERVER_TRANSCODING_MAX_OUTPUTS_PER_JOB=16
 RTMP_SERVER_TRANSCODING_MAX_RESTART_ATTEMPTS=5
 RTMP_SERVER_RECORDING_ENABLED=false
 RTMP_SERVER_RECORDING_DIRECTORY=/var/lib/rtmp-server/recordings
-RTMP_SERVER_LOG_LEVEL=info
+# warn, not info: the Info stream includes a line per accepted connection,
+# and the logger serialises every line on one mutex behind a synchronous
+# write to the journal. At a large connection rate that becomes a contention
+# and journald-backpressure point. Warnings/errors still surface.
+RTMP_SERVER_LOG_LEVEL=warn
 RTMP_SERVER_METRICS_ENABLED=true
 EOF
 chown root:rtmp-server "${EXISTING_ENV}"
@@ -908,8 +917,27 @@ EOF
 log "Applying measured-workload Linux network baselines"
 SYSTEM_FILE_MAX=$((NOFILE * 4))
 if (( SYSTEM_FILE_MAX < 2097152 )); then SYSTEM_FILE_MAX=2097152; fi
+# Global TCP memory thresholds in 4 KiB pages: min / pressure / max as
+# roughly 3% / 6% / 9% of RAM. The per-socket rmem/wmem below only bound one
+# connection; this is the ceiling across ALL sockets, and the kernel starts
+# pruning buffers once "pressure" is crossed. The default is a small fixed
+# value that a large audience blows past well before RAM is actually short.
+TCP_MEM_MIN=$(( MEM_TOTAL_KB / 4 * 3 / 100 ))
+TCP_MEM_PRESSURE=$(( MEM_TOTAL_KB / 4 * 6 / 100 ))
+TCP_MEM_MAX=$(( MEM_TOTAL_KB / 4 * 9 / 100 ))
+# Tiny floors only: guard a mis-detected/very small RAM value, without ever
+# letting a small box reserve a large slice for TCP. ~64 / 96 / 128 MiB.
+if (( TCP_MEM_MIN < 16384 )); then TCP_MEM_MIN=16384; fi
+if (( TCP_MEM_PRESSURE < 24576 )); then TCP_MEM_PRESSURE=24576; fi
+if (( TCP_MEM_MAX < 32768 )); then TCP_MEM_MAX=32768; fi
+# Orphan-socket cap: ~1/32 of RAM (each orphan can hold ~64 KiB), floored so
+# a small box is not starved and ceiled so it cannot balloon.
+TCP_MAX_ORPHANS=$(( MEM_TOTAL_KB / 32 ))
+if (( TCP_MAX_ORPHANS < 65536 )); then TCP_MAX_ORPHANS=65536; fi
+if (( TCP_MAX_ORPHANS > 1048576 )); then TCP_MAX_ORPHANS=1048576; fi
 cat > /etc/sysctl.d/60-streamforge.conf <<EOF
 fs.file-max = ${SYSTEM_FILE_MAX}
+net.ipv4.tcp_mem = ${TCP_MEM_MIN} ${TCP_MEM_PRESSURE} ${TCP_MEM_MAX}
 net.core.somaxconn = 65535
 net.ipv4.tcp_max_syn_backlog = 65535
 net.core.netdev_max_backlog = 65536
@@ -939,8 +967,10 @@ net.ipv4.tcp_notsent_lowat = 131072
 # a fraction of viewers on the first large segment; probing recovers them.
 net.ipv4.tcp_mtu_probing = 1
 # More orphaned (closed-but-draining) sockets before the kernel starts
-# resetting them -- a large audience cycling connections produces many.
-net.ipv4.tcp_max_orphans = 1048576
+# resetting them -- a large audience cycling connections produces many. Each
+# can hold up to ~64 KiB, so scale the cap with RAM instead of a fixed value
+# that could let orphans alone exhaust a small box.
+net.ipv4.tcp_max_orphans = ${TCP_MAX_ORPHANS}
 net.ipv4.tcp_rfc1337 = 1
 # Softirq packet-processing budget per poll: the default 300 is a throughput
 # ceiling on a busy NIC well before the CPU is the limit.
@@ -970,9 +1000,12 @@ EOF
 #  2. Size what remains (real public client flows) from RAM -- budget 12% of
 #     RAM at ~320 B/entry -- and widen the hash to match so lookups stay
 #     O(1). Short TCP timeouts recycle closed flows fast.
-CONNTRACK_MAX=$(( MEM_TOTAL_KB * 1024 * 12 / 100 / 320 ))
-if (( CONNTRACK_MAX < 1048576 )); then CONNTRACK_MAX=1048576; fi
-if (( CONNTRACK_MAX > 67108864 )); then CONNTRACK_MAX=67108864; fi
+# ~5% of RAM at ~400 B per tracked flow (entry + hash slot). Loopback is
+# already untracked below, so this only has to hold real public client
+# flows. Floor keeps a small box usable; ceiling keeps a huge box sane.
+CONNTRACK_MAX=$(( MEM_TOTAL_KB * 1024 * 5 / 100 / 400 ))
+if (( CONNTRACK_MAX < 262144 )); then CONNTRACK_MAX=262144; fi
+if (( CONNTRACK_MAX > 33554432 )); then CONNTRACK_MAX=33554432; fi
 CONNTRACK_HASHSIZE=$(( CONNTRACK_MAX / 2 ))
 if modprobe nf_conntrack 2>/dev/null && [[ -d /proc/sys/net/netfilter ]]; then
   cat > /etc/sysctl.d/61-streamforge-conntrack.conf <<EOF
@@ -1076,6 +1109,19 @@ set -euo pipefail
 . /etc/default/rtmp-network
 [[ -n "${RTMP_INTERFACE:-}" && "${RTMP_SHAPE_MBIT:-0}" =~ ^[0-9]+$ ]] || exit 1
 
+# CPU frequency governor -> performance. The default (schedutil/powersave/
+# ondemand) drops the cores to a low clock when idle and takes tens of ms to
+# ramp back up; a streaming box's load arrives in sudden bursts (event start,
+# join waves) that the ramp lag turns into a visible stutter. On a VPS whose
+# clock the hypervisor owns this is a silent no-op -- harmless. Best-effort
+# via cpupower, then a direct sysfs fallback.
+if command -v cpupower >/dev/null 2>&1; then
+  cpupower frequency-set -g performance >/dev/null 2>&1 || true
+fi
+for _gov in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
+  [[ -w "${_gov}" ]] && echo performance > "${_gov}" 2>/dev/null || true
+done
+
 # NIC queue count matched to WorkerPool worker count, so RSS spreads
 # interrupts/softirqs across the same cores the io_uring workers run on
 # instead of funnelling every packet through one queue/core. Best-effort:
@@ -1101,7 +1147,7 @@ ethtool -C "${RTMP_INTERFACE}" adaptive-rx on adaptive-tx on >/dev/null 2>&1 ||
 
 # RPS/RFS: software packet steering. On a virtio VPS the NIC usually has one
 # hardware rx queue, so every packet's softirq lands on a single core -- that
-# core caps total throughput long before the other 31 are busy. RPS fans the
+# core caps total throughput long before the remaining cores are busy. RPS fans the
 # per-packet work out to every CPU; RFS then pulls each flow back to the core
 # running its socket so cache stays warm. Only engaged when the hardware
 # cannot already spread the load itself (few real queues).
@@ -1213,30 +1259,37 @@ log "Configuring Varnish shared HLS cache"
 # strings are normalized by the public high-scale VCL to prevent cache-key
 # fragmentation.
 # Bound to loopback only: never exposed directly to the internet.
-VARNISH_CACHE_MB=$(( MEM_TOTAL_KB / 1024 / 5 ))
+# Object cache: a quarter of RAM. The ceiling only exists so the box keeps
+# room for the origin, Varnish threads and the OS -- it scales with the host,
+# it is not a fixed size.
+VARNISH_CACHE_MB=$(( MEM_TOTAL_KB / 1024 / 4 ))
 if (( VARNISH_CACHE_MB < 128 )); then VARNISH_CACHE_MB=128; fi
-if (( VARNISH_CACHE_MB > 16384 )); then VARNISH_CACHE_MB=16384; fi
+if (( VARNISH_CACHE_MB > 262144 )); then VARNISH_CACHE_MB=262144; fi
+# Short-lived objects (1s playlists, 1s cached errors) live in Transient
+# storage. Left unbounded, a sustained 4xx/5xx burst can grow it without
+# limit; cap it at an eighth of the main cache.
+VARNISH_TRANSIENT_MB=$(( VARNISH_CACHE_MB / 8 ))
+if (( VARNISH_TRANSIENT_MB < 64 )); then VARNISH_TRANSIENT_MB=64; fi
+if (( VARNISH_TRANSIENT_MB > 8192 )); then VARNISH_TRANSIENT_MB=8192; fi
 VARNISH_THREAD_POOLS=$(( (WORKERS + 3) / 4 ))
 if (( VARNISH_THREAD_POOLS < 2 )); then VARNISH_THREAD_POOLS=2; fi
 if (( VARNISH_THREAD_POOLS > 16 )); then VARNISH_THREAD_POOLS=16; fi
-# Varnish has no literal "unlimited" for its worker pool, so the ceiling is
-# set as high as RAM allows and the pool is pre-warmed so ramp-up is never
-# the bottleneck. thread_pools * thread_pool_max is the absolute ceiling; at
-# ~80 KiB of stack per thread the values below reserve headroom for hundreds
-# of thousands of concurrent in-flight requests, which no cache-HIT workload
-# reaches in practice (a HIT is served in microseconds). thread_pool_min is
-# lifted so a flash crowd is served immediately instead of waiting for the
-# 2 ms/thread spawn cadence, and the queue that absorbs any momentary
-# overflow is effectively unbounded.
-VARNISH_THREAD_POOL_MAX=20000
-# ~64k pre-spawned workers total (min * pools), capped so a tiny VPS does not
-# reserve more thread stacks than it has RAM: budget 5% of RAM at 80 KiB each.
-VARNISH_THREAD_POOL_MIN=$(( 65536 / VARNISH_THREAD_POOLS ))
-VARNISH_THREAD_MIN_BUDGET=$(( MEM_TOTAL_KB / 20 / 80 / VARNISH_THREAD_POOLS ))
-if (( VARNISH_THREAD_POOL_MIN > VARNISH_THREAD_MIN_BUDGET )); then
-  VARNISH_THREAD_POOL_MIN=${VARNISH_THREAD_MIN_BUDGET}
-fi
+# Varnish has no literal "unlimited" for its worker pool. Both the ceiling
+# and the pre-warmed minimum are sized from RAM (~80 KiB of stack per
+# thread), so a small box never reserves or spawns more thread stacks than
+# it can hold, while a large box gets a genuinely deep pool. thread_pool_min
+# is pre-warmed so a flash crowd is served immediately instead of waiting on
+# the thread-spawn cadence; the overflow queue is effectively unbounded.
+# Ceiling: total worker stacks may use up to a quarter of RAM.
+VARNISH_THREAD_POOL_MAX=$(( MEM_TOTAL_KB / 4 / 80 / VARNISH_THREAD_POOLS ))
+if (( VARNISH_THREAD_POOL_MAX < 2000 )); then VARNISH_THREAD_POOL_MAX=2000; fi
+if (( VARNISH_THREAD_POOL_MAX > 20000 )); then VARNISH_THREAD_POOL_MAX=20000; fi
+# Pre-warm: total min*pools stays under 5% of RAM in thread stacks.
+VARNISH_THREAD_POOL_MIN=$(( MEM_TOTAL_KB / 20 / 80 / VARNISH_THREAD_POOLS ))
 if (( VARNISH_THREAD_POOL_MIN < 100 )); then VARNISH_THREAD_POOL_MIN=100; fi
+if (( VARNISH_THREAD_POOL_MIN > VARNISH_THREAD_POOL_MAX )); then
+  VARNISH_THREAD_POOL_MIN=${VARNISH_THREAD_POOL_MAX}
+fi
 VARNISH_THREAD_QUEUE_LIMIT=1000000
 # The Varnish->origin backend has no .max_connections cap (see
 # deploy/varnish/streamforge.vcl): concurrent cache MISSes are bounded only
@@ -1249,7 +1302,7 @@ install -d -m 0755 /etc/systemd/system/varnish.service.d
 cat > /etc/systemd/system/varnish.service.d/streamforge.conf <<EOF
 [Service]
 ExecStart=
-ExecStart=/usr/sbin/varnishd -j unix,user=vcache -F -a 127.0.0.1:6081 -T localhost:6082 -f /etc/varnish/streamforge.vcl -S /etc/varnish/secret -s malloc,${VARNISH_CACHE_MB}m -p thread_pools=${VARNISH_THREAD_POOLS} -p thread_pool_min=${VARNISH_THREAD_POOL_MIN} -p thread_pool_max=${VARNISH_THREAD_POOL_MAX} -p thread_queue_limit=${VARNISH_THREAD_QUEUE_LIMIT} -p thread_pool_add_delay=0 -p listen_depth=65535
+ExecStart=/usr/sbin/varnishd -j unix,user=vcache -F -a 127.0.0.1:6081 -T localhost:6082 -f /etc/varnish/streamforge.vcl -S /etc/varnish/secret -s malloc,${VARNISH_CACHE_MB}m -s Transient=malloc,${VARNISH_TRANSIENT_MB}m -p thread_pools=${VARNISH_THREAD_POOLS} -p thread_pool_min=${VARNISH_THREAD_POOL_MIN} -p thread_pool_max=${VARNISH_THREAD_POOL_MAX} -p thread_queue_limit=${VARNISH_THREAD_QUEUE_LIMIT} -p thread_pool_add_delay=0 -p nuke_limit=1000 -p listen_depth=65535
 LimitNOFILE=${NOFILE}
 TasksMax=infinity
 LimitNPROC=infinity
@@ -1294,7 +1347,16 @@ ${CADDY_SITE} {
     # Both playlists and segments use the local shared cache.
     @hls path /hls/*
     handle @hls {
-        reverse_proxy 127.0.0.1:6081
+        reverse_proxy 127.0.0.1:6081 {
+            # Reuse loopback connections to Varnish aggressively. Without
+            # this Caddy opens (and soon closes) a fresh 127.0.0.1 socket
+            # per burst of viewer requests, churning ephemeral ports and
+            # TIME_WAIT slots on the loopback path under a large audience.
+            transport http {
+                keepalive 5m
+                keepalive_idle_conns_per_host 4096
+            }
+        }
     }
 
     handle {
@@ -1423,8 +1485,8 @@ printf '  Admission mode:   %s\n' "$(if [[ "${ADMISSION_MODE}" == "unlimited" ]]
 printf '  VPS CPU profile:  pinning=%s, SQPOLL=%s, FD limit=%s\n' \
   "$([[ "${WORKER_CPU_PINNING}" == "1" ]] && printf on || printf off)" \
   "$([[ "${ENABLE_SQPOLL}" == "1" ]] && printf on || printf off)" "${NOFILE}"
-printf '  HLS shared cache:  Varnish, %s MB RAM, 127.0.0.1:6081 (.ts 1h; media playlists 1s; masters 30s)\n' "${VARNISH_CACHE_MB}"
-printf '  Origin fan-in:     uncapped Varnish->origin; bounded only by the origin HTTP worker pool (CPU*256)\n'
+printf '  HLS shared cache:  Varnish, %s MB RAM, 127.0.0.1:6081 (.ts 1h; media playlists 3s; masters 30s; 6s segments)\n' "${VARNISH_CACHE_MB}"
+printf '  Origin fan-in:     uncapped Varnish->origin; bounded only by the origin HTTP worker pool (scales with cores)\n'
 printf '  Conntrack:         loopback NOTRACK + table sized to %s entries (public flows only)\n' "${CONNTRACK_MAX}"
 if [[ "${ENABLE_DISK_GUARD}" == "1" ]]; then
   printf '  Disk guard:        every 5m; cleanup at %s%% or <%s MB free, target %s%%\n' \

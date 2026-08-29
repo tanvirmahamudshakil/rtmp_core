@@ -220,14 +220,24 @@ int main(int argc, char** argv) {
             rtmp_server::hls::SegmentStoreConfig store_config;
             store_config.live_window_segments = 6;
             store_config.retention_grace_segments = 6;
-            store_config.max_total_bytes = 128u * 1024u * 1024u;
-            store_config.target_duration_seconds = 2;
+            store_config.max_total_bytes = 256u * 1024u * 1024u;
+            // 6 s segments: at a large single-box audience this cuts each
+            // viewer's playlist+segment request rate to a third of what 2 s
+            // segments produce (fewer packets, connections and conntrack
+            // churn) and keeps every fetch in bulk TCP transfer rather than
+            // slow-start. Trade-off is ~12-18 s more glass-to-glass latency,
+            // which a rebroadcast/IPTV audience does not notice. The encoder
+            // keyframe interval must divide this (2 s or 3 s GOP).
+            store_config.target_duration_seconds = 6;
             auto store = std::make_shared<rtmp_server::hls::SegmentStore>(store_config);
 
             rtmp_server::hls::SegmenterConfig segmenter_config;
-            segmenter_config.target_duration = std::chrono::seconds(2);
-            segmenter_config.max_segment_duration = std::chrono::seconds(8);
-            segmenter_config.max_segment_bytes = 16u * 1024u * 1024u;
+            segmenter_config.target_duration = std::chrono::seconds(6);
+            // Headroom above target so a stream whose keyframe cadence is not
+            // a clean divisor of 6 s is still cut on a keyframe rather than
+            // force-split mid-GOP.
+            segmenter_config.max_segment_duration = std::chrono::seconds(12);
+            segmenter_config.max_segment_bytes = 24u * 1024u * 1024u;
 
             hls_handler.register_stream(std::string(application), std::string(stream), store);
             return std::make_shared<rtmp_server::hls::StreamSink>(std::move(store),
@@ -381,6 +391,13 @@ int main(int argc, char** argv) {
     // HTTP/admin traffic can never starve an in-flight transcode, and vice
     // versa. 0 (default) keeps today's behaviour of sizing from every core.
     source_job_options.transcode_cpu_reservation_percent = config.transcode_cpu_reservation_percent;
+    // 6 s output segments for pulled/transcoded sources, matching the RTMP
+    // ingest path above. On a large single-box audience this thirds each
+    // viewer's playlist+segment request rate versus 2 s segments; the
+    // per-rendition byte budget grows in step so a high-bitrate rendition
+    // still evicts on segment count, not on the cap.
+    source_job_options.target_duration_seconds = 6;
+    source_job_options.max_total_bytes_per_rendition = 256u * 1024u * 1024u;
     rtmp_server::transcoding::native::SourceJobManager source_job_manager(std::move(source_hooks), store.get(),
                                                                           source_job_options);
     source_job_manager.load_from_store();
@@ -545,9 +562,18 @@ int main(int argc, char** argv) {
     // with an unbounded pending queue below, the origin never rejects a
     // loopback request for load: it either has a free worker or the request
     // waits microseconds for one, with no audience-size cap.
+    //
+    // Scales from the machine's real logical-core count at runtime. The pool
+    // only has to cover concurrent cache MISSes: with the shared cache doing
+    // request coalescing (and errors now cached, see streamforge.vcl) a join
+    // stampede on a well-cached origin produces at most a few hundred to a
+    // couple thousand simultaneous origin fetches, not tens of thousands, so
+    // cores*32 with a modest ceiling is ample. Keeping the number sane also
+    // keeps the process's committed virtual memory (8 MiB default stack per
+    // thread) reasonable on hosts with strict overcommit accounting.
     const auto hardware_threads = std::max(1U, std::thread::hardware_concurrency());
     const auto hls_http_workers =
-        std::clamp<std::size_t>(static_cast<std::size_t>(hardware_threads) * 256, 2048, 65536);
+        std::clamp<std::size_t>(static_cast<std::size_t>(hardware_threads) * 32, 256, 4096);
     rtmp_server::control::HttpServerOptions api_server_options{
         config.api_bind_address, config.api_port, 65'535, hls_http_workers,
         std::numeric_limits<std::size_t>::max(), 16 * 1024, 128 * 1024};
