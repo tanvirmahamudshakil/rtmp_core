@@ -7,10 +7,11 @@ backend default {
     .connect_timeout = 1s;
     .first_byte_timeout = 5s;
     .between_bytes_timeout = 5s;
-    # Installer replaces this with the origin's CPU-sized HTTP worker count.
-    # Cache HIT traffic is unaffected; only concurrent MISSes are bounded so
-    # a join/restart stampede cannot starve playlists, health, or ingest.
-    .max_connections = 256;
+    # No .max_connections: the Varnish->origin fan-in is deliberately
+    # uncapped. The origin's own HTTP worker pool (apps/rtmp_server/main.cpp,
+    # sized CPU*256 with an unbounded accept queue) is the single
+    # backpressure point; a cap here would only convert a join stampede into
+    # 503s while every segment/playlist body is already cache-hot.
 }
 
 sub vcl_recv {

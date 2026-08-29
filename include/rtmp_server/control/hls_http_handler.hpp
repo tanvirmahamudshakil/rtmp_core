@@ -211,7 +211,12 @@ private:
     // Hard cap on tracked sessions per stream key, swept opportunistically once
     // exceeded. Bounds memory even if a stream is hit by a huge number of
     // distinct, non-returning sessions (e.g. an unauthenticated scrape).
-    static constexpr std::size_t kMaxTrackedViewerSessions = 20000;
+    // This does not gate playback -- it only caps the per-stream viewer-count
+    // figure -- but it is set well above any real single-stream audience so
+    // the reported count stays accurate at scale. ~60 B/entry => ~30 MiB per
+    // stream at the absolute ceiling, and only if that many distinct
+    // sessions are simultaneously live.
+    static constexpr std::size_t kMaxTrackedViewerSessions = 500000;
 
     struct StreamEntry {
         std::shared_ptr<hls::SegmentStore> store;

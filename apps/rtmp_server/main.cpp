@@ -3,6 +3,7 @@
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
+#include <limits>
 #include <memory>
 #include <sstream>
 #include <string>
@@ -532,12 +533,24 @@ int main(int argc, char** argv) {
     // asynchronous client I/O. HLS players request a newly published segment
     // in synchronized bursts, so size the blocking loopback pool from the
     // machine rather than imposing the old fixed 16-request bottleneck.
+    //
+    // The pool is one blocking worker per in-flight request (keep-alive is
+    // off below), so it also bounds how many concurrent cache MISSes / fresh
+    // per-viewer playlist redirects the origin can serve at once. A join
+    // stampede on a large audience needs thousands of those in flight for a
+    // few milliseconds each, so the ceiling is deliberately far above the
+    // core count -- idle worker threads cost only their (lazily faulted)
+    // stack, while too low a ceiling turns a join spike into origin 503s
+    // even though every segment/playlist body is already cache-hot. Paired
+    // with an unbounded pending queue below, the origin never rejects a
+    // loopback request for load: it either has a free worker or the request
+    // waits microseconds for one, with no audience-size cap.
     const auto hardware_threads = std::max(1U, std::thread::hardware_concurrency());
     const auto hls_http_workers =
-        std::clamp<std::size_t>(static_cast<std::size_t>(hardware_threads) * 16, 64, 256);
+        std::clamp<std::size_t>(static_cast<std::size_t>(hardware_threads) * 256, 2048, 65536);
     rtmp_server::control::HttpServerOptions api_server_options{
-        config.api_bind_address, config.api_port, 65'535, hls_http_workers, 65'536,
-        16 * 1024, 128 * 1024};
+        config.api_bind_address, config.api_port, 65'535, hls_http_workers,
+        std::numeric_limits<std::size_t>::max(), 16 * 1024, 128 * 1024};
     // This server assigns one blocking worker to a connection for its entire
     // keep-alive lifetime. A cache restart can leave hundreds of backend
     // connections queued while every worker waits idle on an earlier one,

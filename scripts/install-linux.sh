@@ -225,11 +225,16 @@ remove_managed_path() {
     /etc/systemd/system/rtmp-server.service.d | \
     /etc/systemd/system/rtmp-network-tune.service | \
     /etc/systemd/system/rtmp-network-tune.service.d | \
+    /etc/systemd/system/streamforge-notrack.service | \
     /etc/systemd/system/viewer-estimator.service | \
     /etc/systemd/system/streamforge-disk-guard.service | \
     /etc/systemd/system/streamforge-disk-guard.timer | \
     /etc/systemd/journald.conf.d/streamforge.conf | \
     /etc/sysctl.d/60-streamforge.conf | \
+    /etc/sysctl.d/61-streamforge-conntrack.conf | \
+    /etc/modprobe.d/streamforge-conntrack.conf | \
+    /etc/streamforge/notrack.nft | \
+    /etc/streamforge | \
     /etc/default/rtmp-network | \
     /etc/default/streamforge-disk-guard | \
     /etc/logrotate.d/rtmp-server | \
@@ -307,6 +312,7 @@ clean_previous_install() {
   # a hard failure: deleting its executable or data underneath it is unsafe.
   stop_and_disable_unit rtmp-server.service
   stop_and_disable_unit rtmp-network-tune.service
+  stop_and_disable_unit streamforge-notrack.service
   stop_and_disable_unit viewer-estimator.service
   stop_and_disable_unit streamforge-disk-guard.timer
   stop_and_disable_unit streamforge-disk-guard.service
@@ -346,11 +352,15 @@ clean_previous_install() {
     /etc/systemd/system/rtmp-server.service.d \
     /etc/systemd/system/rtmp-network-tune.service \
     /etc/systemd/system/rtmp-network-tune.service.d \
+    /etc/systemd/system/streamforge-notrack.service \
     /etc/systemd/system/viewer-estimator.service \
     /etc/systemd/system/streamforge-disk-guard.service \
     /etc/systemd/system/streamforge-disk-guard.timer \
     /etc/systemd/journald.conf.d/streamforge.conf \
     /etc/sysctl.d/60-streamforge.conf \
+    /etc/sysctl.d/61-streamforge-conntrack.conf \
+    /etc/modprobe.d/streamforge-conntrack.conf \
+    /etc/streamforge/notrack.nft \
     /etc/default/rtmp-network \
     /etc/default/streamforge-disk-guard \
     /etc/logrotate.d/rtmp-server \
@@ -388,8 +398,8 @@ clean_previous_install() {
   fi
 
   systemctl daemon-reload
-  systemctl reset-failed rtmp-server.service rtmp-network-tune.service viewer-estimator.service \
-    streamforge-disk-guard.service varnish.service >/dev/null 2>&1 || true
+  systemctl reset-failed rtmp-server.service rtmp-network-tune.service streamforge-notrack.service \
+    viewer-estimator.service streamforge-disk-guard.service varnish.service >/dev/null 2>&1 || true
   log "Previous StreamForge installation cleanup complete"
 }
 
@@ -417,7 +427,7 @@ apt-get update
 apt-get install -y --no-install-recommends "${APT_REINSTALL_ARGS[@]}" \
   build-essential cmake ninja-build pkg-config git ca-certificates curl gnupg \
   liburing-dev liburing2 libssl-dev libsqlite3-dev libsqlite3-0 sqlite3 \
-  iproute2 ethtool kmod varnish
+  iproute2 ethtool kmod varnish nftables
 
 # The distribution's default "clang" meta-package tracks whatever major
 # version that release shipped with — fine on 24.04 (clang-18) but not
@@ -853,6 +863,8 @@ RestartPreventExitStatus=1
 LimitNOFILE=${NOFILE}
 LimitMEMLOCK=infinity
 LimitCORE=0
+TasksMax=infinity
+LimitNPROC=infinity
 OOMScoreAdjust=200
 OOMPolicy=stop
 StateDirectory=rtmp-server
@@ -902,12 +914,119 @@ net.core.somaxconn = 65535
 net.ipv4.tcp_max_syn_backlog = 65535
 net.core.netdev_max_backlog = 65536
 net.ipv4.tcp_syncookies = 1
-net.core.rmem_max = 16777216
-net.core.wmem_max = 16777216
-net.ipv4.tcp_rmem = 4096 87380 16777216
-net.ipv4.tcp_wmem = 4096 65536 16777216
+net.core.rmem_max = 67108864
+net.core.wmem_max = 67108864
+net.ipv4.tcp_rmem = 4096 131072 33554432
+net.ipv4.tcp_wmem = 4096 65536 33554432
 net.core.default_qdisc = fq
+net.ipv4.ip_local_port_range = 1024 65535
+net.ipv4.tcp_tw_reuse = 1
+net.ipv4.tcp_fin_timeout = 15
+net.ipv4.tcp_max_tw_buckets = 2000000
+# HLS is a fetch every few seconds on a kept-alive socket that goes idle in
+# between. With slow_start_after_idle on (the default), the kernel resets the
+# congestion window after each gap and every segment restarts in slow start
+# -- the single biggest cause of "the stream is fine at 500 viewers and
+# stutters at 3000". Off = the socket keeps the window it earned.
+net.ipv4.tcp_slow_start_after_idle = 0
+# Cap unsent bytes queued in each socket's write buffer. At tens of
+# thousands of concurrent viewers the default lets every slow client pin
+# megabytes of kernel memory; 128 KiB keeps the total bounded and improves
+# fairness between fast and slow players with no throughput cost at this
+# object size.
+net.ipv4.tcp_notsent_lowat = 131072
+# Path-MTU black holes (common across VPS overlay networks) otherwise stall
+# a fraction of viewers on the first large segment; probing recovers them.
+net.ipv4.tcp_mtu_probing = 1
+# More orphaned (closed-but-draining) sockets before the kernel starts
+# resetting them -- a large audience cycling connections produces many.
+net.ipv4.tcp_max_orphans = 1048576
+net.ipv4.tcp_rfc1337 = 1
+# Softirq packet-processing budget per poll: the default 300 is a throughput
+# ceiling on a busy NIC well before the CPU is the limit.
+net.core.netdev_budget = 60000
+net.core.netdev_budget_usecs = 8000
+net.core.dev_weight = 128
+# TCP Fast Open both directions: repeat HLS clients skip a round trip on
+# reconnect (segment fetch after a playlist gap).
+net.ipv4.tcp_fastopen = 3
+# Global RFS flow table (per-queue slices are set by rtmp-network-tune). Sized
+# from core count; harmless on hosts where RPS/RFS is never engaged.
+net.core.rps_sock_flow_entries = $(( CPU_COUNT * 4096 ))
 EOF
+# Connection tracking, when the module is loaded (nftables/iptables present),
+# is a hidden per-viewer ceiling: the default table silently drops new flows
+# once full. Two moves take it off the critical path entirely:
+#
+#  1. NOTRACK every loopback packet. Caddy->Varnish->origin is three
+#     127.0.0.1 connections per viewer that conntrack has no reason to
+#     track; skipping them removes the bulk of the table's growth.
+#  2. Size what remains (real public client flows) from RAM -- budget 12% of
+#     RAM at ~320 B/entry -- and widen the hash to match so lookups stay
+#     O(1). Short TCP timeouts recycle closed flows fast.
+CONNTRACK_MAX=$(( MEM_TOTAL_KB * 1024 * 12 / 100 / 320 ))
+if (( CONNTRACK_MAX < 1048576 )); then CONNTRACK_MAX=1048576; fi
+if (( CONNTRACK_MAX > 67108864 )); then CONNTRACK_MAX=67108864; fi
+CONNTRACK_HASHSIZE=$(( CONNTRACK_MAX / 2 ))
+if modprobe nf_conntrack 2>/dev/null && [[ -d /proc/sys/net/netfilter ]]; then
+  cat > /etc/sysctl.d/61-streamforge-conntrack.conf <<EOF
+net.netfilter.nf_conntrack_max = ${CONNTRACK_MAX}
+net.netfilter.nf_conntrack_tcp_timeout_time_wait = 20
+net.netfilter.nf_conntrack_tcp_timeout_close_wait = 20
+net.netfilter.nf_conntrack_tcp_timeout_fin_wait = 20
+net.netfilter.nf_conntrack_tcp_timeout_established = 1800
+net.netfilter.nf_conntrack_tcp_loose = 0
+EOF
+  echo "options nf_conntrack hashsize=${CONNTRACK_HASHSIZE}" > /etc/modprobe.d/streamforge-conntrack.conf
+  printf '%s\n' "${CONNTRACK_HASHSIZE}" > /sys/module/nf_conntrack/parameters/hashsize 2>/dev/null || true
+fi
+# Loopback NOTRACK, persisted and reapplied on boot before the services that
+# depend on it. Own named table so it never collides with ufw/iptables/other
+# nft rulesets. Best-effort: a host without nft still works, just with the
+# loopback flows tracked and the (large) table above absorbing them.
+if command -v nft >/dev/null 2>&1; then
+  install -d -m 0755 /etc/streamforge
+  cat > /etc/streamforge/notrack.nft <<'EOF'
+#!/usr/sbin/nft -f
+# Managed by StreamForge install-linux.sh -- keep loopback out of conntrack.
+table inet streamforge_notrack
+delete table inet streamforge_notrack
+table inet streamforge_notrack {
+    chain raw_prerouting {
+        type filter hook prerouting priority raw; policy accept;
+        iifname "lo" notrack
+        ip saddr 127.0.0.0/8 notrack
+        ip6 saddr ::1 notrack
+    }
+    chain raw_output {
+        type filter hook output priority raw; policy accept;
+        oifname "lo" notrack
+        ip daddr 127.0.0.0/8 notrack
+        ip6 daddr ::1 notrack
+    }
+}
+EOF
+  cat > /etc/systemd/system/streamforge-notrack.service <<'EOF'
+[Unit]
+Description=StreamForge loopback conntrack bypass
+DefaultDependencies=no
+After=nftables.service
+Before=network-pre.target varnish.service rtmp-server.service
+Wants=network-pre.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/nft -f /etc/streamforge/notrack.nft
+ExecStop=/usr/sbin/nft delete table inet streamforge_notrack
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+  systemctl enable --now streamforge-notrack.service >/dev/null 2>&1 ||
+    log "streamforge-notrack could not load; loopback flows will be tracked (table is sized for it)"
+fi
 if modprobe tcp_bbr 2>/dev/null && sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -qw bbr; then
   printf '%s\n' 'net.ipv4.tcp_congestion_control = bbr' >> /etc/sysctl.d/60-streamforge.conf
 fi
@@ -967,6 +1086,35 @@ fi
 # Larger rx/tx rings absorb short bursts (viewer stampede, keyframe spikes)
 # without drops. Not all drivers/providers honour this value; ignored if not.
 ethtool -G "${RTMP_INTERFACE}" rx 4096 tx 4096 >/dev/null 2>&1 || true
+
+# RPS/RFS: software packet steering. On a virtio VPS the NIC usually has one
+# hardware rx queue, so every packet's softirq lands on a single core -- that
+# core caps total throughput long before the other 31 are busy. RPS fans the
+# per-packet work out to every CPU; RFS then pulls each flow back to the core
+# running its socket so cache stays warm. Only engaged when the hardware
+# cannot already spread the load itself (few real queues).
+HW_QUEUES="$( { ls -d /sys/class/net/"${RTMP_INTERFACE}"/queues/rx-* 2>/dev/null || true; } | wc -l | tr -cd '0-9')"
+NCPU="$(nproc)"
+if [[ "${HW_QUEUES}" =~ ^[0-9]+$ ]] && (( HW_QUEUES > 0 && HW_QUEUES < NCPU )); then
+  # rps_cpus wants a (possibly comma-separated) hex bitmask, 32 bits/word,
+  # so an all-ones mask for NCPU cores works for any core count.
+  CPU_MASK=""; _rem=${NCPU}
+  while (( _rem > 0 )); do
+    _bits=$(( _rem >= 32 ? 32 : _rem ))
+    CPU_MASK="$(printf '%x' $(( (1 << _bits) - 1 )))${CPU_MASK:+,${CPU_MASK}}"
+    _rem=$(( _rem - _bits ))
+  done
+  GLOBAL_FLOWS=$(( NCPU * 4096 ))
+  sysctl -qw "net.core.rps_sock_flow_entries=${GLOBAL_FLOWS}" 2>/dev/null || true
+  for rxq in /sys/class/net/"${RTMP_INTERFACE}"/queues/rx-*; do
+    [[ -w "${rxq}/rps_cpus" ]] && printf '%s' "${CPU_MASK}" > "${rxq}/rps_cpus" 2>/dev/null || true
+    [[ -w "${rxq}/rps_flow_cnt" ]] &&
+      printf '%s' "$(( GLOBAL_FLOWS / HW_QUEUES ))" > "${rxq}/rps_flow_cnt" 2>/dev/null || true
+  done
+  for txq in /sys/class/net/"${RTMP_INTERFACE}"/queues/tx-*; do
+    [[ -w "${txq}/xps_cpus" ]] && printf '%s' "${CPU_MASK}" > "${txq}/xps_cpus" 2>/dev/null || true
+  done
+fi
 
 if (( RTMP_SHAPE_MBIT <= 10000 )) && modprobe sch_cake 2>/dev/null; then
   tc qdisc replace dev "${RTMP_INTERFACE}" root cake bandwidth "${RTMP_SHAPE_MBIT}Mbit" \
@@ -1058,21 +1206,41 @@ if (( VARNISH_CACHE_MB < 128 )); then VARNISH_CACHE_MB=128; fi
 if (( VARNISH_CACHE_MB > 16384 )); then VARNISH_CACHE_MB=16384; fi
 VARNISH_THREAD_POOLS=$(( (WORKERS + 3) / 4 ))
 if (( VARNISH_THREAD_POOLS < 2 )); then VARNISH_THREAD_POOLS=2; fi
-if (( VARNISH_THREAD_POOLS > 8 )); then VARNISH_THREAD_POOLS=8; fi
-VARNISH_BACKEND_CONNECTIONS=$((WORKERS * 16))
-if (( VARNISH_BACKEND_CONNECTIONS < 64 )); then VARNISH_BACKEND_CONNECTIONS=64; fi
-if (( VARNISH_BACKEND_CONNECTIONS > 256 )); then VARNISH_BACKEND_CONNECTIONS=256; fi
-
+if (( VARNISH_THREAD_POOLS > 16 )); then VARNISH_THREAD_POOLS=16; fi
+# Varnish has no literal "unlimited" for its worker pool, so the ceiling is
+# set as high as RAM allows and the pool is pre-warmed so ramp-up is never
+# the bottleneck. thread_pools * thread_pool_max is the absolute ceiling; at
+# ~80 KiB of stack per thread the values below reserve headroom for hundreds
+# of thousands of concurrent in-flight requests, which no cache-HIT workload
+# reaches in practice (a HIT is served in microseconds). thread_pool_min is
+# lifted so a flash crowd is served immediately instead of waiting for the
+# 2 ms/thread spawn cadence, and the queue that absorbs any momentary
+# overflow is effectively unbounded.
+VARNISH_THREAD_POOL_MAX=20000
+# ~64k pre-spawned workers total (min * pools), capped so a tiny VPS does not
+# reserve more thread stacks than it has RAM: budget 5% of RAM at 80 KiB each.
+VARNISH_THREAD_POOL_MIN=$(( 65536 / VARNISH_THREAD_POOLS ))
+VARNISH_THREAD_MIN_BUDGET=$(( MEM_TOTAL_KB / 20 / 80 / VARNISH_THREAD_POOLS ))
+if (( VARNISH_THREAD_POOL_MIN > VARNISH_THREAD_MIN_BUDGET )); then
+  VARNISH_THREAD_POOL_MIN=${VARNISH_THREAD_MIN_BUDGET}
+fi
+if (( VARNISH_THREAD_POOL_MIN < 100 )); then VARNISH_THREAD_POOL_MIN=100; fi
+VARNISH_THREAD_QUEUE_LIMIT=1000000
+# The Varnish->origin backend has no .max_connections cap (see
+# deploy/varnish/streamforge.vcl): concurrent cache MISSes are bounded only
+# by the origin's own HTTP worker pool, never by Varnish. A stale numeric
+# cap left by an earlier install is stripped so re-runs converge to uncapped.
 install -m 0644 "${SOURCE_DIR}/deploy/varnish/streamforge.vcl" /etc/varnish/streamforge.vcl
-sed -i "s/^[[:space:]]*\.max_connections = 256;/    .max_connections = ${VARNISH_BACKEND_CONNECTIONS};/" \
-  /etc/varnish/streamforge.vcl
+sed -i "/^[[:space:]]*\.max_connections = [0-9]\+;[[:space:]]*$/d" /etc/varnish/streamforge.vcl
 
 install -d -m 0755 /etc/systemd/system/varnish.service.d
 cat > /etc/systemd/system/varnish.service.d/streamforge.conf <<EOF
 [Service]
 ExecStart=
-ExecStart=/usr/sbin/varnishd -j unix,user=vcache -F -a 127.0.0.1:6081 -T localhost:6082 -f /etc/varnish/streamforge.vcl -S /etc/varnish/secret -s malloc,${VARNISH_CACHE_MB}m -p thread_pools=${VARNISH_THREAD_POOLS} -p thread_pool_min=100 -p thread_pool_max=2500 -p thread_queue_limit=100000 -p listen_depth=65535
+ExecStart=/usr/sbin/varnishd -j unix,user=vcache -F -a 127.0.0.1:6081 -T localhost:6082 -f /etc/varnish/streamforge.vcl -S /etc/varnish/secret -s malloc,${VARNISH_CACHE_MB}m -p thread_pools=${VARNISH_THREAD_POOLS} -p thread_pool_min=${VARNISH_THREAD_POOL_MIN} -p thread_pool_max=${VARNISH_THREAD_POOL_MAX} -p thread_queue_limit=${VARNISH_THREAD_QUEUE_LIMIT} -p thread_pool_add_delay=0 -p listen_depth=65535
 LimitNOFILE=${NOFILE}
+TasksMax=infinity
+LimitNPROC=infinity
 EOF
 
 install -d -m 0755 /etc/systemd/system/caddy.service.d
@@ -1244,8 +1412,8 @@ printf '  VPS CPU profile:  pinning=%s, SQPOLL=%s, FD limit=%s\n' \
   "$([[ "${WORKER_CPU_PINNING}" == "1" ]] && printf on || printf off)" \
   "$([[ "${ENABLE_SQPOLL}" == "1" ]] && printf on || printf off)" "${NOFILE}"
 printf '  HLS shared cache:  Varnish, %s MB RAM, 127.0.0.1:6081 (.ts 1h; media playlists 1s; masters 30s)\n' "${VARNISH_CACHE_MB}"
-printf '  Origin protection: %s concurrent Varnish cache misses; cache hits remain unlimited\n' \
-  "${VARNISH_BACKEND_CONNECTIONS}"
+printf '  Origin fan-in:     uncapped Varnish->origin; bounded only by the origin HTTP worker pool (CPU*256)\n'
+printf '  Conntrack:         loopback NOTRACK + table sized to %s entries (public flows only)\n' "${CONNTRACK_MAX}"
 if [[ "${ENABLE_DISK_GUARD}" == "1" ]]; then
   printf '  Disk guard:        every 5m; cleanup at %s%% or <%s MB free, target %s%%\n' \
     "${DISK_TRIGGER_PERCENT}" "${DISK_MIN_FREE_MB}" "${DISK_TARGET_PERCENT}"

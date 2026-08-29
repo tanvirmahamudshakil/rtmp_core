@@ -109,6 +109,14 @@ LimitMEMLOCK=536870912
 # data-disclosure risk -- it contains stream keys and signing secrets.
 LimitCORE=infinity
 
+# The origin HLS loopback pool is one thread per in-flight request and is
+# sized well above the core count (apps/rtmp_server/main.cpp) so a join
+# stampede is never thread-starved. systemd's default TasksMax (a fraction
+# of kernel pids_max) and the default RLIMIT_NPROC would cap that pool and
+# turn a large audience into pthread_create failures, so both are lifted.
+TasksMax=infinity
+LimitNPROC=infinity
+
 # Prefer killing this service over the rest of the host if memory runs out;
 # it is restartable and its peers (database, monitoring) usually are not.
 OOMScoreAdjust=200
