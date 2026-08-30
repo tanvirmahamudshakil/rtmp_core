@@ -473,7 +473,7 @@ if [[ "${RTMP_ENABLE_NATIVE_TRANSCODE:-1}" != "1" ]]; then
   NATIVE_TRANSCODE=0
 fi
 apt-get install -y --no-install-recommends "${APT_REINSTALL_ARGS[@]}" \
-  libx265-dev libx264-dev libopenh264-dev libde265-dev libfdk-aac-dev libcurl4-openssl-dev libyuv-dev
+  libx265-dev libx264-dev libopenh264-dev libavcodec-dev libavutil-dev libde265-dev libfdk-aac-dev libcurl4-openssl-dev libyuv-dev
 
 if ! apt-cache show caddy >/dev/null 2>&1; then
   if [[ "${ID}" == "ubuntu" ]]; then

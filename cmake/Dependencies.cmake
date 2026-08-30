@@ -63,6 +63,11 @@ if(RTMP_ENABLE_NATIVE_TRANSCODE)
     pkg_check_modules(X265 IMPORTED_TARGET x265)
     pkg_check_modules(X264 IMPORTED_TARGET x264)
     pkg_check_modules(OPENH264 IMPORTED_TARGET openh264)
+    # H.264 decode. libavcodec's decoder (unlike OpenH264's) handles the High
+    # profile every real IPTV/broadcast source uses. GPL, like x264/x265
+    # already linked here, so it changes nothing about the binary's licence.
+    pkg_check_modules(LIBAVCODEC IMPORTED_TARGET libavcodec)
+    pkg_check_modules(LIBAVUTIL IMPORTED_TARGET libavutil)
     pkg_check_modules(FDKAAC IMPORTED_TARGET fdk-aac)
     pkg_check_modules(LIBCURL IMPORTED_TARGET libcurl)
     pkg_check_modules(LIBYUV IMPORTED_TARGET libyuv)
@@ -93,7 +98,7 @@ if(RTMP_ENABLE_NATIVE_TRANSCODE)
     # packages once and re-probe, instead of just warning. Anything else
     # (non-apt distro, non-root configure, no network) silently skips this
     # and falls through to the graceful-degrade warning below.
-    if(NOT (X265_FOUND AND X264_FOUND AND OPENH264_FOUND AND FDKAAC_FOUND AND LIBCURL_FOUND AND RTMP_LIBYUV_TARGET AND LIBDE265_FOUND))
+    if(NOT (X265_FOUND AND X264_FOUND AND OPENH264_FOUND AND LIBAVCODEC_FOUND AND LIBAVUTIL_FOUND AND FDKAAC_FOUND AND LIBCURL_FOUND AND RTMP_LIBYUV_TARGET AND LIBDE265_FOUND))
         find_program(RTMP_APT_GET_BIN apt-get)
         if(RTMP_APT_GET_BIN AND CMAKE_HOST_SYSTEM_NAME STREQUAL "Linux")
             execute_process(COMMAND id -u OUTPUT_VARIABLE RTMP_UID OUTPUT_STRIP_TRAILING_WHITESPACE)
@@ -107,6 +112,12 @@ if(RTMP_ENABLE_NATIVE_TRANSCODE)
                 endif()
                 if(NOT OPENH264_FOUND)
                     list(APPEND RTMP_MISSING_APT_PACKAGES libopenh264-dev)
+                endif()
+                if(NOT LIBAVCODEC_FOUND)
+                    list(APPEND RTMP_MISSING_APT_PACKAGES libavcodec-dev)
+                endif()
+                if(NOT LIBAVUTIL_FOUND)
+                    list(APPEND RTMP_MISSING_APT_PACKAGES libavutil-dev)
                 endif()
                 if(NOT FDKAAC_FOUND)
                     list(APPEND RTMP_MISSING_APT_PACKAGES libfdk-aac-dev)
@@ -131,6 +142,8 @@ if(RTMP_ENABLE_NATIVE_TRANSCODE)
                     pkg_check_modules(X265 IMPORTED_TARGET x265)
                     pkg_check_modules(X264 IMPORTED_TARGET x264)
                     pkg_check_modules(OPENH264 IMPORTED_TARGET openh264)
+                    pkg_check_modules(LIBAVCODEC IMPORTED_TARGET libavcodec)
+                    pkg_check_modules(LIBAVUTIL IMPORTED_TARGET libavutil)
                     pkg_check_modules(FDKAAC IMPORTED_TARGET fdk-aac)
                     pkg_check_modules(LIBCURL IMPORTED_TARGET libcurl)
                     pkg_check_modules(LIBYUV IMPORTED_TARGET libyuv)
@@ -158,7 +171,7 @@ if(RTMP_ENABLE_NATIVE_TRANSCODE)
         endif()
     endif()
 
-    if(X265_FOUND AND X264_FOUND AND OPENH264_FOUND AND FDKAAC_FOUND AND LIBCURL_FOUND AND RTMP_LIBYUV_TARGET AND LIBDE265_FOUND)
+    if(X265_FOUND AND X264_FOUND AND OPENH264_FOUND AND LIBAVCODEC_FOUND AND LIBAVUTIL_FOUND AND FDKAAC_FOUND AND LIBCURL_FOUND AND RTMP_LIBYUV_TARGET AND LIBDE265_FOUND)
         set(RTMP_NATIVE_TRANSCODE_AVAILABLE ON)
         message(STATUS "Native transcoding pipeline: available (Source Transcode/HEVC will be built).")
     else()
@@ -172,10 +185,10 @@ if(RTMP_ENABLE_NATIVE_TRANSCODE)
         set(RTMP_NATIVE_TRANSCODE_AVAILABLE OFF)
         message(WARNING
             "RTMP_ENABLE_NATIVE_TRANSCODE=ON but dependencies are missing "
-            "(x265=${X265_FOUND} x264=${X264_FOUND} openh264=${OPENH264_FOUND} fdk-aac=${FDKAAC_FOUND} "
+            "(x265=${X265_FOUND} x264=${X264_FOUND} openh264=${OPENH264_FOUND} libavcodec=${LIBAVCODEC_FOUND} libavutil=${LIBAVUTIL_FOUND} fdk-aac=${FDKAAC_FOUND} "
             "libcurl=${LIBCURL_FOUND} libyuv=${LIBYUV_FOUND} libde265=${LIBDE265_FOUND}) -- building WITHOUT the "
             "native transcoding pipeline (Source Transcode/HEVC will be unavailable at runtime). Install them to "
             "enable it, e.g. on Ubuntu: "
-            "sudo apt-get install libx265-dev libx264-dev libopenh264-dev libfdk-aac-dev libcurl4-openssl-dev libyuv-dev libde265-dev")
+            "sudo apt-get install libx265-dev libx264-dev libopenh264-dev libavcodec-dev libavutil-dev libfdk-aac-dev libcurl4-openssl-dev libyuv-dev libde265-dev")
     endif()
 endif()

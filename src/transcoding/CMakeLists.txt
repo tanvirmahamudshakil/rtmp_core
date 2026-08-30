@@ -65,6 +65,8 @@ if(RTMP_NATIVE_TRANSCODE_AVAILABLE)
             PkgConfig::X265
             PkgConfig::X264
             PkgConfig::OPENH264
+            PkgConfig::LIBAVCODEC
+            PkgConfig::LIBAVUTIL
             PkgConfig::FDKAAC
             PkgConfig::LIBCURL
             PkgConfig::LIBDE265

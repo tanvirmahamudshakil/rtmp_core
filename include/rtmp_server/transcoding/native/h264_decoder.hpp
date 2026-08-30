@@ -20,12 +20,16 @@ namespace detail {
 
 } // namespace detail
 
-// Wraps an openh264 decoder. Input is Annex B (start-code prefixed) H.264 —
-// convert AVCC samples with media::h264::avcc_to_annexb first. Output is I420,
-// copied into a caller-owned YuvFrame so the pipeline can reuse buffers.
+// Wraps libavcodec's H.264 decoder. Input is Annex B (start-code prefixed)
+// H.264 — convert AVCC samples with media::h264::avcc_to_annexb first. Output
+// is 8-bit 4:2:0, copied into a caller-owned YuvFrame so the pipeline can
+// reuse buffers.
 //
-// openh264 is a delay-free CPU H.264 decoder (BSD licensed), which keeps the
-// whole transcode path software-only and free of any FFmpeg dependency.
+// libavcodec (not OpenH264) is used because real IPTV/broadcast sources ship
+// High profile — with 8x8 transform, custom scaling lists and CABAC — which
+// OpenH264's decoder cannot handle (it rejects every access unit). The
+// detail:: helpers below still classify OpenH264 DECODING_STATE bitmasks and
+// keep their unit tests; they are no longer on the runtime path.
 class H264Decoder {
 public:
     H264Decoder();
