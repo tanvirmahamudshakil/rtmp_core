@@ -184,6 +184,34 @@ TEST(SegmentStoreTest, RecoveryContinuesAfterFallbackWithoutReusingAPlaylistUrl)
     EXPECT_EQ(live->data.size(), 3072u);
 }
 
+TEST(SegmentStoreTest, SeamlessFallbackRecoveryOmitsTheDiscontinuityOnResume) {
+    SegmentStoreConfig config;
+    config.repeat_last_segment_on_stall = true;
+    config.seamless_fallback_recovery = true; // re-encoded, re-anchored timeline
+    SegmentStore store(config);
+
+    auto original = make_segment(7, 1024, false, 20ms);
+    store.add_segment(original);
+    std::this_thread::sleep_for(35ms);
+    (void)store.playlist(); // synthetic segment 8 (no discontinuity)
+
+    auto recovered = make_segment(8, 3072, false, 20ms);
+    store.add_segment(recovered);
+
+    const auto backfill = store.find_segment("segment-8.ts");
+    ASSERT_NE(backfill, nullptr);
+    EXPECT_FALSE(backfill->discontinuity);
+    const auto live = store.find_segment("segment-9.ts");
+    ASSERT_NE(live, nullptr);
+    // Re-numbered for URL monotonicity, but NOT marked discontinuous: the
+    // producer's output timeline is continuous across the outage.
+    EXPECT_FALSE(live->discontinuity);
+    EXPECT_EQ(live->data.size(), 3072u);
+
+    const auto playlist = store.playlist();
+    EXPECT_EQ(playlist.find("#EXT-X-DISCONTINUITY"), std::string::npos) << playlist;
+}
+
 TEST(SegmentStoreTest, OrdinaryPublishersDoNotRepeatSegmentsByDefault) {
     SegmentStore store;
     auto segment = make_segment(0, 1024, false, 20ms);

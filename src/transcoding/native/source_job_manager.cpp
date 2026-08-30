@@ -177,6 +177,12 @@ void SourceJobManager::build_renditions_locked(Job& job) {
         // puller's own stall detection is unaffected (SegmentStoreStats::
         // real_segments_added).
         store_config.repeat_last_segment_on_stall = true;
+        // Every rendition is fully re-encoded (SourceTranscoder) onto one
+        // re-anchored, monotonic output timeline, so recovery after an outage
+        // is seamless -- no EXT-X-DISCONTINUITY, which a flaky upstream would
+        // otherwise trigger every minute and freeze players on each one. A
+        // real discontinuity from the upstream playlist still propagates.
+        store_config.seamless_fallback_recovery = true;
         PullerRendition pr;
         pr.spec = spec;
         pr.store = std::make_shared<hls::SegmentStore>(store_config);

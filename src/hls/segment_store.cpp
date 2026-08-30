@@ -42,7 +42,12 @@ void SegmentStore::add_segment(SegmentPtr segment) {
     if (config_.repeat_last_segment_on_stall && !segments_.empty()) {
         const auto next = segments_.back()->sequence + 1;
         if (segment->sequence != next || fallback_active_) {
-            segment = copy_with_sequence(*segment, next, fallback_active_);
+            // Re-number for URL monotonicity regardless; only mark the
+            // recovery segment discontinuous when the producer's timeline is
+            // NOT seamless across the outage (see seamless_fallback_recovery).
+            const bool mark_discontinuous =
+                fallback_active_ && !config_.seamless_fallback_recovery;
+            segment = copy_with_sequence(*segment, next, mark_discontinuous);
         }
     }
 

@@ -38,6 +38,16 @@ struct SegmentStoreConfig {
     // synthetic copies carry discontinuities because their media timestamps
     // restart. Disabled for ordinary publishers; source-transcode jobs opt in.
     bool repeat_last_segment_on_stall = false;
+
+    // Set when the producer re-encodes onto one continuous, re-anchored
+    // output timeline (a source-transcode job): the first real segment after
+    // an outage then has identical codec parameters and monotonic PTS, so it
+    // needs no EXT-X-DISCONTINUITY. Without this, a source that stalls every
+    // minute stamps a discontinuity that often and players freeze crossing
+    // each one. A genuine EXT-X-DISCONTINUITY advertised by the upstream
+    // playlist still propagates (Segment::discontinuity). Off for passthrough
+    // ingest, where a post-outage timestamp jump is real.
+    bool seamless_fallback_recovery = false;
 };
 
 struct SegmentStoreStats {
