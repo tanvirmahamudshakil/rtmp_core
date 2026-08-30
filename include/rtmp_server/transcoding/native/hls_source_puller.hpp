@@ -59,8 +59,13 @@ private:
     // Classifies an HTTP(S) source as a bounded HLS playlist (master or media, resolved
     // to media_url_out) or a continuous raw HTTP-TS live feed (raw_ts_out set,
     // media_url_out == source_url_) — the two shapes this puller can ingest.
+    // reresolve_each_poll_out is set when the media playlist should be re-fetched
+    // from the ORIGINAL source_url_ on every poll (following its redirect afresh)
+    // rather than from a cached post-redirect URL: token-gated IPTV panels hand
+    // out a single-use redirect target per request and reject a reused one
+    // (HTTP 403/409/429/509), so the cached URL goes stale within seconds.
     [[nodiscard]] bool resolve_source(HttpClient& http, std::string& media_url_out, bool& raw_ts_out,
-                                      std::string& detail_out);
+                                      bool& reresolve_each_poll_out, std::string& detail_out);
     void set_detail(std::string detail);
 
     std::string source_url_;

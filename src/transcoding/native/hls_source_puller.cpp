@@ -247,7 +247,8 @@ std::string HlsSourcePuller::detail() const {
 }
 
 bool HlsSourcePuller::resolve_source(HttpClient& http, std::string& media_url_out, bool& raw_ts_out,
-                                     std::string& detail_out) {
+                                     bool& reresolve_each_poll_out, std::string& detail_out) {
+    reresolve_each_poll_out = false;
     // A bounded peek tells us the source's shape without downloading a
     // never-ending raw-TS body in full (that download would simply time out).
     std::vector<std::byte> peeked;
@@ -277,8 +278,14 @@ bool HlsSourcePuller::resolve_source(HttpClient& http, std::string& media_url_ou
     if (!is_master_playlist(text)) {
         // The playlist may have redirected to a different CDN host. Its
         // root-relative and path-relative segment URIs belong to that final
-        // URL, so retain it for every subsequent poll and parse.
+        // URL, so retain it as the parse base for this body.
         media_url_out = effective_source_url;
+        // If a redirect was actually followed, the target is very likely a
+        // per-request token URL (IPTV panels): reused, it returns 403/429/509
+        // within seconds. Re-run source_url_ (and its fresh redirect) on every
+        // poll instead. A source that did not redirect keeps polling the same
+        // URL as before -- source_url_ == effective_source_url there.
+        reresolve_each_poll_out = (effective_source_url != source_url_);
         return true;
     }
     const auto variants = parse_master_playlist(text, effective_source_url);
@@ -297,13 +304,19 @@ void HlsSourcePuller::run() {
     std::string detail;
     std::string media_url;
     bool raw_ts = false;
+    bool reresolve_each_poll = false;
     const bool rtmp_source = is_rtmp_source(source_url_);
-    if (!rtmp_source && !resolve_source(http, media_url, raw_ts, detail)) {
+    if (!rtmp_source && !resolve_source(http, media_url, raw_ts, reresolve_each_poll, detail)) {
         set_detail(detail.empty() ? "could not resolve source" : detail);
         status_.store(PullerStatus::Error);
         running_.store(false);
         return;
     }
+    // For a token-redirect source, the URL to poll each iteration is the
+    // original one -- libcurl follows its redirect to a fresh target every
+    // time, and effective_media_url (captured per fetch below) is the parse
+    // base for that body's segment URIs.
+    const std::string& poll_url = reresolve_each_poll ? source_url_ : media_url;
 
     // Build the decode-once / encode-per-rendition core and wire each rendition
     // to its own segmenter + segment store via a RenditionFeed.
@@ -818,16 +831,24 @@ void HlsSourcePuller::run() {
     // One pool for the whole job: its workers keep their libcurl handles (and
     // therefore their connections to the source's CDN) alive across polls.
     // Four concurrent fetches cover the 2-3 unseen segments a poll typically
-    // turns up without turning a many-job box into a download storm.
-    SegmentFetchPool segment_fetcher(4);
+    // turns up without turning a many-job box into a download storm. A
+    // token-redirect IPTV panel usually enforces a tiny per-account
+    // connection cap, so hold it to two there (playlist poll + one segment)
+    // to avoid tripping its 403/429/509 limiter.
+    SegmentFetchPool segment_fetcher(reresolve_each_poll ? 2 : 4);
     const std::function<bool()> fetch_should_continue = [this] { return running_.load(); };
 
     while (running_.load()) {
         std::vector<std::byte> playlist_bytes;
         std::string effective_media_url;
-        if (auto r = http.get(media_url, playlist_bytes, &effective_media_url); !r) {
+        if (auto r = http.get(poll_url, playlist_bytes, &effective_media_url); !r) {
             set_detail(r.error().message());
-            if (++consecutive_errors >= 5) {
+            // A token-redirect source that briefly over-limits (403/429/509)
+            // recovers on the very next poll, which fetches a fresh token via
+            // poll_url == source_url_. Give it more attempts before declaring
+            // the job failed so a transient panel throttle is not fatal.
+            const int error_ceiling = reresolve_each_poll ? 20 : 5;
+            if (++consecutive_errors >= error_ceiling) {
                 status_.store(PullerStatus::Error);
                 break;
             }

@@ -1274,23 +1274,22 @@ if (( VARNISH_TRANSIENT_MB > 8192 )); then VARNISH_TRANSIENT_MB=8192; fi
 VARNISH_THREAD_POOLS=$(( (WORKERS + 3) / 4 ))
 if (( VARNISH_THREAD_POOLS < 2 )); then VARNISH_THREAD_POOLS=2; fi
 if (( VARNISH_THREAD_POOLS > 16 )); then VARNISH_THREAD_POOLS=16; fi
-# Varnish has no literal "unlimited" for its worker pool. Both the ceiling
-# and the pre-warmed minimum are sized from RAM (~80 KiB of stack per
-# thread), so a small box never reserves or spawns more thread stacks than
-# it can hold, while a large box gets a genuinely deep pool. thread_pool_min
-# is pre-warmed so a flash crowd is served immediately instead of waiting on
-# the thread-spawn cadence; the overflow queue is effectively unbounded.
-# Ceiling: total worker stacks may use up to a quarter of RAM.
-VARNISH_THREAD_POOL_MAX=$(( MEM_TOTAL_KB / 4 / 80 / VARNISH_THREAD_POOLS ))
-if (( VARNISH_THREAD_POOL_MAX < 2000 )); then VARNISH_THREAD_POOL_MAX=2000; fi
-if (( VARNISH_THREAD_POOL_MAX > 20000 )); then VARNISH_THREAD_POOL_MAX=20000; fi
-# Pre-warm: total min*pools stays under 5% of RAM in thread stacks.
-VARNISH_THREAD_POOL_MIN=$(( MEM_TOTAL_KB / 20 / 80 / VARNISH_THREAD_POOLS ))
+# thread_pool_max is capped at 5000 per pool by varnishd itself, so the real
+# ceiling on concurrent request-serving threads is thread_pools * 5000
+# (e.g. 8 pools -> 40000 -- already far more than any cache-HIT workload
+# needs, since a HIT is served in microseconds). Do not exceed 5000 here or
+# varnishd refuses to start.
+VARNISH_THREAD_POOL_MAX=5000
+# Pre-warm a modest number per pool so a flash crowd is served without
+# waiting on thread spawn, but nowhere near the ceiling (pre-warmed threads
+# are actually allocated at startup). Scale gently with RAM, hard-capped so
+# min can never approach thread_pool_max and startup stays fast.
+VARNISH_THREAD_POOL_MIN=$(( MEM_TOTAL_KB / 40 / 80 / VARNISH_THREAD_POOLS ))
 if (( VARNISH_THREAD_POOL_MIN < 100 )); then VARNISH_THREAD_POOL_MIN=100; fi
-if (( VARNISH_THREAD_POOL_MIN > VARNISH_THREAD_POOL_MAX )); then
-  VARNISH_THREAD_POOL_MIN=${VARNISH_THREAD_POOL_MAX}
-fi
-VARNISH_THREAD_QUEUE_LIMIT=1000000
+if (( VARNISH_THREAD_POOL_MIN > 1000 )); then VARNISH_THREAD_POOL_MIN=1000; fi
+# Requests allowed to wait for a free thread before Varnish sheds load. Kept
+# large but within a value varnishd accepts across versions.
+VARNISH_THREAD_QUEUE_LIMIT=100000
 # The Varnish->origin backend has no .max_connections cap (see
 # deploy/varnish/streamforge.vcl): concurrent cache MISSes are bounded only
 # by the origin's own HTTP worker pool, never by Varnish. A stale numeric
@@ -1302,7 +1301,11 @@ install -d -m 0755 /etc/systemd/system/varnish.service.d
 cat > /etc/systemd/system/varnish.service.d/streamforge.conf <<EOF
 [Service]
 ExecStart=
-ExecStart=/usr/sbin/varnishd -j unix,user=vcache -F -a 127.0.0.1:6081 -T localhost:6082 -f /etc/varnish/streamforge.vcl -S /etc/varnish/secret -s malloc,${VARNISH_CACHE_MB}m -s Transient=malloc,${VARNISH_TRANSIENT_MB}m -p thread_pools=${VARNISH_THREAD_POOLS} -p thread_pool_min=${VARNISH_THREAD_POOL_MIN} -p thread_pool_max=${VARNISH_THREAD_POOL_MAX} -p thread_queue_limit=${VARNISH_THREAD_QUEUE_LIMIT} -p thread_pool_add_delay=0 -p nuke_limit=1000 -p listen_depth=65535
+# thread_pool_max is passed BEFORE thread_pool_min: varnishd validates each
+# -p as it parses, and thread_pool_min is rejected if it exceeds the
+# thread_pool_max currently in effect (the default 5000). Setting max first
+# keeps the pair consistent regardless of the numbers.
+ExecStart=/usr/sbin/varnishd -j unix,user=vcache -F -a 127.0.0.1:6081 -T localhost:6082 -f /etc/varnish/streamforge.vcl -S /etc/varnish/secret -s malloc,${VARNISH_CACHE_MB}m -s Transient=malloc,${VARNISH_TRANSIENT_MB}m -p thread_pools=${VARNISH_THREAD_POOLS} -p thread_pool_max=${VARNISH_THREAD_POOL_MAX} -p thread_pool_min=${VARNISH_THREAD_POOL_MIN} -p thread_queue_limit=${VARNISH_THREAD_QUEUE_LIMIT} -p nuke_limit=1000 -p listen_depth=65535
 LimitNOFILE=${NOFILE}
 TasksMax=infinity
 LimitNPROC=infinity
