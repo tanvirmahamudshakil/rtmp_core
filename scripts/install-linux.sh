@@ -1174,17 +1174,24 @@ if [[ "${HW_QUEUES}" =~ ^[0-9]+$ ]] && (( HW_QUEUES > 0 && HW_QUEUES < NCPU )); 
   done
 fi
 
+# A multi-queue NIC (after ethtool -L above) carries an "mq" root qdisc that
+# `tc qdisc replace root ...` cannot convert in place ("Change operation not
+# supported by specified qdisc"). Clear whatever root is present first, then
+# install ours. Best-effort throughout: shaping is an optimisation, not a
+# correctness requirement, so a tc failure must never abort the tune script
+# (and with it the installer).
+tc qdisc del dev "${RTMP_INTERFACE}" root >/dev/null 2>&1 || true
 if (( RTMP_SHAPE_MBIT <= 10000 )) && modprobe sch_cake 2>/dev/null; then
   tc qdisc replace dev "${RTMP_INTERFACE}" root cake bandwidth "${RTMP_SHAPE_MBIT}Mbit" \
-    besteffort dual-dsthost nat nowash
+    besteffort dual-dsthost nat nowash || true
 else
   # CAKE becomes CPU-expensive at 10G+ line rates. HTB provides the required
   # join headroom while fq fairly schedules the individual HTTP flows.
-  tc qdisc replace dev "${RTMP_INTERFACE}" root handle 1: htb default 10
-  tc class replace dev "${RTMP_INTERFACE}" parent 1: classid 1:10 htb \
-    rate "${RTMP_SHAPE_MBIT}Mbit" ceil "${RTMP_SHAPE_MBIT}Mbit" burst 16m cburst 16m
-  tc qdisc replace dev "${RTMP_INTERFACE}" parent 1:10 handle 10: \
-    fq limit 100000 flow_limit 1000 buckets 65536
+  tc qdisc add dev "${RTMP_INTERFACE}" root handle 1: htb default 10 || true
+  tc class add dev "${RTMP_INTERFACE}" parent 1: classid 1:10 htb \
+    rate "${RTMP_SHAPE_MBIT}Mbit" ceil "${RTMP_SHAPE_MBIT}Mbit" burst 16m cburst 16m || true
+  tc qdisc add dev "${RTMP_INTERFACE}" parent 1:10 handle 10: \
+    fq limit 100000 flow_limit 1000 buckets 65536 || true
 fi
 EOF
   chmod 0755 /usr/local/sbin/rtmp-network-tune
