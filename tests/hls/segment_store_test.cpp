@@ -146,11 +146,15 @@ TEST(SegmentStoreTest, RepeatsLastGoodSegmentWhileAConfiguredSourceIsStalled) {
 
     const auto playlist = store.playlist();
     ASSERT_NE(playlist.find("segment-41.ts"), std::string::npos) << playlist;
-    ASSERT_NE(playlist.find("#EXT-X-DISCONTINUITY"), std::string::npos) << playlist;
 
     const auto fallback = store.find_segment("segment-41.ts");
     ASSERT_NE(fallback, nullptr);
-    EXPECT_TRUE(fallback->discontinuity);
+    // A backfill copy is byte-identical to a segment the player already
+    // decoded: it replays cleanly and carries no EXT-X-DISCONTINUITY. The
+    // real break is signalled on the first live segment after recovery
+    // (see RecoveryContinuesAfterFallbackWithoutReusingAPlaylistUrl).
+    EXPECT_FALSE(fallback->discontinuity);
+    EXPECT_EQ(playlist.find("#EXT-X-DISCONTINUITY"), std::string::npos) << playlist;
     EXPECT_EQ(fallback->data.size(), original->data.size());
     EXPECT_EQ(fallback->data.view().data(), original->data.view().data());
     EXPECT_EQ(store.stats().fallback_segments_added, 1u);

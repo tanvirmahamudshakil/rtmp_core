@@ -115,7 +115,15 @@ void SegmentStore::append_fallback_if_due_locked() {
 
     for (std::size_t appended = 0; appended < backfill_count; ++appended) {
         const auto next = segments_.back()->sequence + 1;
-        auto fallback = copy_with_sequence(*segments_.back(), next, /*force_discontinuity=*/true);
+        // A backfill copy is byte-identical to a segment the player already
+        // decoded, so it needs no EXT-X-DISCONTINUITY -- the player just
+        // replays it (a brief freeze). The genuine break is the *first real
+        // segment after the stall*, whose content skips the outage; that one
+        // is marked discontinuous in append() via fallback_active_. Marking
+        // every backfill copy too made a flaky source (one that stalls every
+        // ~15-20 s) emit a discontinuity every few segments, which forces a
+        // decoder rebuild that often -- a permanent stutter.
+        auto fallback = copy_with_sequence(*segments_.back(), next, /*force_discontinuity=*/false);
         append_locked(std::move(fallback), /*fallback=*/true);
     }
 }
