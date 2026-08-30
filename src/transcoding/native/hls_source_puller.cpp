@@ -997,16 +997,31 @@ void HlsSourcePuller::run() {
             const bool sequence_gap =
                 last_ingested_sequence &&
                 segment->sequence != *last_ingested_sequence + 1;
-            if (segment->discontinuity || sequence_gap) {
+            if (segment->discontinuity) {
+                // The source itself advertised EXT-X-DISCONTINUITY: a real
+                // content/parameter break the player must reset across.
+                // Propagate it fully -- mark the output segment AND
+                // re-anchor the transcoder clock (the latter may not exist
+                // yet if this precedes the PMT ever being parsed).
                 for (auto& feed : feeds) feed->mark_discontinuity();
-                // Also reset the transcoder's own video clock gate -- see
-                // SourceTranscoder::mark_discontinuity()'s comment for why
-                // skipping this left video frozen (while audio kept
-                // playing) after exactly this kind of gap. The transcoder
-                // may not exist yet if this discontinuity precedes the PMT
-                // ever being parsed (e.g. the very first segment is itself
-                // discontinuous); nothing to re-anchor in that case.
                 if (transcoder) transcoder->mark_discontinuity();
+            } else if (sequence_gap) {
+                if (transcoder) {
+                    // Only the sequence number jumped, with no discontinuity
+                    // tag from the source -- almost always a token-redirect
+                    // panel load-balancing us onto another backend whose
+                    // counter is independent. The broadcast is continuous and
+                    // the transcoder re-encodes it onto one timeline with
+                    // unchanged SPS/PPS, so re-anchor its clock but do NOT
+                    // emit EXT-X-DISCONTINUITY: the tag would force every
+                    // player to rebuild its decoder on each backend hop,
+                    // which shows up as a constant stutter.
+                    transcoder->mark_discontinuity();
+                } else {
+                    // Passthrough (no re-encode): the gap cannot be smoothed,
+                    // so the output segment must carry the marker.
+                    for (auto& feed : feeds) feed->mark_discontinuity();
+                }
             }
             auto demuxed = demux.feed(result.value());
             if (!demuxed) pipeline_error = demuxed.error();

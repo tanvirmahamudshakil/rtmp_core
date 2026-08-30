@@ -218,7 +218,10 @@ int main(int argc, char** argv) {
         [&hls_handler](std::string_view application,
                        std::string_view stream) -> std::shared_ptr<rtmp_server::protocol::commands::RecorderSink> {
             rtmp_server::hls::SegmentStoreConfig store_config;
-            store_config.live_window_segments = 6;
+            // A deeper live window (10 x 6 s = 60 s) gives players a large
+            // rebuffer cushion, so an occasional upstream hiccup or backend
+            // hop does not stall playback.
+            store_config.live_window_segments = 10;
             store_config.retention_grace_segments = 6;
             store_config.max_total_bytes = 256u * 1024u * 1024u;
             // 6 s segments: at a large single-box audience this cuts each
@@ -397,6 +400,11 @@ int main(int argc, char** argv) {
     // per-rendition byte budget grows in step so a high-bitrate rendition
     // still evicts on segment count, not on the cap.
     source_job_options.target_duration_seconds = 6;
+    // Deeper live window (10 x 6 s): a pulled source is not under this
+    // server's control and can stall or hop CDN backends at any moment; a
+    // 60 s player cushion keeps playback smooth across that.
+    source_job_options.live_window_segments = 10;
+    source_job_options.retention_grace_segments = 6;
     source_job_options.max_total_bytes_per_rendition = 256u * 1024u * 1024u;
     rtmp_server::transcoding::native::SourceJobManager source_job_manager(std::move(source_hooks), store.get(),
                                                                           source_job_options);
