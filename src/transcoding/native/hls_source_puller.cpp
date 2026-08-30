@@ -312,11 +312,16 @@ void HlsSourcePuller::run() {
         running_.store(false);
         return;
     }
-    // For a token-redirect source, the URL to poll each iteration is the
-    // original one -- libcurl follows its redirect to a fresh target every
-    // time, and effective_media_url (captured per fetch below) is the parse
-    // base for that body's segment URIs.
-    const std::string& poll_url = reresolve_each_poll ? source_url_ : media_url;
+    // The URL polled each iteration. For a token-redirect source this is the
+    // post-redirect (tokenised) URL and it is kept as long as it works: the
+    // panel load-balances source_url_ across several backends whose media
+    // sequence numbers are independent, so re-resolving on every poll makes
+    // the sequence jump backends constantly and the ingest treats every jump
+    // as a real EXT-X-DISCONTINUITY (the player then re-inits its decoder
+    // every few segments -- visible as a permanent stutter). Re-resolution
+    // happens only when the current token URL actually fails (below), which
+    // costs at most one genuine discontinuity per token lifetime.
+    std::string poll_url = media_url;
 
     // Build the decode-once / encode-per-rendition core and wire each rendition
     // to its own segmenter + segment store via a RenditionFeed.
@@ -843,10 +848,23 @@ void HlsSourcePuller::run() {
         std::string effective_media_url;
         if (auto r = http.get(poll_url, playlist_bytes, &effective_media_url); !r) {
             set_detail(r.error().message());
-            // A token-redirect source that briefly over-limits (403/429/509)
-            // recovers on the very next poll, which fetches a fresh token via
-            // poll_url == source_url_. Give it more attempts before declaring
-            // the job failed so a transient panel throttle is not fatal.
+            // The tokenised URL has most likely expired / hit the panel's
+            // per-token connection cap (403/429/509). Re-resolve once from
+            // source_url_ to mint a fresh token URL and keep polling that;
+            // the sequence discontinuity this may introduce is a real one
+            // and rare (once per token lifetime), not once per poll.
+            if (reresolve_each_poll) {
+                std::string refreshed;
+                bool refreshed_raw = false;
+                bool refreshed_flag = false;
+                std::string ignore_detail;
+                if (resolve_source(http, refreshed, refreshed_raw, refreshed_flag, ignore_detail) &&
+                    !refreshed_raw && !refreshed.empty()) {
+                    poll_url = refreshed;
+                }
+            }
+            // Give a token-redirect source more attempts before declaring the
+            // job failed so a transient panel throttle is not fatal.
             const int error_ceiling = reresolve_each_poll ? 20 : 5;
             if (++consecutive_errors >= error_ceiling) {
                 status_.store(PullerStatus::Error);
