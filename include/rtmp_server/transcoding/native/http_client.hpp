@@ -26,6 +26,14 @@ public:
     HttpClient(const HttpClient&) = delete;
     HttpClient& operator=(const HttpClient&) = delete;
 
+    // When set, every request opens a fresh connection and closes it on
+    // completion instead of keeping it in libcurl's pool for reuse. Needed
+    // for a source behind a panel that enforces a tiny per-account
+    // concurrent-connection cap (Xtream-style 509): a pooled idle connection
+    // from an earlier poll otherwise still counts against that cap when the
+    // next poll or segment fetch opens another.
+    void set_forbid_connection_reuse(bool value) noexcept { forbid_reuse_ = value; }
+
     // Fetches `url` into `out` (replacing its contents). Fails on transport
     // error or any non-2xx status. Intended for small, bounded bodies
     // (playlists, TS segments) — never a continuously-flowing stream.
@@ -53,6 +61,7 @@ public:
 private:
     void* handle_ = nullptr; // CURL*
     std::chrono::seconds timeout_;
+    bool forbid_reuse_ = false;
 };
 
 } // namespace rtmp_server::transcoding::native

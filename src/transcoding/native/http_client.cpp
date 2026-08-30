@@ -94,6 +94,13 @@ core::Result<void> HttpClient::get(const std::string& url, std::vector<std::byte
     curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, ""); // allow gzip
     curl_easy_setopt(curl, CURLOPT_USERAGENT, "rtmp_core-source-transcoder/1.0");
 
+    if (forbid_reuse_) {
+        // Do not reuse a pooled connection and do not leave this one pooled:
+        // a panel that caps concurrent connections per account counts an idle
+        // keep-alive from a previous request against the next one.
+        curl_easy_setopt(curl, CURLOPT_FRESH_CONNECT, 1L);
+        curl_easy_setopt(curl, CURLOPT_FORBID_REUSE, 1L);
+    }
     const CURLcode code = curl_easy_perform(curl);
     if (code != CURLE_OK) return http_error(std::string("HTTP GET failed: ") + curl_easy_strerror(code));
 
@@ -127,6 +134,13 @@ core::Result<void> HttpClient::peek(const std::string& url, std::size_t max_byte
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
     curl_easy_setopt(curl, CURLOPT_USERAGENT, "rtmp_core-source-transcoder/1.0");
 
+    if (forbid_reuse_) {
+        // Do not reuse a pooled connection and do not leave this one pooled:
+        // a panel that caps concurrent connections per account counts an idle
+        // keep-alive from a previous request against the next one.
+        curl_easy_setopt(curl, CURLOPT_FRESH_CONNECT, 1L);
+        curl_easy_setopt(curl, CURLOPT_FORBID_REUSE, 1L);
+    }
     const CURLcode code = curl_easy_perform(curl);
     // A short write from peek_write_cb (i.e. we already have max_bytes) is the
     // expected way this transfer ends; only a genuine transport failure with
@@ -164,6 +178,13 @@ core::Result<void> HttpClient::stream(const std::string& url,
     curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, stream_progress_cb);
     curl_easy_setopt(curl, CURLOPT_XFERINFODATA, &state);
 
+    if (forbid_reuse_) {
+        // Do not reuse a pooled connection and do not leave this one pooled:
+        // a panel that caps concurrent connections per account counts an idle
+        // keep-alive from a previous request against the next one.
+        curl_easy_setopt(curl, CURLOPT_FRESH_CONNECT, 1L);
+        curl_easy_setopt(curl, CURLOPT_FORBID_REUSE, 1L);
+    }
     const CURLcode code = curl_easy_perform(curl);
     if (code == CURLE_ABORTED_BY_CALLBACK || code == CURLE_WRITE_ERROR) return {}; // caller asked to stop
     if (code != CURLE_OK) return http_error(std::string("HTTP GET failed: ") + curl_easy_strerror(code));

@@ -78,10 +78,14 @@ class SegmentFetchPool {
 public:
     using Body = core::Result<std::vector<std::byte>>;
 
-    explicit SegmentFetchPool(std::size_t workers) {
+    explicit SegmentFetchPool(std::size_t workers, bool forbid_connection_reuse = false) {
         workers = std::clamp<std::size_t>(workers, 1, 8);
         clients_.reserve(workers);
-        for (std::size_t i = 0; i < workers; ++i) clients_.push_back(std::make_unique<HttpClient>());
+        for (std::size_t i = 0; i < workers; ++i) {
+            auto client = std::make_unique<HttpClient>();
+            client->set_forbid_connection_reuse(forbid_connection_reuse);
+            clients_.push_back(std::move(client));
+        }
         threads_.reserve(workers);
         for (std::size_t i = 0; i < workers; ++i) threads_.emplace_back([this, i] { worker(i); });
     }
@@ -322,6 +326,14 @@ void HlsSourcePuller::run() {
     // happens only when the current token URL actually fails (below), which
     // costs at most one genuine discontinuity per token lifetime.
     std::string poll_url = media_url;
+
+    // A token-redirect panel almost always enforces a tiny per-account
+    // concurrent-connection cap. Force every request to this source onto its
+    // own short-lived connection so a pooled idle keep-alive from the last
+    // poll never collides with the next poll or a segment fetch (which
+    // otherwise shows up as a relentless HTTP 509 and the stalls/
+    // discontinuities that follow).
+    if (reresolve_each_poll) http.set_forbid_connection_reuse(true);
 
     // Build the decode-once / encode-per-rendition core and wire each rendition
     // to its own segmenter + segment store via a RenditionFeed.
@@ -838,9 +850,11 @@ void HlsSourcePuller::run() {
     // Four concurrent fetches cover the 2-3 unseen segments a poll typically
     // turns up without turning a many-job box into a download storm. A
     // token-redirect IPTV panel usually enforces a tiny per-account
-    // connection cap, so hold it to two there (playlist poll + one segment)
-    // to avoid tripping its 403/429/509 limiter.
-    SegmentFetchPool segment_fetcher(reresolve_each_poll ? 2 : 4);
+    // connection cap, so hold it to a single fetch worker there, on its own
+    // non-pooled connection, and only ever while the (sequential) playlist
+    // poll is not itself talking to the source -- peak concurrency 1.
+    SegmentFetchPool segment_fetcher(reresolve_each_poll ? 1 : 4,
+                                     /*forbid_connection_reuse=*/reresolve_each_poll);
     const std::function<bool()> fetch_should_continue = [this] { return running_.load(); };
 
     while (running_.load()) {
