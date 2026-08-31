@@ -14,8 +14,11 @@
 # viewer counts, which the Varnish-collapsed origin cannot observe itself.
 add_library(rtmp_server_control STATIC
     http_server.cpp
+    http_message.cpp
+    async_http_server.cpp
     management_api.cpp
     hls_http_handler.cpp
+    viewer_session_tracker.cpp
     edge_viewer_stats.cpp
     settings_schema.cpp
     settings_codec.cpp

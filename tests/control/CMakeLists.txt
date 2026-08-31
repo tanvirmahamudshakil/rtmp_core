@@ -2,6 +2,7 @@ add_executable(rtmp_server_control_tests
     http_server_test.cpp
     management_api_test.cpp
     edge_viewer_stats_test.cpp
+    viewer_session_tracker_test.cpp
 )
 
 target_link_libraries(rtmp_server_control_tests PRIVATE

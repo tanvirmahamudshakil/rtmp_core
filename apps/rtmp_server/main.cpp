@@ -14,6 +14,7 @@
 
 #include "rtmp_server/authentication/rtmp_authenticator.hpp"
 #include "rtmp_server/control/edge_viewer_stats.hpp"
+#include "rtmp_server/control/async_http_server.hpp"
 #include "rtmp_server/control/hls_http_handler.hpp"
 #include "rtmp_server/control/http_server.hpp"
 #include "rtmp_server/control/management_api.hpp"
@@ -554,45 +555,53 @@ int main(int argc, char** argv) {
     hls_handler.set_next([&management_api](const rtmp_server::control::HttpRequest& request) {
         return management_api.handle(request);
     });
-    // Caddy drains these loopback responses and performs the public
-    // asynchronous client I/O. HLS players request a newly published segment
-    // in synchronized bursts, so size the blocking loopback pool from the
-    // machine rather than imposing the old fixed 16-request bottleneck.
+    // Origin HTTP delivery for /hls plus the management API.
     //
-    // The pool is one blocking worker per in-flight request (keep-alive is
-    // off below), so it also bounds how many concurrent cache MISSes / fresh
-    // per-viewer playlist redirects the origin can serve at once. A join
-    // stampede on a large audience needs thousands of those in flight for a
-    // few milliseconds each, so the ceiling is deliberately far above the
-    // core count -- idle worker threads cost only their (lazily faulted)
-    // stack, while too low a ceiling turns a join spike into origin 503s
-    // even though every segment/playlist body is already cache-hot. Paired
-    // with an unbounded pending queue below, the origin never rejects a
-    // loopback request for load: it either has a free worker or the request
-    // waits microseconds for one, with no audience-size cap.
+    // Event-driven, not one thread per connection: connection count is
+    // decoupled from thread count, so the origin's capacity is set by file
+    // descriptors and bandwidth rather than by a pool size. The previous
+    // blocking server pinned a worker to a connection for its whole life,
+    // which made the pool the real viewer ceiling and forced two workarounds
+    // that are no longer needed -- an oversized pool (cores * 32) and
+    // keep-alive disabled entirely.
     //
-    // Scales from the machine's real logical-core count at runtime. The pool
-    // only has to cover concurrent cache MISSes: with the shared cache doing
-    // request coalescing (and errors now cached, see streamforge.vcl) a join
-    // stampede on a well-cached origin produces at most a few hundred to a
-    // couple thousand simultaneous origin fetches, not tens of thousands, so
-    // cores*32 with a modest ceiling is ample. Keeping the number sane also
-    // keeps the process's committed virtual memory (8 MiB default stack per
-    // thread) reasonable on hosts with strict overcommit accounting.
-    const auto hardware_threads = std::max(1U, std::thread::hardware_concurrency());
-    const auto hls_http_workers =
-        std::clamp<std::size_t>(static_cast<std::size_t>(hardware_threads) * 32, 256, 4096);
-    rtmp_server::control::HttpServerOptions api_server_options{
-        config.api_bind_address, config.api_port, 65'535, hls_http_workers,
-        std::numeric_limits<std::size_t>::max(), 16 * 1024, 128 * 1024};
-    // This server assigns one blocking worker to a connection for its entire
-    // keep-alive lifetime. A cache restart can leave hundreds of backend
-    // connections queued while every worker waits idle on an earlier one,
-    // starving health, playlist, and segment requests despite an otherwise
-    // idle machine. Loopback TCP setup is cheap; close after each response so
-    // workers are scheduled per request and no idle connection owns a slot.
-    api_server_options.enable_keep_alive = false;
-    rtmp_server::control::HttpServer api_server(api_server_options);
+    // One loop per core is the right number here and multiplying it buys
+    // nothing: a loop is CPU-bound on its own thread and never blocks on a
+    // socket, so extra loops would only add scheduler pressure. On Linux each
+    // loop takes its own SO_REUSEPORT listener, so accepts scale with cores
+    // instead of funnelling through a single queue.
+    //
+    // Handlers run on a loop thread, so they must not block. HlsHttpHandler
+    // satisfies that: its request counters are atomics, its stream registry is
+    // read under a shared lock, and its viewer-session accounting is sharded
+    // (see hls_http_handler.hpp and viewer_session_tracker.hpp).
+    rtmp_server::control::AsyncHttpServerOptions api_server_options;
+    api_server_options.bind_address = config.api_bind_address;
+    api_server_options.port = config.api_port;
+    api_server_options.listen_backlog = 65'535;
+    api_server_options.event_loops =
+        std::max<std::size_t>(1, std::thread::hardware_concurrency());
+    // Unbounded by request, as before: the process fd limit (LimitNOFILE in
+    // deploy/systemd/rtmp-server.service) is the real ceiling, and refusing a
+    // loopback request for load would turn a join spike into origin 503s even
+    // though every segment body is already cache-hot.
+    api_server_options.max_connections = 0;
+    api_server_options.max_header_bytes = 16 * 1024;
+    api_server_options.max_body_bytes = 128 * 1024;
+    // Now safe to leave on, and worth it: an idle keep-alive connection costs
+    // an entry in an interest set rather than a thread, so the cache's
+    // backend connections no longer starve playlist and segment requests. This
+    // removes a full TCP setup per loopback request at every viewer's segment
+    // cadence.
+    api_server_options.enable_keep_alive = true;
+    // The old 1000-request cap existed to bound how long one client could hold
+    // a worker thread. No thread is held now, so the bound's only remaining
+    // job is to recycle a connection occasionally -- and the peers here are
+    // Caddy and Varnish over loopback, which reuse a connection for minutes at
+    // every viewer's segment cadence. Recycling every 1000 requests would
+    // reintroduce exactly the connection churn keep-alive is here to remove.
+    api_server_options.max_requests_per_connection = 1'000'000;
+    rtmp_server::control::AsyncHttpServer api_server(api_server_options);
     api_server.set_handler([&hls_handler](const rtmp_server::control::HttpRequest& request) {
         return hls_handler.handle(request);
     });

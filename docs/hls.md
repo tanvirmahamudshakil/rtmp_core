@@ -258,10 +258,17 @@ Keep 10-20% headroom for protocol overhead, bursts and retransmissions and use
 the provider's committed egress rate, not merely the virtual NIC's displayed
 link speed.
 
-The production installer enforces that headroom with fair egress scheduling:
-CAKE up to 10 Gbps, or HTB plus `fq` above it. Consequently a new viewer's
-playlist and first advertised (already cached) segment are not stuck behind
-all established viewers in the provider's saturated FIFO/policer queue.
+The production installer enforces that headroom with fair egress scheduling.
+On a multi-queue NIC it shapes under `mq`, splitting the target rate evenly
+across an HTB class plus `fq` per TX queue (`scripts/install-linux.sh`,
+`rtmp-network-tune`) so shaping work spreads across as many cores as there
+are queues instead of serialising every outgoing packet through one root
+qdisc's lock — the single-queue path (CAKE up to 10 Gbps, or HTB plus `fq`
+above it) is used only when the NIC exposes one TX queue and there is no
+parallelism to gain. Consequently a new viewer's playlist and first
+advertised (already cached) segment are not stuck behind all established
+viewers in the provider's saturated FIFO/policer queue, and total shaping
+throughput is not capped by a single CPU core's packet-processing rate.
 
 ### Cache-Control
 

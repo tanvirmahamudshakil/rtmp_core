@@ -1,14 +1,18 @@
 #pragma once
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <functional>
 #include <memory>
-#include <mutex>
+#include <shared_mutex>
 #include <string>
+#include <string_view>
 #include <unordered_map>
+#include <vector>
 
 #include "rtmp_server/control/http_server.hpp"
+#include "rtmp_server/control/viewer_session_tracker.hpp"
 #include "rtmp_server/hls/playlist.hpp"
 #include "rtmp_server/hls/segment_store.hpp"
 
@@ -218,29 +222,57 @@ private:
     // sessions are simultaneously live.
     static constexpr std::size_t kMaxTrackedViewerSessions = 500000;
 
+    // Held by shared_ptr and never copied: a request resolves the entry
+    // under a shared lock, takes a reference count, and then works entirely
+    // outside the registry lock. Every field a request mutates is either
+    // atomic or internally sharded, so concurrent requests to the same
+    // stream do not serialise against each other -- which is the whole
+    // point once the HTTP layer stops being one-thread-per-connection.
     struct StreamEntry {
-        std::shared_ptr<hls::SegmentStore> store;
-        std::vector<hls::Rendition> renditions;
-        // Both guarded by mutex_, same lock already taken per-request for
-        // stats_ below — piggybacking avoids adding new contention.
-        std::uint64_t bytes_total = 0;
-        std::unordered_map<std::string, std::chrono::steady_clock::time_point> recent_viewer_sessions;
+        // Swapped by register_stream()/set_renditions() while readers may
+        // hold the entry, so both are atomic shared_ptrs rather than plain
+        // members: a reader either sees the old value or the new one, never
+        // a torn or freed pointer. Renditions are held as an immutable
+        // vector so publishing a new ladder is a pointer store, not a copy
+        // under a lock.
+        std::atomic<std::shared_ptr<hls::SegmentStore>> store;
+        std::atomic<std::shared_ptr<const std::vector<hls::Rendition>>> renditions;
+
+        std::atomic<std::uint64_t> bytes_total{0};
+        ViewerSessionTracker sessions{kViewerWindow, kMaxTrackedViewerSessions};
     };
+    using StreamEntryPtr = std::shared_ptr<StreamEntry>;
+
+    // Resolves "application/stream" to its entry under a shared lock.
+    // Returns nullptr when the stream is not registered.
+    [[nodiscard]] StreamEntryPtr find_entry(const std::string& application,
+                                            const std::string& stream) const;
+    // Resolves, creating the entry if absent. Writer path only.
+    [[nodiscard]] StreamEntryPtr find_or_create_entry(const std::string& application,
+                                                      const std::string& stream);
 
     // Records one successful delivery for `application/stream` — called for
     // every 2xx/206 media-playlist or segment response. No-op if the stream
     // was unregistered between building the response and this call.
-    void record_delivery(const std::string& application, const std::string& stream, std::uint64_t bytes,
-                         const std::string& playback_session);
+    // Takes the entry the request already resolved rather than looking it up
+    // again: the second lookup was pure duplicated work on the hottest path,
+    // and it could also race with unregistration in a way that silently
+    // dropped the accounting for a stream still being served.
+    static void record_delivery(StreamEntry& entry, std::uint64_t bytes,
+                                std::string_view playback_session);
 
     [[nodiscard]] bool authorized(const HttpRequest& request, const std::string& application,
                                   const std::string& stream) const;
-    [[nodiscard]] HttpResponse serve_media_playlist(const HttpRequest& request, const StreamEntry& entry,
+    // Take the already-resolved store/renditions rather than the entry, so
+    // each helper's dependency is explicit and no helper can accidentally
+    // re-read an atomic member and observe a different value mid-request.
+    [[nodiscard]] HttpResponse serve_media_playlist(const HttpRequest& request, hls::SegmentStore& store,
                                                     const std::string& application,
                                                     const std::string& stream);
-    [[nodiscard]] HttpResponse serve_master_playlist(const HttpRequest& request, const StreamEntry& entry,
+    [[nodiscard]] HttpResponse serve_master_playlist(const HttpRequest& request,
+                                                     const std::vector<hls::Rendition>& renditions,
                                                      const std::string& application);
-    [[nodiscard]] HttpResponse serve_segment(const HttpRequest& request, const StreamEntry& entry,
+    [[nodiscard]] HttpResponse serve_segment(const HttpRequest& request, hls::SegmentStore& store,
                                              const std::string& name);
     void decorate(HttpResponse& response, const std::string& cache_control) const;
 
@@ -248,9 +280,22 @@ private:
     HttpHandler next_;
     StreamEnabledChecker enabled_checker_;
 
-    mutable std::mutex mutex_;
-    std::unordered_map<std::string, StreamEntry> streams_; // key: "app/stream"
-    mutable Stats stats_;
+    // Guards only the registry's shape (which keys exist), not the entries'
+    // contents. Registration/unregistration is rare; lookup happens on every
+    // request, so readers must not exclude each other.
+    mutable std::shared_mutex streams_mutex_;
+    std::unordered_map<std::string, StreamEntryPtr> streams_; // key: "app/stream"
+
+    // Request counters are pure increments read only by stats(), so they are
+    // relaxed atomics rather than anything the request path has to lock for.
+    struct AtomicStats {
+        std::atomic<std::uint64_t> playlist_requests{0};
+        std::atomic<std::uint64_t> segment_requests{0};
+        std::atomic<std::uint64_t> unauthorized{0};
+        std::atomic<std::uint64_t> not_found{0};
+        std::atomic<std::uint64_t> range_requests{0};
+    };
+    mutable AtomicStats stats_;
 };
 
 } // namespace rtmp_server::control

@@ -427,7 +427,7 @@ apt-get update
 apt-get install -y --no-install-recommends "${APT_REINSTALL_ARGS[@]}" \
   build-essential cmake ninja-build pkg-config git ca-certificates curl gnupg \
   liburing-dev liburing2 libssl-dev libsqlite3-dev libsqlite3-0 sqlite3 \
-  iproute2 ethtool kmod varnish nftables
+  iproute2 ethtool kmod varnish varnish-modules nftables
 
 # The distribution's default "clang" meta-package tracks whatever major
 # version that release shipped with — fine on 24.04 (clang-18) but not
@@ -1181,12 +1181,61 @@ fi
 # correctness requirement, so a tc failure must never abort the tune script
 # (and with it the installer).
 tc qdisc del dev "${RTMP_INTERFACE}" root >/dev/null 2>&1 || true
-if (( RTMP_SHAPE_MBIT <= 10000 )) && modprobe sch_cake 2>/dev/null; then
+
+# CAKE and a single HTB class both shape through one root qdisc/class, which
+# means one lock: every outgoing packet on the whole NIC serialises through
+# it, so total egress is capped by whatever a single CPU core can push
+# through that lock -- far below line rate on a many-core box, and the
+# packet rate at a large HLS audience gets there fast (this is what turned
+# into a hard ~3-4 Gbps ceiling on a 16 Gbps link in practice, well before
+# the NIC or the origin were the limit). A multi-queue NIC gives each TX
+# queue its own qdisc under "mq", each with its own lock, so shaping work
+# spreads across as many cores as there are queues instead of pinning one.
+#
+# Splitting one shaped rate across N independent per-queue limiters is an
+# approximation, not an exact global cap: RSS hashes flows to queues by
+# source/dest, so with enough concurrent viewers (thousands of distinct
+# flows) the split evens out close to fair, but a queue can briefly run
+# above its even share while another runs under. ceil+headroom below (each
+# queue capped at 1.15x its even share, and the queue count itself already
+# rounds the per-queue share up) absorbs that skew without materially
+# raising the real total above RTMP_SHAPE_MBIT.
+TX_QUEUES="$(ls -d /sys/class/net/"${RTMP_INTERFACE}"/queues/tx-* 2>/dev/null | wc -l | tr -cd '0-9')"
+[[ "${TX_QUEUES}" =~ ^[0-9]+$ ]] || TX_QUEUES=1
+
+if (( TX_QUEUES > 1 )) && tc qdisc add dev "${RTMP_INTERFACE}" root handle 1: mq 2>/dev/null; then
+  # Round the per-queue share up so the sum of caps is never below the
+  # requested total (a floor division would under-shape by up to N-1 Mbit).
+  PER_QUEUE_MBIT=$(( (RTMP_SHAPE_MBIT + TX_QUEUES - 1) / TX_QUEUES ))
+  if (( PER_QUEUE_MBIT < 1 )); then PER_QUEUE_MBIT=1; fi
+  PER_QUEUE_CEIL_MBIT=$(( PER_QUEUE_MBIT + PER_QUEUE_MBIT * 15 / 100 ))
+  for (( _q = 1; _q <= TX_QUEUES; ++_q )); do
+    # mq exposes each TX queue as band 1:1 .. 1:N (1-indexed, matching queue
+    # 0..N-1): every "parent 1:${_q}" below attaches to that queue's own
+    # qdisc slot, not to the shared root. Handles just need to be distinct
+    # per queue; 0x100+_q / 0x200+_q keeps them clear of the "1:" root and of
+    # each other with room for well over 200 queues.
+    _htb_handle="$(printf '%x' $(( 0x100 + _q )))"
+    _fq_handle="$(printf '%x' $(( 0x200 + _q )))"
+    tc qdisc add dev "${RTMP_INTERFACE}" parent "1:${_q}" handle "${_htb_handle}:" \
+      htb default 10 >/dev/null 2>&1 || true
+    tc class add dev "${RTMP_INTERFACE}" parent "${_htb_handle}:" classid "${_htb_handle}:10" htb \
+      rate "${PER_QUEUE_MBIT}Mbit" ceil "${PER_QUEUE_CEIL_MBIT}Mbit" burst 4m cburst 4m \
+      >/dev/null 2>&1 || true
+    tc qdisc add dev "${RTMP_INTERFACE}" parent "${_htb_handle}:10" handle "${_fq_handle}:" \
+      fq limit 25000 flow_limit 1000 buckets 16384 >/dev/null 2>&1 || true
+  done
+elif (( RTMP_SHAPE_MBIT <= 10000 )) && modprobe sch_cake 2>/dev/null; then
+  # Single-queue hardware (common on virtio-net VPS NICs): no per-queue
+  # parallelism to gain from mq, so CAKE's per-flow fairness at moderate
+  # rates is worth more than avoiding its single lock -- there is only ever
+  # going to be one queue's worth of packets in flight here regardless.
   tc qdisc replace dev "${RTMP_INTERFACE}" root cake bandwidth "${RTMP_SHAPE_MBIT}Mbit" \
     besteffort dual-dsthost nat nowash || true
 else
-  # CAKE becomes CPU-expensive at 10G+ line rates. HTB provides the required
-  # join headroom while fq fairly schedules the individual HTTP flows.
+  # CAKE becomes CPU-expensive at 10G+ line rates and there is still only one
+  # queue to shape. HTB provides the required join headroom while fq fairly
+  # schedules the individual HTTP flows.
   tc qdisc add dev "${RTMP_INTERFACE}" root handle 1: htb default 10 || true
   tc class add dev "${RTMP_INTERFACE}" parent 1: classid 1:10 htb \
     rate "${RTMP_SHAPE_MBIT}Mbit" ceil "${RTMP_SHAPE_MBIT}Mbit" burst 16m cburst 16m || true
@@ -1303,6 +1352,16 @@ VARNISH_THREAD_QUEUE_LIMIT=100000
 # cap left by an earlier install is stripped so re-runs converge to uncapped.
 install -m 0644 "${SOURCE_DIR}/deploy/varnish/streamforge.vcl" /etc/varnish/streamforge.vcl
 sed -i "/^[[:space:]]*\.max_connections = [0-9]\+;[[:space:]]*$/d" /etc/varnish/streamforge.vcl
+
+# The VCL imports the digest vmod (libvmod-digest, from the varnish-modules
+# package installed above) to mint the per-viewer session id at the edge
+# instead of round-tripping every fresh join to the origin. An import that
+# fails to resolve fails the WHOLE VCL load, not just that one feature, so a
+# missing or version-mismatched module would otherwise surface as Varnish
+# refusing to start with no config left in place -- caught here instead,
+# same fail-loud-before-activating posture as `caddy validate` below.
+varnishd -C -f /etc/varnish/streamforge.vcl >/dev/null ||
+  die "generated /etc/varnish/streamforge.vcl failed to compile -- check 'varnishd -C -f /etc/varnish/streamforge.vcl' and that varnish-modules matches the installed varnish version"
 
 install -d -m 0755 /etc/systemd/system/varnish.service.d
 cat > /etc/systemd/system/varnish.service.d/streamforge.conf <<EOF

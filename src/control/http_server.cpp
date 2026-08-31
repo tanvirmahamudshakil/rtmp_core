@@ -11,6 +11,7 @@
 #include <poll.h>
 #include <unistd.h>
 
+#include "rtmp_server/control/http_message.hpp"
 #include "rtmp_server/observability/logger.hpp"
 
 namespace {
@@ -25,10 +26,6 @@ namespace {
 
 using rtmp_server::observability::LogLevel;
 
-std::string to_lower(std::string s) {
-    for (char& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-    return s;
-}
 
 // Reads exactly the request line + headers (bounded by max_header_bytes),
 // then, if Content-Length is present, exactly that many body bytes
@@ -56,48 +53,20 @@ bool read_request(int fd, const HttpServerOptions& options, HttpRequest& out, in
         header_end = buffer.find("\r\n\r\n");
     }
 
-    std::string head = buffer.substr(0, header_end);
+    // Shared with AsyncHttpServer so both servers frame requests identically:
+    // two hand-rolled parsers drifting apart is how a request-smuggling
+    // difference gets introduced.
+    if (!parse_request_head(std::string_view(buffer).substr(0, header_end), out)) {
+        status_on_failure = 400;
+        return false;
+    }
     std::string leftover = buffer.substr(header_end + 4);
 
-    std::size_t line_end = head.find("\r\n");
-    if (line_end == std::string::npos) {
+    bool length_valid = true;
+    const std::size_t content_length = content_length_of(out, length_valid);
+    if (!length_valid) {
         status_on_failure = 400;
         return false;
-    }
-    std::string request_line = head.substr(0, line_end);
-    std::size_t sp1 = request_line.find(' ');
-    std::size_t sp2 = sp1 == std::string::npos ? std::string::npos : request_line.find(' ', sp1 + 1);
-    if (sp1 == std::string::npos || sp2 == std::string::npos) {
-        status_on_failure = 400;
-        return false;
-    }
-    out.method = request_line.substr(0, sp1);
-    out.http_version = request_line.substr(sp2 + 1);
-    std::string target = request_line.substr(sp1 + 1, sp2 - sp1 - 1);
-    if (auto qpos = target.find('?'); qpos != std::string::npos) {
-        out.path = target.substr(0, qpos);
-        out.query = target.substr(qpos + 1);
-    } else {
-        out.path = target;
-    }
-
-    std::size_t pos = line_end + 2;
-    while (pos < head.size()) {
-        std::size_t next = head.find("\r\n", pos);
-        if (next == std::string::npos) next = head.size();
-        std::string line = head.substr(pos, next - pos);
-        if (auto colon = line.find(':'); colon != std::string::npos) {
-            std::string key = to_lower(line.substr(0, colon));
-            std::size_t vstart = colon + 1;
-            while (vstart < line.size() && line[vstart] == ' ') ++vstart;
-            out.headers[key] = line.substr(vstart);
-        }
-        pos = next + 2;
-    }
-
-    std::size_t content_length = 0;
-    if (auto it = out.headers.find("content-length"); it != out.headers.end()) {
-        content_length = static_cast<std::size_t>(std::strtoul(it->second.c_str(), nullptr, 10));
     }
     if (content_length > options.max_body_bytes) {
         status_on_failure = 413; // Payload Too Large
@@ -117,47 +86,8 @@ bool read_request(int fd, const HttpServerOptions& options, HttpRequest& out, in
     return true;
 }
 
-// Reason phrases for the statuses this server actually emits. HLS clients
-// and CDNs key retry/caching behaviour off the status line, and a 206 or 416
-// labelled "Error"/"OK" is confusing to intermediaries even though the code
-// is what is normative.
-const char* reason_phrase(int status) {
-    switch (status) {
-        case 200: return "OK";
-        case 201: return "Created";
-        case 204: return "No Content";
-        case 206: return "Partial Content";
-        case 304: return "Not Modified";
-        case 400: return "Bad Request";
-        case 401: return "Unauthorized";
-        case 403: return "Forbidden";
-        case 404: return "Not Found";
-        case 405: return "Method Not Allowed";
-        case 409: return "Conflict";
-        case 413: return "Payload Too Large";
-        case 416: return "Range Not Satisfiable";
-        case 429: return "Too Many Requests";
-        case 500: return "Internal Server Error";
-        case 503: return "Service Unavailable";
-        default: return status < 400 ? "OK" : "Error";
-    }
-}
-
 bool write_response(int fd, const HttpResponse& response, bool keep_alive) {
-    std::string out = "HTTP/1.1 " + std::to_string(response.status) + " ";
-    out += reason_phrase(response.status);
-    out += "\r\n";
-    out += "Content-Type: " + response.content_type + "\r\n";
-    // A handler may set Content-Length itself (a HEAD response describes the
-    // body it would have sent while carrying none). Emitting our own too
-    // would produce a duplicate header, which is a request-smuggling hazard,
-    // so the handler's value wins.
-    if (!response.headers.contains("Content-Length")) {
-        out += "Content-Length: " + std::to_string(response.payload_size()) + "\r\n";
-    }
-    out += keep_alive ? "Connection: keep-alive\r\n" : "Connection: close\r\n";
-    for (const auto& [k, v] : response.headers) out += k + ": " + v + "\r\n";
-    out += "\r\n";
+    const std::string out = serialize_response_head(response, keep_alive);
 
     auto send_all = [fd](const char* data, std::size_t size) {
         std::size_t sent = 0;

@@ -223,73 +223,81 @@ HlsHttpHandler::HlsHttpHandler(HlsHttpOptions options) : options_(std::move(opti
     }
 }
 
+HlsHttpHandler::StreamEntryPtr HlsHttpHandler::find_entry(const std::string& application,
+                                                          const std::string& stream) const {
+    std::shared_lock lock(streams_mutex_);
+    const auto it = streams_.find(application + "/" + stream);
+    return it == streams_.end() ? nullptr : it->second;
+}
+
+HlsHttpHandler::StreamEntryPtr HlsHttpHandler::find_or_create_entry(const std::string& application,
+                                                                    const std::string& stream) {
+    const std::string key = application + "/" + stream;
+    {
+        std::shared_lock lock(streams_mutex_);
+        const auto it = streams_.find(key);
+        if (it != streams_.end()) return it->second;
+    }
+    std::unique_lock lock(streams_mutex_);
+    // Re-check: another thread may have created it between the two locks.
+    auto& slot = streams_[key];
+    if (!slot) slot = std::make_shared<StreamEntry>();
+    return slot;
+}
+
 void HlsHttpHandler::register_stream(const std::string& application, const std::string& stream,
                                      std::shared_ptr<hls::SegmentStore> store) {
-    std::lock_guard lock(mutex_);
-    streams_[application + "/" + stream].store = std::move(store);
+    // Registering a store for a key that already has one (a republish)
+    // deliberately keeps the existing entry, so its accumulated byte count
+    // and live viewer sessions survive the swap instead of resetting the
+    // link's stats to zero mid-audience.
+    find_or_create_entry(application, stream)->store.store(std::move(store), std::memory_order_release);
 }
 
 void HlsHttpHandler::unregister_stream(const std::string& application, const std::string& stream) {
-    std::lock_guard lock(mutex_);
+    std::unique_lock lock(streams_mutex_);
     streams_.erase(application + "/" + stream);
 }
 
 std::shared_ptr<hls::SegmentStore> HlsHttpHandler::find_stream(const std::string& application,
                                                                const std::string& stream) const {
-    std::lock_guard lock(mutex_);
-    const auto it = streams_.find(application + "/" + stream);
-    return it == streams_.end() ? nullptr : it->second.store;
+    const auto entry = find_entry(application, stream);
+    return entry ? entry->store.load(std::memory_order_acquire) : nullptr;
 }
 
 void HlsHttpHandler::set_renditions(const std::string& application, const std::string& stream,
                                     std::vector<hls::Rendition> renditions) {
-    std::lock_guard lock(mutex_);
-    streams_[application + "/" + stream].renditions = std::move(renditions);
+    auto published = std::make_shared<const std::vector<hls::Rendition>>(std::move(renditions));
+    find_or_create_entry(application, stream)
+        ->renditions.store(std::move(published), std::memory_order_release);
 }
 
 HlsHttpHandler::Stats HlsHttpHandler::stats() const {
-    std::lock_guard lock(mutex_);
-    return stats_;
+    // Relaxed throughout: these are independent counters displayed together,
+    // never used to order anything, so a snapshot that mixes adjacent
+    // increments is both expected and harmless.
+    Stats snapshot;
+    snapshot.playlist_requests = stats_.playlist_requests.load(std::memory_order_relaxed);
+    snapshot.segment_requests = stats_.segment_requests.load(std::memory_order_relaxed);
+    snapshot.unauthorized = stats_.unauthorized.load(std::memory_order_relaxed);
+    snapshot.not_found = stats_.not_found.load(std::memory_order_relaxed);
+    snapshot.range_requests = stats_.range_requests.load(std::memory_order_relaxed);
+    return snapshot;
 }
 
-void HlsHttpHandler::record_delivery(const std::string& application, const std::string& stream, std::uint64_t bytes,
-                                     const std::string& playback_session) {
-    if (!options_.track_delivery_stats) return;
-    std::lock_guard lock(mutex_);
-    const auto it = streams_.find(application + "/" + stream);
-    if (it == streams_.end()) return;
-    it->second.bytes_total += bytes;
-    if (playback_session.empty()) return;
-    auto& sessions = it->second.recent_viewer_sessions;
-    sessions[playback_session] = std::chrono::steady_clock::now();
-    if (sessions.size() > kMaxTrackedViewerSessions) {
-        const auto cutoff = std::chrono::steady_clock::now() - kViewerWindow;
-        for (auto iter = sessions.begin(); iter != sessions.end();) {
-            if (iter->second < cutoff) {
-                iter = sessions.erase(iter);
-            } else {
-                ++iter;
-            }
-        }
-    }
+void HlsHttpHandler::record_delivery(StreamEntry& entry, std::uint64_t bytes,
+                                     std::string_view playback_session) {
+    entry.bytes_total.fetch_add(bytes, std::memory_order_relaxed);
+    entry.sessions.record(playback_session, std::chrono::steady_clock::now());
 }
 
-HlsHttpHandler::LinkStats HlsHttpHandler::link_stats(const std::string& application, const std::string& stream) {
-    std::lock_guard lock(mutex_);
-    const auto it = streams_.find(application + "/" + stream);
-    if (it == streams_.end()) return {};
+HlsHttpHandler::LinkStats HlsHttpHandler::link_stats(const std::string& application,
+                                                     const std::string& stream) {
+    const auto entry = find_entry(application, stream);
+    if (!entry) return {};
     LinkStats result;
-    result.bytes_total = it->second.bytes_total;
-    const auto cutoff = std::chrono::steady_clock::now() - kViewerWindow;
-    auto& sessions = it->second.recent_viewer_sessions;
-    for (auto iter = sessions.begin(); iter != sessions.end();) {
-        if (iter->second < cutoff) {
-            iter = sessions.erase(iter);
-        } else {
-            ++result.viewer_count;
-            ++iter;
-        }
-    }
+    result.bytes_total = entry->bytes_total.load(std::memory_order_relaxed);
+    result.viewer_count = entry->sessions.active_count(std::chrono::steady_clock::now());
     return result;
 }
 
@@ -311,35 +319,41 @@ std::string rendition_stream_from_uri(const std::string& uri) {
 
 HlsHttpHandler::LinkStats HlsHttpHandler::aggregate_link_stats(const std::string& application,
                                                                const std::string& master_stream) {
+    const auto master = find_entry(application, master_stream);
+    if (!master) return {};
+
     std::vector<std::string> rendition_streams;
-    {
-        std::lock_guard lock(mutex_);
-        const auto it = streams_.find(application + "/" + master_stream);
-        if (it == streams_.end()) return {};
-        for (const auto& rendition : it->second.renditions) {
+    if (const auto renditions = master->renditions.load(std::memory_order_acquire)) {
+        for (const auto& rendition : *renditions) {
             auto name = rendition_stream_from_uri(rendition.uri);
             if (!name.empty()) rendition_streams.push_back(std::move(name));
         }
     }
     if (rendition_streams.empty()) return link_stats(application, master_stream);
 
+    // Resolve every rendition's entry first, then read them without holding
+    // the registry lock: collect_active() takes each stream's own shard
+    // locks, and nesting those under the registry lock would put the
+    // (potentially large) union work on the path of every concurrent
+    // register/unregister.
+    std::vector<StreamEntryPtr> entries;
+    entries.reserve(rendition_streams.size());
+    {
+        std::shared_lock lock(streams_mutex_);
+        for (const auto& stream : rendition_streams) {
+            const auto it = streams_.find(application + "/" + stream);
+            if (it != streams_.end()) entries.push_back(it->second);
+        }
+    }
+
     LinkStats aggregate;
     std::unordered_set<std::string> active_sessions;
-    const auto cutoff = std::chrono::steady_clock::now() - kViewerWindow;
-    std::lock_guard lock(mutex_);
-    for (const auto& stream : rendition_streams) {
-        const auto it = streams_.find(application + "/" + stream);
-        if (it == streams_.end()) continue;
-        aggregate.bytes_total += it->second.bytes_total;
-        auto& sessions = it->second.recent_viewer_sessions;
-        for (auto iter = sessions.begin(); iter != sessions.end();) {
-            if (iter->second < cutoff) {
-                iter = sessions.erase(iter);
-            } else {
-                active_sessions.insert(iter->first);
-                ++iter;
-            }
-        }
+    const auto now = std::chrono::steady_clock::now();
+    for (const auto& entry : entries) {
+        aggregate.bytes_total += entry->bytes_total.load(std::memory_order_relaxed);
+        // Union rather than sum: one player switching between renditions
+        // appears in each variant it touched and must count once.
+        entry->sessions.collect_active(active_sessions, now);
     }
     aggregate.viewer_count = active_sessions.size();
     return aggregate;
@@ -381,14 +395,14 @@ void HlsHttpHandler::decorate(HttpResponse& response, const std::string& cache_c
     if (options_.enable_range_requests) response.headers["Accept-Ranges"] = "bytes";
 }
 
-HttpResponse HlsHttpHandler::serve_media_playlist(const HttpRequest& request, const StreamEntry& entry,
+HttpResponse HlsHttpHandler::serve_media_playlist(const HttpRequest& request, hls::SegmentStore& store,
                                                   const std::string& application,
                                                   const std::string& stream) {
     (void)application;
     (void)stream;
     // Preserve the caller's query string on segment URIs so a token-gated
     // stream stays playable: the player copies the URI verbatim.
-    std::string body = entry.store->playlist({});
+    std::string body = store.playlist({});
     if (options_.propagate_query_to_playlist_uris) {
         append_query_to_playlist_uris(body, request.query);
     }
@@ -401,9 +415,10 @@ HttpResponse HlsHttpHandler::serve_media_playlist(const HttpRequest& request, co
     return response;
 }
 
-HttpResponse HlsHttpHandler::serve_master_playlist(const HttpRequest& request, const StreamEntry& entry,
+HttpResponse HlsHttpHandler::serve_master_playlist(const HttpRequest& request,
+                                                   const std::vector<hls::Rendition>& renditions,
                                                    const std::string& application) {
-    if (entry.renditions.empty()) {
+    if (renditions.empty()) {
         return plain(404, "no renditions declared for this stream");
     }
     if (options_.enable_fast_join) {
@@ -414,7 +429,7 @@ HttpResponse HlsHttpHandler::serve_master_playlist(const HttpRequest& request, c
         // -- reuse the same reversal the delivery-stats aggregator uses
         // rather than a generic relative-URL resolver, since that's the only
         // shape this ever has to handle.
-        const std::string rendition_stream = rendition_stream_from_uri(entry.renditions.front().uri);
+        const std::string rendition_stream = rendition_stream_from_uri(renditions.front().uri);
         if (!rendition_stream.empty()) {
             HttpResponse redirect;
             redirect.status = 302;
@@ -441,7 +456,7 @@ HttpResponse HlsHttpHandler::serve_master_playlist(const HttpRequest& request, c
     HttpResponse response;
     response.status = 200;
     response.content_type = kContentTypeM3u8;
-    response.body = hls::build_master_playlist(entry.renditions);
+    response.body = hls::build_master_playlist(renditions);
     if (options_.propagate_query_to_playlist_uris) {
         append_query_to_playlist_uris(response.body, request.query);
     }
@@ -452,9 +467,9 @@ HttpResponse HlsHttpHandler::serve_master_playlist(const HttpRequest& request, c
     return response;
 }
 
-HttpResponse HlsHttpHandler::serve_segment(const HttpRequest& request, const StreamEntry& entry,
+HttpResponse HlsHttpHandler::serve_segment(const HttpRequest& request, hls::SegmentStore& store,
                                            const std::string& name) {
-    auto segment = entry.store->find_segment(name);
+    auto segment = store.find_segment(name);
     if (!segment) {
         // A segment that has scrolled out of retention. 404 is correct and
         // is what makes bounded cleanup safe for players (they re-fetch the
@@ -472,10 +487,7 @@ HttpResponse HlsHttpHandler::serve_segment(const HttpRequest& request, const Str
         std::size_t start = 0;
         std::size_t end = 0;
         if (parse_range(range_header->second, size, start, end)) {
-            {
-                std::lock_guard lock(mutex_);
-                stats_.range_requests += 1;
-            }
+            stats_.range_requests.fetch_add(1, std::memory_order_relaxed);
             HttpResponse response;
             response.status = 206;
             response.content_type = kContentTypeMpegTs;
@@ -524,8 +536,7 @@ HttpResponse HlsHttpHandler::handle(const HttpRequest& request) {
 
     std::vector<std::string> parts;
     if (!split_path(std::string_view(request.path).substr(prefix.size()), parts) || parts.size() != 3) {
-        std::lock_guard lock(mutex_);
-        stats_.not_found += 1;
+        stats_.not_found.fetch_add(1, std::memory_order_relaxed);
         return plain(404, "not found");
     }
 
@@ -536,39 +547,36 @@ HttpResponse HlsHttpHandler::handle(const HttpRequest& request) {
     // A disabled stream serves no playlists or segments: its .m3u8 links stop
     // working the moment it is disabled, in lockstep with the RTMP gate.
     if (enabled_checker_ && !enabled_checker_(application, stream)) {
-        std::lock_guard lock(mutex_);
-        stats_.not_found += 1;
+        stats_.not_found.fetch_add(1, std::memory_order_relaxed);
         return plain(404, "not found");
     }
 
     if (!authorized(request, application, stream)) {
-        {
-            std::lock_guard lock(mutex_);
-            stats_.unauthorized += 1;
-        }
+        stats_.unauthorized.fetch_add(1, std::memory_order_relaxed);
         auto response = plain(403, "playback token required or invalid");
         response.headers["Cache-Control"] = "no-store";
         return response;
     }
 
-    StreamEntry entry;
-    {
-        std::lock_guard lock(mutex_);
-        const auto it = streams_.find(application + "/" + stream);
-        // A master playlist name (e.g. a source-transcode job's output base
-        // name) only ever gets a `renditions` entry — its segments live under
-        // each rendition's own stream key, so it never has a `store`. Only
-        // media-playlist/segment requests need one.
-        const bool needs_store = resource != "master.m3u8";
-        if (it == streams_.end() || (needs_store && !it->second.store)) {
-            stats_.not_found += 1;
-            auto response = plain(404, "stream not found");
-            response.headers["Cache-Control"] = "no-store";
-            return response;
-        }
-        // Copy the entry (a shared_ptr + a small vector) so the rest of the
-        // request runs without the registry lock held (3.7).
-        entry = it->second;
+    // One shared-lock registry lookup, then a reference count: everything
+    // below runs with no registry lock held, so concurrent requests never
+    // serialise on the shape of the stream table (3.7).
+    const StreamEntryPtr entry = find_entry(application, stream);
+    // A master playlist name (e.g. a source-transcode job's output base
+    // name) only ever gets a `renditions` entry -- its segments live under
+    // each rendition's own stream key, so it never has a `store`. Only
+    // media-playlist/segment requests need one.
+    const bool needs_store = resource != "master.m3u8";
+    // Read the store once and reuse that value for the whole request: a
+    // republish could swap it underneath us, and serving half a request
+    // from each store would be worse than serving all of it from the one
+    // that was live when the request arrived.
+    const auto store = entry ? entry->store.load(std::memory_order_acquire) : nullptr;
+    if (!entry || (needs_store && !store)) {
+        stats_.not_found.fetch_add(1, std::memory_order_relaxed);
+        auto response = plain(404, "stream not found");
+        response.headers["Cache-Control"] = "no-store";
+        return response;
     }
 
     // A public, stable HLS URL starts a fresh playback session on each open.
@@ -655,28 +663,20 @@ HttpResponse HlsHttpHandler::handle(const HttpRequest& request) {
     HttpResponse response;
     bool countable = false;
     if (resource == "master.m3u8") {
-        {
-            std::lock_guard lock(mutex_);
-            stats_.playlist_requests += 1;
-        }
-        response = serve_master_playlist(request, entry, application);
+        stats_.playlist_requests.fetch_add(1, std::memory_order_relaxed);
+        const auto renditions = entry->renditions.load(std::memory_order_acquire);
+        static const std::vector<hls::Rendition> kNoRenditions;
+        response = serve_master_playlist(request, renditions ? *renditions : kNoRenditions, application);
     } else if (ends_with(resource, ".m3u8")) {
-        {
-            std::lock_guard lock(mutex_);
-            stats_.playlist_requests += 1;
-        }
-        response = serve_media_playlist(request, entry, application, stream);
+        stats_.playlist_requests.fetch_add(1, std::memory_order_relaxed);
+        response = serve_media_playlist(request, *store, application, stream);
         countable = true;
     } else if (ends_with(resource, ".ts")) {
-        {
-            std::lock_guard lock(mutex_);
-            stats_.segment_requests += 1;
-        }
-        response = serve_segment(request, entry, resource);
+        stats_.segment_requests.fetch_add(1, std::memory_order_relaxed);
+        response = serve_segment(request, *store, resource);
         countable = true;
     } else {
-        std::lock_guard lock(mutex_);
-        stats_.not_found += 1;
+        stats_.not_found.fetch_add(1, std::memory_order_relaxed);
         return plain(404, "not found");
     }
 
@@ -684,8 +684,9 @@ HttpResponse HlsHttpHandler::handle(const HttpRequest& request) {
     // signal (a player refetches one or the other every segment duration);
     // master.m3u8 is fetched once at session start and would undercount a
     // long-running viewer, so it deliberately isn't counted here.
-    if (countable && (response.status == 200 || response.status == 206)) {
-        record_delivery(application, stream, response.payload_size(), playback_session_from_query(request.query));
+    if (options_.track_delivery_stats && countable &&
+        (response.status == 200 || response.status == 206)) {
+        record_delivery(*entry, response.payload_size(), playback_session_from_query(request.query));
     }
 
     // HEAD must carry identical headers but no body (RFC 9110). Content-Length
