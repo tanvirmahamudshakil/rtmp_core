@@ -43,6 +43,13 @@ ExecStart=/usr/local/bin/rtmp-server --config /etc/rtmp-server/server.yaml
 # server's own clear validation error rather than an opaque systemd error.
 EnvironmentFile=-/etc/rtmp-server/rtmp-server.env
 
+# Cap glibc malloc arenas. The default (8 x CPU cores) lets RSS balloon under
+# a connection storm or many concurrent transcode threads because per-arena
+# free lists are not returned to the OS. 4 follows Wowza's high-concurrency
+# transcoding starting point; a pure ingest/HLS origin can use 2. An explicit
+# value in rtmp-server.env overrides this line.
+Environment=MALLOC_ARENA_MAX=4
+
 User=rtmp-server
 Group=rtmp-server
 

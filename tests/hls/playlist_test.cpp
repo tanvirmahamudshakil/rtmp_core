@@ -246,6 +246,37 @@ TEST(PlaylistTest, DiscontinuitySequenceIsEmittedOnlyWhenNonZero) {
     EXPECT_EQ(validation.discontinuity_sequence, 7u);
 }
 
+TEST(PlaylistTest, ServerControlDefaultsToCanBlockReloadNo) {
+    auto segments = make_segments(3, 4000ms);
+    const auto text = build_media_playlist(segments, {});
+    ASSERT_TRUE(validate_media_playlist(text).valid) << text;
+    EXPECT_NE(text.find("#EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD=NO"), std::string::npos);
+    // No HOLD-BACK attribute unless explicitly requested.
+    EXPECT_EQ(text.find("HOLD-BACK="), std::string::npos);
+}
+
+TEST(PlaylistTest, ServerControlCanBeSuppressed) {
+    auto segments = make_segments(3, 4000ms);
+    MediaPlaylistOptions options;
+    options.emit_server_control = false;
+    EXPECT_EQ(build_media_playlist(segments, options).find("#EXT-X-SERVER-CONTROL"),
+              std::string::npos);
+}
+
+TEST(PlaylistTest, HoldBackIsEmittedAndClampedToThreeTargetDurations) {
+    auto segments = make_segments(3, 4000ms);
+    MediaPlaylistOptions options;
+    options.target_duration_seconds = 4;
+
+    options.hold_back_seconds = 30.0;  // above the 12 s floor -> kept
+    EXPECT_NE(build_media_playlist(segments, options).find("HOLD-BACK=30.000"),
+              std::string::npos);
+
+    options.hold_back_seconds = 5.0;  // below 3 x 4 s -> clamped up to 12
+    EXPECT_NE(build_media_playlist(segments, options).find("HOLD-BACK=12.000"),
+              std::string::npos);
+}
+
 TEST(PlaylistTest, EndlistIsAppendedForAFinishedStream) {
     auto segments = make_segments(3, 4000ms);
     MediaPlaylistOptions options;

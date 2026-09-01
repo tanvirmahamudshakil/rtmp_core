@@ -50,6 +50,20 @@ std::string build_media_playlist(std::span<const SegmentPtr> segments,
     if (options.discontinuity_sequence > 0) {
         out += "#EXT-X-DISCONTINUITY-SEQUENCE:" + std::to_string(options.discontinuity_sequence) + "\n";
     }
+    if (options.emit_server_control) {
+        // CAN-BLOCK-RELOAD=NO: no blocking playlist reload here, so a
+        // compliant player polls at the TARGETDURATION cadence.
+        out += "#EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD=NO";
+        if (options.hold_back_seconds > 0.0) {
+            // RFC 8216bis: HOLD-BACK MUST be at least 3 x TARGETDURATION.
+            const double hold_back =
+                std::max(options.hold_back_seconds, 3.0 * static_cast<double>(target));
+            char buffer[32];
+            std::snprintf(buffer, sizeof(buffer), "%.3f", hold_back);
+            out += ",HOLD-BACK=" + std::string(buffer);
+        }
+        out += "\n";
+    }
 
     for (const auto& segment : segments) {
         if (!segment) continue;

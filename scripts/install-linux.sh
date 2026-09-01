@@ -771,6 +771,16 @@ fi
 [[ "${TOKEN_SECRET}" =~ ^[A-Za-z0-9._~-]{32,256}$ ]] ||
   die "The existing token-signing secret is invalid; set RTMP_FORCE_ROTATE_SECRETS=1."
 
+# Cap glibc malloc arenas so per-arena free lists cannot balloon RSS under a
+# connection storm or many concurrent transcode threads. glibc's default is
+# 8 x CPU cores; Wowza's high-concurrency transcoding guidance starts at
+# 4 x cores, and a pure ingest/HLS origin runs fine on 2.
+if [[ "${ENABLE_TRANSCODING}" == "1" ]]; then
+  MALLOC_ARENA_MAX_VALUE=$(( CPU_COUNT * 4 ))
+else
+  MALLOC_ARENA_MAX_VALUE=2
+fi
+
 cat > "${EXISTING_ENV}" <<EOF
 RTMP_SERVER_TOKEN_SIGNING_SECRET=${TOKEN_SECRET}
 RTMP_SERVER_API_AUTHENTICATION_SECRET=${ADMIN_TOKEN}
@@ -795,6 +805,14 @@ RTMP_SERVER_ENABLE_SQPOLL=$([[ "${ENABLE_SQPOLL}" == "1" ]] && echo true || echo
 RTMP_SERVER_ENABLE_HLS_FAST_JOIN=$([[ "${ENABLE_FAST_JOIN}" == "1" ]] && echo true || echo false)
 RTMP_SERVER_PROVIDED_BUFFER_COUNT=${PROVIDED_BUFFER_COUNT}
 RTMP_SERVER_PROVIDED_BUFFER_SIZE=${PROVIDED_BUFFER_SIZE}
+# Per-connection transport tuning. A pinned 256 KiB send buffer bounds
+# per-viewer kernel memory at high fan-out and surfaces a slow receiver to
+# the write queue sooner; receive stays on kernel autosizing. notsent_lowat
+# keeps pacing running against a small unsent queue.
+RTMP_SERVER_CLIENT_SEND_BUFFER_BYTES=262144
+RTMP_SERVER_CLIENT_RECEIVE_BUFFER_BYTES=0
+RTMP_SERVER_CLIENT_TCP_NOTSENT_LOWAT_BYTES=131072
+MALLOC_ARENA_MAX=${MALLOC_ARENA_MAX_VALUE}
 RTMP_SERVER_SUBSCRIBER_QUEUE_MAX_BYTES=4194304
 RTMP_SERVER_SUBSCRIBER_QUEUE_MAX_PACKETS=512
 STREAMFORGE_MAX_TRACKED_VIEWERS_PER_STREAM=${TRACKED_VIEWER_LIMIT}

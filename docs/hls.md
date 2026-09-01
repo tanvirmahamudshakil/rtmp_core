@@ -270,6 +270,21 @@ advertised (already cached) segment are not stuck behind all established
 viewers in the provider's saturated FIFO/policer queue, and total shaping
 throughput is not capped by a single CPU core's packet-processing rate.
 
+### Playlist reload cadence
+
+Every media playlist carries `#EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD=NO`.
+The origin does not implement blocking playlist reload, and the tag tells a
+compliant player to re-fetch at the `EXT-X-TARGETDURATION` cadence rather
+than polling faster — the HLS analogue of Wowza's "client idle frequency",
+and the main lever on per-viewer origin request rate. Combined with the
+6 s segment default (`SegmentStoreConfig::target_duration_seconds`) and the
+`public, max-age=1` micro-cache below, a large audience collapses to roughly
+one origin playlist fetch per second per link.
+
+`SegmentStoreConfig::playlist_hold_back_seconds` (0 = player default of
+3 × TARGETDURATION) sets the advertised `HOLD-BACK`; a value under the
+3 × TARGETDURATION floor is clamped up per RFC 8216bis.
+
 ### Cache-Control
 
 | Resource | Header | Why |

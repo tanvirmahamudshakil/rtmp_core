@@ -575,14 +575,25 @@ void IoUringEventLoop::handle_accept_completion(const OperationContext& /*op*/, 
     ::setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
     int keepalive = 1;
     ::setsockopt(client_fd, SOL_SOCKET, SO_KEEPALIVE, &keepalive, sizeof(keepalive));
-    // Keep per-viewer kernel memory bounded and surface a slow receiver to
-    // the application queue early enough for keyframe-aware shedding.
-    int send_buffer = 256 * 1024;
-    ::setsockopt(client_fd, SOL_SOCKET, SO_SNDBUF, &send_buffer, sizeof(send_buffer));
+    // Transport buffer sizing (Wowza "Tune for performance"). A zero here
+    // leaves the kernel's autosizing on, which is throughput-optimal on a
+    // well-provisioned link; a non-zero value pins the buffer to keep
+    // per-viewer kernel memory bounded and surface a slow receiver to the
+    // application queue early enough for keyframe-aware shedding.
+    if (config_.client_send_buffer_bytes != 0) {
+        int send_buffer = static_cast<int>(config_.client_send_buffer_bytes);
+        ::setsockopt(client_fd, SOL_SOCKET, SO_SNDBUF, &send_buffer, sizeof(send_buffer));
+    }
+    if (config_.client_receive_buffer_bytes != 0) {
+        int receive_buffer = static_cast<int>(config_.client_receive_buffer_bytes);
+        ::setsockopt(client_fd, SOL_SOCKET, SO_RCVBUF, &receive_buffer, sizeof(receive_buffer));
+    }
 #ifdef TCP_NOTSENT_LOWAT
-    std::uint32_t not_sent_low_watermark = 128 * 1024;
-    ::setsockopt(client_fd, IPPROTO_TCP, TCP_NOTSENT_LOWAT, &not_sent_low_watermark,
-                 sizeof(not_sent_low_watermark));
+    if (config_.client_tcp_notsent_lowat_bytes != 0) {
+        std::uint32_t not_sent_low_watermark = config_.client_tcp_notsent_lowat_bytes;
+        ::setsockopt(client_fd, IPPROTO_TCP, TCP_NOTSENT_LOWAT, &not_sent_low_watermark,
+                     sizeof(not_sent_low_watermark));
+    }
 #endif
 #ifdef TCP_KEEPIDLE
     int keep_idle_seconds = 30;

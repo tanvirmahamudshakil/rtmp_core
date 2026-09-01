@@ -189,6 +189,54 @@ TEST(ServerConfigValidate, RejectsUnboundedRemoteControlledQueues) {
     EXPECT_FALSE(cfg.validate().ok());
 }
 
+TEST_F(ConfigTest, LoadsClientSocketTuningKeys) {
+    write_config(
+        "rtmp_port: 1935\n"
+        "api_port: 8080\n"
+        "client_send_buffer_bytes: 131072\n"
+        "client_receive_buffer_bytes: 262144\n"
+        "client_tcp_notsent_lowat_bytes: 65536\n"
+        "token_signing_secret: 4f3c1d9a8b7e6520f1a2b3c4d5e6f708\n"
+        "api_authentication_secret: 9a8b7c6d5e4f30211f2e3d4c5b6a7988\n");
+
+    auto result = load_config(path_);
+    ASSERT_TRUE(result.ok());
+    EXPECT_EQ(result.value().client_send_buffer_bytes, 131072u);
+    EXPECT_EQ(result.value().client_receive_buffer_bytes, 262144u);
+    EXPECT_EQ(result.value().client_tcp_notsent_lowat_bytes, 65536u);
+}
+
+TEST(ServerConfigValidate, AcceptsZeroSocketBuffersAsAutotune) {
+    auto cfg = valid_config();
+    cfg.client_send_buffer_bytes = 0;
+    cfg.client_receive_buffer_bytes = 0;
+    cfg.client_tcp_notsent_lowat_bytes = 0;
+    EXPECT_TRUE(cfg.validate().ok());
+}
+
+TEST(ServerConfigValidate, RejectsPinnedSocketBuffersOutsideBounds) {
+    auto cfg = valid_config();
+    cfg.client_send_buffer_bytes = 1024;  // below one segment
+    EXPECT_FALSE(cfg.validate().ok());
+
+    cfg = valid_config();
+    cfg.client_receive_buffer_bytes = 128u * 1024u * 1024u;  // above 64 MiB
+    EXPECT_FALSE(cfg.validate().ok());
+}
+
+TEST(ServerConfigValidate, RejectsNotsentLowatAboveSendBuffer) {
+    auto cfg = valid_config();
+    cfg.client_send_buffer_bytes = 65536;
+    cfg.client_tcp_notsent_lowat_bytes = 131072;
+    EXPECT_FALSE(cfg.validate().ok());
+
+    // ...but a lowat over an autosized (0) send buffer is fine.
+    cfg = valid_config();
+    cfg.client_send_buffer_bytes = 0;
+    cfg.client_tcp_notsent_lowat_bytes = 131072;
+    EXPECT_TRUE(cfg.validate().ok());
+}
+
 TEST(ServerConfigValidate, RejectsNonPositiveTimeouts) {
     auto cfg = valid_config();
     cfg.idle_timeout = std::chrono::milliseconds{0};

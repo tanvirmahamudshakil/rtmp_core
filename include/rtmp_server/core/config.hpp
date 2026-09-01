@@ -83,6 +83,28 @@ struct ServerConfig {
     std::uint32_t provided_buffer_count = 4096;
     std::uint32_t provided_buffer_size = 65536;
 
+    // --- Client socket tuning -------------------------------------------
+    // Wowza "Tune Wowza Streaming Engine for optimal performance": transport
+    // send/receive buffers and TCP write-pacing. All three apply per accepted
+    // RTMP playback/ingest socket in IoUringEventLoop::on_accept.
+    //
+    // 0 = leave the kernel's buffer autosizing in charge, which is the
+    // throughput-optimal default Wowza recommends for a well-provisioned
+    // link. A non-zero value pins SO_SNDBUF / SO_RCVBUF and disables
+    // autotuning for that direction (the kernel still doubles the value and
+    // floors it at its own minimum). The send default is deliberately small:
+    // it bounds per-viewer kernel memory at high fan-out and surfaces a slow
+    // receiver to the application write queue early enough for the playback
+    // policy's keyframe-aware shedding to act.
+    std::uint32_t client_send_buffer_bytes = 256 * 1024;
+    std::uint32_t client_receive_buffer_bytes = 0;
+    // TCP_NOTSENT_LOWAT: the unsent byte count the kernel will hold before it
+    // stops reporting the socket writable, so pacing runs against a small
+    // queue instead of a full socket buffer. 0 disables the sockopt; it is
+    // also ignored where the platform lacks TCP_NOTSENT_LOWAT. Must not
+    // exceed client_send_buffer_bytes when both are non-zero.
+    std::uint32_t client_tcp_notsent_lowat_bytes = 128 * 1024;
+
     // Unbounded by request. These were the operator-facing admission caps
     // (docs/v2_promot.md section 3.5's "remote-controlled resource must have
     // a real bound") -- setting them to the type maximum removes that

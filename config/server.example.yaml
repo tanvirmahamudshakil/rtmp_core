@@ -33,6 +33,18 @@ registered_buffer_size: 65536
 provided_buffer_count: 4096
 provided_buffer_size: 65536
 
+# Per-connection transport tuning (Wowza "Tune for optimal performance").
+# 0 = let the kernel autosize the buffer (throughput-optimal on a
+# well-provisioned link). A non-zero send buffer bounds per-viewer kernel
+# memory at high fan-out and makes a slow receiver visible to the write
+# queue sooner. notsent_lowat caps unsent bytes the kernel holds before the
+# socket stops reporting writable, so pacing runs against a small queue; it
+# must not exceed client_send_buffer_bytes and is ignored where the kernel
+# lacks TCP_NOTSENT_LOWAT.
+client_send_buffer_bytes: 262144
+client_receive_buffer_bytes: 0
+client_tcp_notsent_lowat_bytes: 131072
+
 # Unbounded (uint32 max) by request -- no admission cap at any of these
 # layers. See ServerConfig in include/rtmp_server/core/config.hpp for the
 # DoS-protection tradeoff this removes.

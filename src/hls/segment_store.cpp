@@ -189,6 +189,7 @@ std::string SegmentStore::playlist(const std::string& segment_uri_prefix) {
 
         options.target_duration_seconds = config_.target_duration_seconds;
         options.version = config_.playlist_version;
+        options.hold_back_seconds = config_.playlist_hold_back_seconds;
         options.discontinuity_sequence = discontinuities_before;
         options.ended = ended_;
         options.segment_uri_prefix = segment_uri_prefix;

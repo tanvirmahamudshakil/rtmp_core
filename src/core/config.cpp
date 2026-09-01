@@ -189,6 +189,30 @@ Result<void> ServerConfig::validate() const {
         return Error(ErrorCode::InvalidConfiguration, ErrorCategory::Configuration,
                       "transcode_cpu_reservation_percent must be between 0 and 100");
     }
+    // Client socket tuning. A pinned buffer below one TCP segment's worth is
+    // always a misconfiguration, and one above 64 MiB per connection is a
+    // memory-exhaustion footgun at any real fan-out. 0 (kernel autotune) is
+    // always allowed. setsockopt itself would silently clamp instead of
+    // erroring, so the check lives here where the message is legible.
+    {
+        constexpr std::uint32_t kMinPinnedSocketBuffer = 2048;
+        constexpr std::uint32_t kMaxPinnedSocketBuffer = 64u * 1024u * 1024u;
+        auto check_buffer = [](std::uint32_t value, const char* name) -> Result<void> {
+            if (value != 0 && (value < kMinPinnedSocketBuffer || value > kMaxPinnedSocketBuffer)) {
+                return Error(ErrorCode::InvalidConfiguration, ErrorCategory::Configuration,
+                              std::string(name) +
+                                  " must be 0 (kernel autotune) or between 2048 and 67108864 bytes");
+            }
+            return {};
+        };
+        if (auto r = check_buffer(client_send_buffer_bytes, "client_send_buffer_bytes"); !r) return r;
+        if (auto r = check_buffer(client_receive_buffer_bytes, "client_receive_buffer_bytes"); !r) return r;
+        if (client_tcp_notsent_lowat_bytes != 0 && client_send_buffer_bytes != 0 &&
+            client_tcp_notsent_lowat_bytes > client_send_buffer_bytes) {
+            return Error(ErrorCode::InvalidConfiguration, ErrorCategory::Configuration,
+                          "client_tcp_notsent_lowat_bytes must not exceed client_send_buffer_bytes");
+        }
+    }
     // --- Phase 8 release gate: "required configuration is missing" and
     // "unsupported insecure defaults are used" must both fail startup, not
     // warn. Everything below is enforced at load_config() time, so a
@@ -311,6 +335,10 @@ Result<ServerConfig> load_config(const std::string& path) {
     u32("registered_buffer_size", cfg.registered_buffer_size);
     u32("provided_buffer_count", cfg.provided_buffer_count);
     u32("provided_buffer_size", cfg.provided_buffer_size);
+
+    u32("client_send_buffer_bytes", cfg.client_send_buffer_bytes);
+    u32("client_receive_buffer_bytes", cfg.client_receive_buffer_bytes);
+    u32("client_tcp_notsent_lowat_bytes", cfg.client_tcp_notsent_lowat_bytes);
 
     u32("maximum_connections", cfg.maximum_connections);
     u32("maximum_connections_per_ip", cfg.maximum_connections_per_ip);

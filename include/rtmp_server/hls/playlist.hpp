@@ -31,6 +31,18 @@ struct MediaPlaylistOptions {
     bool ended = false;
     // Relative URI prefix prepended to each segment name.
     std::string segment_uri_prefix;
+    // Emit EXT-X-SERVER-CONTROL. Players that predate the tag ignore it.
+    // CAN-BLOCK-RELOAD=NO is always set when emitted: this origin does not
+    // implement blocking playlist reload, so a compliant player re-fetches at
+    // the TARGETDURATION cadence instead of polling aggressively — the HLS
+    // analogue of Wowza's "client idle frequency" control, and the main lever
+    // for origin request rate at a large audience.
+    bool emit_server_control = true;
+    // HOLD-BACK seconds advertised in EXT-X-SERVER-CONTROL: how far back from
+    // the live edge a player begins. 0 omits the attribute (player uses its
+    // 3 x TARGETDURATION default). A value below 3 x TARGETDURATION is invalid
+    // per RFC 8216bis and is clamped up.
+    double hold_back_seconds = 0.0;
 };
 
 // Builds a media playlist. TARGETDURATION is raised automatically if any

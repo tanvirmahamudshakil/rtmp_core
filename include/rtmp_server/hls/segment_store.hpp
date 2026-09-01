@@ -33,6 +33,12 @@ struct SegmentStoreConfig {
     std::uint32_t target_duration_seconds = 4;
     std::uint32_t playlist_version = 3;
 
+    // Advertised EXT-X-SERVER-CONTROL HOLD-BACK in seconds. 0 lets the player
+    // use its 3 x TARGETDURATION default; a smaller value is clamped up. See
+    // MediaPlaylistOptions::hold_back_seconds. CAN-BLOCK-RELOAD=NO is emitted
+    // unconditionally so players poll at the segment cadence.
+    double playlist_hold_back_seconds = 0.0;
+
     // Keep an established live URL moving through a temporary source
     // outage by repeating the last complete transport-stream segment. The
     // synthetic copies carry discontinuities because their media timestamps
