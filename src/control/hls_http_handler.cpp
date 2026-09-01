@@ -7,6 +7,7 @@
 #include <unordered_set>
 #include <utility>
 
+#include "rtmp_server/core/hmac.hpp"
 #include "rtmp_server/core/random.hpp"
 #include "rtmp_server/management/token.hpp"
 
@@ -282,6 +283,7 @@ HlsHttpHandler::Stats HlsHttpHandler::stats() const {
     snapshot.unauthorized = stats_.unauthorized.load(std::memory_order_relaxed);
     snapshot.not_found = stats_.not_found.load(std::memory_order_relaxed);
     snapshot.range_requests = stats_.range_requests.load(std::memory_order_relaxed);
+    snapshot.edge_unauthorized = stats_.edge_unauthorized.load(std::memory_order_relaxed);
     return snapshot;
 }
 
@@ -532,6 +534,22 @@ HttpResponse HlsHttpHandler::handle(const HttpRequest& request) {
         auto response = plain(405, "method not allowed");
         response.headers["Allow"] = "GET, HEAD";
         return response;
+    }
+
+    // Multi-node edge / origin-shield gate. An origin fronted by its own
+    // edge tier only serves delivery requests that carry the shared edge
+    // token, so the public reaches the origin only through a caching edge
+    // (never directly, never as an open proxy). No-op when unconfigured.
+    if (!options_.edge_fetch_secret.empty()) {
+        const auto it = request.headers.find(options_.edge_fetch_header);
+        const bool ok = it != request.headers.end() &&
+                        core::constant_time_equals(it->second, options_.edge_fetch_secret);
+        if (!ok) {
+            stats_.edge_unauthorized.fetch_add(1, std::memory_order_relaxed);
+            auto response = plain(403, "edge token required");
+            response.headers["Cache-Control"] = "no-store";
+            return response;
+        }
     }
 
     std::vector<std::string> parts;

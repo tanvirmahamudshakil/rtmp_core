@@ -213,6 +213,16 @@ Result<void> ServerConfig::validate() const {
                           "client_tcp_notsent_lowat_bytes must not exceed client_send_buffer_bytes");
         }
     }
+    // The edge-fetch gate is only meaningful with a real secret: a short one
+    // is brute-forceable across the many requests an edge tier makes, and an
+    // accidental one- or two-character value almost certainly means a
+    // templating mistake rather than an intentional token. Empty stays valid
+    // (the gate is simply off).
+    if (!hls_edge_fetch_secret.empty() && hls_edge_fetch_secret.size() < 16) {
+        return Error(ErrorCode::InvalidConfiguration, ErrorCategory::Configuration,
+                      "hls_edge_fetch_secret must be at least 16 characters when set "
+                      "(generate with: openssl rand -hex 32)");
+    }
     // --- Phase 8 release gate: "required configuration is missing" and
     // "unsupported insecure defaults are used" must both fail startup, not
     // warn. Everything below is enforced at load_config() time, so a
@@ -349,6 +359,7 @@ Result<ServerConfig> load_config(const std::string& path) {
     u32("output_chunk_size", cfg.output_chunk_size);
     u32("maximum_rtmp_message_size", cfg.maximum_rtmp_message_size);
     boolean("enable_hls_fast_join", cfg.enable_hls_fast_join);
+    str("hls_edge_fetch_secret", cfg.hls_edge_fetch_secret);
 
     duration("handshake_timeout", cfg.handshake_timeout);
     duration("authentication_timeout", cfg.authentication_timeout);

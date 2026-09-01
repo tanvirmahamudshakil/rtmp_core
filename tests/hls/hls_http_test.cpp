@@ -92,6 +92,65 @@ TEST(HlsHttpTest, ServesSegmentsWithTheMpegTsContentType) {
     EXPECT_EQ(static_cast<unsigned char>(response.shared_body.view()[0]), 0x47u);
 }
 
+// --- Multi-node edge / origin-shield gate --------------------------------
+
+TEST(HlsHttpTest, EdgeGateDisabledByDefaultServesEveryRequest) {
+    HlsHttpHandler handler{HlsHttpOptions{}};
+    handler.register_stream("live", "demo", populated_store());
+
+    // No X-Edge-Token header, gate off: served normally.
+    EXPECT_EQ(handler.handle(get("/hls/live/demo/index.m3u8")).status, 200);
+    EXPECT_EQ(handler.stats().edge_unauthorized, 0u);
+}
+
+TEST(HlsHttpTest, EdgeGateRejectsRequestWithMissingOrWrongToken) {
+    HlsHttpOptions options;
+    options.edge_fetch_secret = "edge-secret-value-0123456789abcdef";
+    HlsHttpHandler handler{options};
+    handler.register_stream("live", "demo", populated_store());
+
+    auto missing = handler.handle(get("/hls/live/demo/index.m3u8"));
+    EXPECT_EQ(missing.status, 403);
+    EXPECT_EQ(header_of(missing, "Cache-Control"), "no-store");
+
+    auto wrong = get("/hls/live/demo/index.m3u8");
+    wrong.headers["x-edge-token"] = "not-the-secret";
+    EXPECT_EQ(handler.handle(wrong).status, 403);
+
+    EXPECT_EQ(handler.stats().edge_unauthorized, 2u);
+    EXPECT_EQ(handler.stats().unauthorized, 0u); // distinct from playback-token failures
+}
+
+TEST(HlsHttpTest, EdgeGateAdmitsRequestCarryingTheExactToken) {
+    HlsHttpOptions options;
+    options.edge_fetch_secret = "edge-secret-value-0123456789abcdef";
+    HlsHttpHandler handler{options};
+    handler.register_stream("live", "demo", populated_store());
+
+    auto request = get("/hls/live/demo/index.m3u8");
+    request.headers["x-edge-token"] = "edge-secret-value-0123456789abcdef";
+    auto response = handler.handle(request);
+    EXPECT_EQ(response.status, 200);
+    EXPECT_EQ(response.content_type, kContentTypeM3u8);
+    EXPECT_EQ(handler.stats().edge_unauthorized, 0u);
+}
+
+TEST(HlsHttpTest, EdgeGateUsesAConfigurableHeaderName) {
+    HlsHttpOptions options;
+    options.edge_fetch_secret = "edge-secret-value-0123456789abcdef";
+    options.edge_fetch_header = "x-sf-edge";
+    HlsHttpHandler handler{options};
+    handler.register_stream("live", "demo", populated_store());
+
+    auto on_default_header = get("/hls/live/demo/index.m3u8");
+    on_default_header.headers["x-edge-token"] = "edge-secret-value-0123456789abcdef";
+    EXPECT_EQ(handler.handle(on_default_header).status, 403);
+
+    auto on_custom_header = get("/hls/live/demo/index.m3u8");
+    on_custom_header.headers["x-sf-edge"] = "edge-secret-value-0123456789abcdef";
+    EXPECT_EQ(handler.handle(on_custom_header).status, 200);
+}
+
 TEST(HlsHttpTest, ServesTheMasterPlaylistWhenRenditionsAreDeclared) {
     HlsHttpHandler handler{HlsHttpOptions{}};
     handler.register_stream("live", "demo", populated_store());

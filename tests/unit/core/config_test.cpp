@@ -237,6 +237,18 @@ TEST(ServerConfigValidate, RejectsNotsentLowatAboveSendBuffer) {
     EXPECT_TRUE(cfg.validate().ok());
 }
 
+TEST(ServerConfigValidate, EdgeFetchSecretEmptyOrLongEnough) {
+    auto cfg = valid_config();
+    cfg.hls_edge_fetch_secret = "";  // gate disabled
+    EXPECT_TRUE(cfg.validate().ok());
+
+    cfg.hls_edge_fetch_secret = "too-short";  // < 16
+    EXPECT_FALSE(cfg.validate().ok());
+
+    cfg.hls_edge_fetch_secret = "0123456789abcdef";  // exactly 16
+    EXPECT_TRUE(cfg.validate().ok());
+}
+
 TEST(ServerConfigValidate, RejectsNonPositiveTimeouts) {
     auto cfg = valid_config();
     cfg.idle_timeout = std::chrono::milliseconds{0};

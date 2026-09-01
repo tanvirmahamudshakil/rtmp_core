@@ -771,6 +771,15 @@ fi
 [[ "${TOKEN_SECRET}" =~ ^[A-Za-z0-9._~-]{32,256}$ ]] ||
   die "The existing token-signing secret is invalid; set RTMP_FORCE_ROTATE_SECRETS=1."
 
+# Multi-node HLS: when RTMP_EDGE_TOKEN is set, the origin serves /hls only to
+# requests carrying X-Edge-Token, so it cannot be hit directly once an edge
+# tier (deploy/edge/install-edge.sh) is in front. Empty = single-box install,
+# gate off. The origin's own co-located Varnish is taught the header below.
+EDGE_TOKEN="${RTMP_EDGE_TOKEN:-}"
+if [[ -n "${EDGE_TOKEN}" && ${#EDGE_TOKEN} -lt 16 ]]; then
+  die "RTMP_EDGE_TOKEN must be at least 16 characters (generate: openssl rand -hex 32)."
+fi
+
 # Cap glibc malloc arenas so per-arena free lists cannot balloon RSS under a
 # connection storm or many concurrent transcode threads. glibc's default is
 # 8 x CPU cores; Wowza's high-concurrency transcoding guidance starts at
@@ -812,7 +821,8 @@ RTMP_SERVER_PROVIDED_BUFFER_SIZE=${PROVIDED_BUFFER_SIZE}
 RTMP_SERVER_CLIENT_SEND_BUFFER_BYTES=262144
 RTMP_SERVER_CLIENT_RECEIVE_BUFFER_BYTES=0
 RTMP_SERVER_CLIENT_TCP_NOTSENT_LOWAT_BYTES=131072
-MALLOC_ARENA_MAX=${MALLOC_ARENA_MAX_VALUE}
+MALLOC_ARENA_MAX=${MALLOC_ARENA_MAX_VALUE}${EDGE_TOKEN:+
+RTMP_SERVER_HLS_EDGE_FETCH_SECRET=${EDGE_TOKEN}}
 RTMP_SERVER_SUBSCRIBER_QUEUE_MAX_BYTES=4194304
 RTMP_SERVER_SUBSCRIBER_QUEUE_MAX_PACKETS=512
 STREAMFORGE_MAX_TRACKED_VIEWERS_PER_STREAM=${TRACKED_VIEWER_LIMIT}
@@ -862,6 +872,18 @@ Each stream has one RTMP URL for publisher input/direct RTMP playback:
   rtmp://${PUBLIC_HOST}:1935/<application>/<stream>
 For scalable segmented playback in VLC/web players, use:
   $(if [[ -n "${DOMAIN}" ]]; then printf 'https://%s' "${DOMAIN}"; else printf 'http://%s' "${PRIMARY_IP}"; fi)/hls/<application>/<stream>/index.m3u8
+$(if [[ -n "${EDGE_TOKEN}" ]]; then cat <<EDGE
+
+Multi-node HLS edge tier: ENABLED
+  Edge/shield token (X-Edge-Token): ${EDGE_TOKEN}
+  This origin now answers /hls only to requests carrying that token.
+  Add an edge on a fresh Debian/Ubuntu host:
+    sudo env STREAMFORGE_ORIGIN=$(if [[ -n "${DOMAIN}" ]]; then printf 'https://%s' "${DOMAIN}"; else printf 'https://%s' "${PUBLIC_HOST}"; fi) \\
+      STREAMFORGE_EDGE_TOKEN=${EDGE_TOKEN} STREAMFORGE_DOMAIN=edge1.example.com \\
+      bash deploy/edge/install-edge.sh
+  See docs/multi-node-hls.md.
+EDGE
+fi)
 EOF
 chmod 0600 "${CREDENTIALS}"
 
@@ -1370,6 +1392,14 @@ VARNISH_THREAD_QUEUE_LIMIT=100000
 # cap left by an earlier install is stripped so re-runs converge to uncapped.
 install -m 0644 "${SOURCE_DIR}/deploy/varnish/streamforge.vcl" /etc/varnish/streamforge.vcl
 sed -i "/^[[:space:]]*\.max_connections = [0-9]\+;[[:space:]]*$/d" /etc/varnish/streamforge.vcl
+
+# When the edge-fetch gate is enabled on the origin, its own co-located
+# Varnish must present the token on every backend fetch or it locks itself
+# out of /hls. Injected into vcl_backend_fetch, right after the Range unset.
+if [[ -n "${EDGE_TOKEN}" ]]; then
+  sed -i "s#\(^[[:space:]]*unset bereq.http.Range;\)#\1\n    set bereq.http.X-Edge-Token = \"${EDGE_TOKEN}\";#" \
+    /etc/varnish/streamforge.vcl
+fi
 
 # The VCL imports the digest vmod (libvmod-digest, from the varnish-modules
 # package installed above) to mint the per-viewer session id at the edge

@@ -127,6 +127,19 @@ struct ServerConfig {
     // every stream generically -- see HlsHttpOptions::enable_fast_join.
     bool enable_hls_fast_join = false;
 
+    // Multi-node HLS edge / origin-shield gate. When non-empty, every HLS
+    // delivery request (playlist or segment) must carry the header
+    // `X-Edge-Token` with this exact value or the origin answers 403. Set it
+    // on an origin that is fronted by its own edge/shield Varnish tier
+    // (deploy/varnish/streamforge-edge.vcl) so the public reaches the origin
+    // only through a caching edge -- never directly, never as an open
+    // segment proxy. Empty (the default) disables the check, which is
+    // correct for a single-box install where only the co-located Varnish
+    // ever reaches this handler. Compared with core::constant_time_equals.
+    // validate() requires >= 16 characters when set (generate with
+    // `openssl rand -hex 32`).
+    std::string hls_edge_fetch_secret;
+
     std::chrono::milliseconds handshake_timeout{5000};
     std::chrono::milliseconds authentication_timeout{5000};
     std::chrono::milliseconds idle_timeout{60000};

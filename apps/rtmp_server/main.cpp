@@ -199,6 +199,13 @@ int main(int argc, char** argv) {
     // this mutex is no longer the contention source it was before.
     hls_options.track_delivery_stats = true;
     hls_options.enable_fast_join = config.enable_hls_fast_join;
+    // Multi-node edge / origin-shield gate. Empty by default (single-box
+    // install: only the co-located Varnish reaches this handler). When set,
+    // the origin serves /hls only to a request carrying X-Edge-Token, so it
+    // cannot be hit directly or used as an open segment proxy once an edge
+    // tier (deploy/varnish/streamforge-edge.vcl, deploy/edge/install-edge.sh)
+    // is in front. See docs/multi-node-hls.md.
+    hls_options.edge_fetch_secret = config.hls_edge_fetch_secret;
     rtmp_server::control::HlsHttpHandler hls_handler(std::move(hls_options));
     // Disabling a stream (or its application) takes its .m3u8 links offline
     // immediately, mirroring the RTMP publish/play gate above — no viewer can

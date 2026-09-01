@@ -350,6 +350,16 @@ entry.
 - `HlsHttpHandler` runs only on `HttpServer` worker threads and performs no
   disk I/O at all.
 
+## Scaling past one box
+
+The co-located Varnish makes one box serve a large audience; its ceiling is
+uplink bandwidth. To add total bandwidth, regions, or machine-failure
+resilience, put **edge** cache nodes in front of the origin — see
+[multi-node-hls.md](multi-node-hls.md). The origin's `hls_edge_fetch_secret`
+gates `/hls` to token-bearing edge requests only; `deploy/edge/install-edge.sh`
+plus `deploy/varnish/streamforge-edge.vcl` stand up an edge or an
+origin-shield node.
+
 ## Known limitations
 
 - No LL-HLS (partial segments, blocking playlist reload). Requires CMAF.

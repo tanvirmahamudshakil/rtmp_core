@@ -33,6 +33,20 @@ struct HlsHttpOptions {
     bool require_playback_token = false;
     std::string token_signing_secret;
 
+    // Multi-node edge / origin-shield gate. When non-empty, every request
+    // under route_prefix must carry `edge_fetch_header` set to this exact
+    // value or it is refused with 403 (no-store). Set it on an origin that
+    // sits behind its own edge/shield Varnish tier
+    // (deploy/varnish/streamforge-edge.vcl) so the public reaches the origin
+    // only through a caching edge, never directly and never as an open
+    // segment proxy. Empty (the default) disables the check, which is
+    // correct for a single-box install where only the co-located Varnish
+    // reaches this handler. Compared with core::constant_time_equals.
+    std::string edge_fetch_secret;
+    // Request header carrying the token. Lower-cased: HttpRequest::headers
+    // keys are already normalised to lower case.
+    std::string edge_fetch_header = "x-edge-token";
+
     // Give every fresh playlist open a distinct, opaque playback session.
     // It normally travels in playlist/segment query strings. Shared-playlist
     // mode keeps it on the recurring playlist URL instead, still allowing the
@@ -178,6 +192,11 @@ public:
         std::uint64_t unauthorized = 0;
         std::uint64_t not_found = 0;
         std::uint64_t range_requests = 0;
+        // Requests refused because edge_fetch_secret is set and the request
+        // carried a missing or wrong edge token. A non-zero value on a
+        // healthy deployment means something is reaching the origin without
+        // going through the edge tier.
+        std::uint64_t edge_unauthorized = 0;
     };
     [[nodiscard]] Stats stats() const;
 
@@ -294,6 +313,7 @@ private:
         std::atomic<std::uint64_t> unauthorized{0};
         std::atomic<std::uint64_t> not_found{0};
         std::atomic<std::uint64_t> range_requests{0};
+        std::atomic<std::uint64_t> edge_unauthorized{0};
     };
     mutable AtomicStats stats_;
 };
