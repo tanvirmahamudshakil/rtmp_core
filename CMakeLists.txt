@@ -84,6 +84,9 @@ add_subdirectory(src/transcoding)
 # Phase 6 HLS packaging (playlists, segmenter, bounded segment store). Must
 # come before src/control, which links it for HLS HTTP delivery.
 add_subdirectory(src/hls)
+# MPEG-DASH packaging (MPD, fMP4 segmenter, bounded segment store). Same
+# platform posture as src/hls; must also come before src/control.
+add_subdirectory(src/dash)
 # Builds everywhere — POSIX sockets, not io_uring.
 add_subdirectory(src/control)
 
@@ -102,6 +105,7 @@ if(RTMP_SERVER_BUILD_TESTS)
     add_subdirectory(tests/media)
     add_subdirectory(tests/recording)
     add_subdirectory(tests/hls)
+    add_subdirectory(tests/dash)
     add_subdirectory(tests/management)
     add_subdirectory(tests/persistence)
     add_subdirectory(tests/integration)

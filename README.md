@@ -141,6 +141,25 @@ After installation:
    rtmp://stream.example.com:1935/live`, `Stream Key: main-stage`); this does
    not create a second server-side URL.
 
+## Optional HLS delivery features
+
+All three are off or free by default; nothing below changes an existing
+deployment unless it is switched on in `server.yaml`. See `docs/hls.md`.
+
+| Feature | Setting | What it buys |
+|---|---|---|
+| Low-Latency HLS | `hls_low_latency: true` | Each segment is published in `hls_part_target_duration` slices (`EXT-X-PART`) and playlist reloads block until the live edge reaches the position the player asked for, so latency drops from roughly three segment durations to roughly one part. The origin holds a blocked request without holding a thread. |
+| AES-128 segment encryption | `hls_encryption_enabled: true` | `EXT-X-KEY` whole-segment AES-128-CBC. A leaked segment URL is worthless without a key fetched from `key-<id>.bin`, behind the same authorisation as the playlist. `hls_key_rotation_interval` bounds a leaked key's reach. Ciphertext is identical for every viewer, so segments stay fully cacheable. |
+| Trick play | `hls_iframe_playlists: true` (default) | `iframe.m3u8` per stream, advertised from the master playlist, so a player can scrub without downloading whole segments. The byte ranges are recorded as a side effect of packaging and cost nothing when unused. |
+| MPEG-DASH | `dash_enabled: true` | Packages the same publish into fMP4/CMAF and serves an MPD at `/dash`, in parallel with `/hls`. Doubles per-publisher packaging/storage cost, so it is off by default. See `docs/dash.md`. |
+
+Low latency raises origin request volume (one cached object per part plus a
+held connection per waiting player) and `hls_blocking_reload_timeout` must
+stay below the cache tier's own backend timeout. Encryption and trick play are
+mutually exclusive on the same rendition: an encrypted segment's byte range
+would point into ciphertext, so the trick-play entry is dropped rather than
+made wrong.
+
 ## Capacity reality
 
 Delivery is bounded by the lowest of usable NIC bandwidth, CPU/kernel

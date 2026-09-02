@@ -5,6 +5,7 @@
 # lives in rtmp_server_control (the existing Phase 5 server), not here.
 add_library(rtmp_server_hls STATIC
     playlist.cpp
+    encryption.cpp
     segmenter.cpp
     segment_store.cpp
     stream_sink.cpp

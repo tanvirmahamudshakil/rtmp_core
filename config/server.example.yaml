@@ -67,6 +67,32 @@ enable_hls_fast_join: false
 # See docs/multi-node-hls.md.
 hls_edge_fetch_secret: ""
 
+# Low-Latency HLS. Publishes each segment in partial slices and answers
+# blocking playlist reloads, cutting live latency from roughly three segment
+# durations to roughly one part. Costs one extra cached object per part and
+# holds one socket per blocked player. See docs/hls.md "Low-Latency HLS".
+hls_low_latency: false
+hls_part_target_duration: 333ms
+# Must stay below the cache tier's backend timeout, or the edge gives up on a
+# held request before this origin answers it.
+hls_blocking_reload_timeout: 9s
+
+# AES-128 segment encryption with EXT-X-KEY. Media becomes useless without a
+# key fetched through the same authorisation gate as the playlist. Encrypted
+# segments stay fully cacheable: every viewer receives identical ciphertext.
+hls_encryption_enabled: false
+# 0 never rotates. Rotation bounds how much media one leaked key exposes.
+hls_key_rotation_interval: 0s
+
+# Serve each stream's EXT-X-I-FRAMES-ONLY playlist (iframe.m3u8) so a player
+# can scrub without fetching whole segments.
+hls_iframe_playlists: true
+
+# MPEG-DASH delivery, off the same RTMP publish as HLS, served at /dash
+# alongside /hls. Off by default: it doubles per-publisher packaging and
+# storage cost. See docs/dash.md.
+dash_enabled: false
+
 handshake_timeout: 5s
 authentication_timeout: 5s
 idle_timeout: 60s

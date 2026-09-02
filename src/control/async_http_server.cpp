@@ -15,6 +15,8 @@
 #include <sys/epoll.h>
 #else
 #include <poll.h>
+
+#include <tuple>
 #endif
 
 #include <algorithm>
@@ -254,6 +256,10 @@ public:
     EventLoop& operator=(const EventLoop&) = delete;
 
     ~EventLoop() {
+        {
+            std::lock_guard lock(mailbox_->mutex);
+            mailbox_->closed = true;
+        }
         for (const auto& [fd, connection] : connections_) ::close(fd);
         if (listen_fd_ >= 0) ::close(listen_fd_);
         if (wakeup_read_ >= 0) ::close(wakeup_read_);
@@ -274,10 +280,17 @@ public:
     void hand_off(int fd, std::string client_ip);
 
 private:
-    enum class State { ReadingHead, ReadingBody, Writing };
+    // Deferred: the handler postponed the answer and the connection is
+    // parked, holding no thread, until someone resolves it (Low-Latency HLS
+    // blocking playlist reload) or its budget expires.
+    enum class State { ReadingHead, ReadingBody, Writing, Deferred };
 
     struct Connection {
         int fd = -1;
+        // Monotonic within this loop. A descriptor can be closed and reused
+        // while a deferred response for the old connection is still in
+        // flight, so a resolution is only applied when this matches.
+        std::uint64_t id = 0;
         std::string client_ip;
         State state = State::ReadingHead;
 
@@ -297,6 +310,10 @@ private:
         std::string out_inline_body; // small bodies the handler built inline
 
         bool keep_alive = false;
+        // Set while state == Deferred: the postponed answer, and the
+        // keep-alive decision already made for the request that produced it.
+        DeferredResponsePtr deferred;
+        bool deferred_keep_alive = false;
         std::size_t requests_served = 0;
         unsigned interest = 0;
         std::chrono::steady_clock::time_point deadline;
@@ -318,6 +335,21 @@ private:
     void update_interest(Connection& connection, unsigned interest);
     void sweep_timeouts();
     void touch(Connection& connection, std::chrono::milliseconds budget);
+    // Parks a connection on a handler's deferred response.
+    bool defer_response(Connection& connection, DeferredResponsePtr deferred, bool keep_alive);
+    // Applies resolutions posted from other threads. Called from drain_wakeup.
+    void drain_resolved();
+
+    // Resolutions arrive from whichever thread produced the media, which is
+    // never this loop's. The mailbox is held by shared_ptr and captured by
+    // weak_ptr in the completion, so a resolution landing after the loop is
+    // gone finds nothing to write to instead of a dangling pointer.
+    struct Mailbox {
+        std::mutex mutex;
+        std::deque<std::tuple<int, std::uint64_t, HttpResponse>> resolved;
+        int wakeup_write = -1;
+        bool closed = false;
+    };
 
     AsyncHttpServer& server_;
     std::size_t id_;
@@ -333,6 +365,9 @@ private:
     std::mutex handoff_mutex_;
     std::deque<std::pair<int, std::string>> handoff_;
 
+    std::shared_ptr<Mailbox> mailbox_ = std::make_shared<Mailbox>();
+    std::uint64_t next_connection_id_ = 1;
+
     std::chrono::steady_clock::time_point next_sweep_{};
     std::vector<ReadyEvent> ready_;
 };
@@ -346,6 +381,10 @@ bool AsyncHttpServer::EventLoop::prepare(int listen_fd) {
     wakeup_write_ = pipe_fds[1];
     if (!set_nonblocking(wakeup_read_) || !set_nonblocking(wakeup_write_)) return false;
     if (!poller_.add(wakeup_read_, kReadable)) return false;
+    {
+        std::lock_guard lock(mailbox_->mutex);
+        mailbox_->wakeup_write = wakeup_write_;
+    }
 
     listen_fd_ = listen_fd;
     if (listen_fd_ >= 0 && !poller_.add(listen_fd_, kReadable)) return false;
@@ -379,6 +418,8 @@ void AsyncHttpServer::EventLoop::drain_wakeup() {
     char scratch[256];
     while (::read(wakeup_read_, scratch, sizeof(scratch)) > 0) {
     }
+
+    drain_resolved();
 
     std::deque<std::pair<int, std::string>> pending;
     {
@@ -516,6 +557,7 @@ void AsyncHttpServer::EventLoop::add_connection(int fd, std::string client_ip) {
 
     Connection connection;
     connection.fd = fd;
+    connection.id = next_connection_id_++;
     connection.client_ip = std::move(client_ip);
     connection.interest = kReadable;
     touch(connection, server_.options_.request_timeout);
@@ -669,7 +711,79 @@ bool AsyncHttpServer::EventLoop::dispatch(Connection& connection) {
                             connection.requests_served + 1 < options.max_requests_per_connection;
 
     ++connection.requests_served;
+    if (response.deferred) {
+        return defer_response(connection, std::move(response.deferred), keep_alive);
+    }
     return begin_response(connection, std::move(response), keep_alive);
+}
+
+bool AsyncHttpServer::EventLoop::defer_response(Connection& connection,
+                                                DeferredResponsePtr deferred, bool keep_alive) {
+    const int fd = connection.fd;
+    const std::uint64_t id = connection.id;
+
+    connection.state = State::Deferred;
+    connection.deferred = deferred;
+    connection.deferred_keep_alive = keep_alive;
+    // Stop watching for readability: a pipelined request arriving now would
+    // be dispatched while this one is still unanswered, putting two responses
+    // on the wire in the wrong order. Those bytes stay in the socket buffer
+    // and are read once this response is out.
+    update_interest(connection, 0);
+
+    const auto budget = deferred->timeout.count() > 0
+                            ? std::min(deferred->timeout, server_.options_.request_timeout)
+                            : server_.options_.request_timeout;
+    touch(connection, budget);
+
+    std::weak_ptr<Mailbox> weak_mailbox = mailbox_;
+    deferred->attach([weak_mailbox, fd, id](HttpResponse response) {
+        const auto mailbox = weak_mailbox.lock();
+        if (!mailbox) return; // the loop is gone; nothing to answer on
+        int wakeup = -1;
+        {
+            std::lock_guard lock(mailbox->mutex);
+            if (mailbox->closed) return;
+            mailbox->resolved.emplace_back(fd, id, std::move(response));
+            wakeup = mailbox->wakeup_write;
+        }
+        if (wakeup >= 0) {
+            const char byte = 0;
+            const ssize_t ignored = ::write(wakeup, &byte, 1);
+            static_cast<void>(ignored);
+        }
+    });
+    return true;
+}
+
+void AsyncHttpServer::EventLoop::drain_resolved() {
+    std::deque<std::tuple<int, std::uint64_t, HttpResponse>> ready;
+    {
+        std::lock_guard lock(mailbox_->mutex);
+        ready.swap(mailbox_->resolved);
+    }
+    for (auto& entry : ready) {
+        const int fd = std::get<0>(entry);
+        const std::uint64_t id = std::get<1>(entry);
+        const auto it = connections_.find(fd);
+        // Gone, or the descriptor was reused by a newer connection: the
+        // request this answered no longer exists.
+        if (it == connections_.end()) continue;
+        Connection& connection = it->second;
+        if (connection.id != id || connection.state != State::Deferred) continue;
+
+        const bool keep_alive = connection.deferred_keep_alive;
+        connection.deferred.reset();
+        HttpResponse response = std::move(std::get<2>(entry));
+        // A handler must not defer twice for one request; treat a nested
+        // deferral as an error rather than parking the connection forever.
+        if (response.deferred) {
+            response.deferred.reset();
+            response.status = 500;
+            response.body = R"({"error":"nested_deferral"})";
+        }
+        begin_response(connection, std::move(response), keep_alive);
+    }
 }
 
 bool AsyncHttpServer::EventLoop::begin_response(Connection& connection, HttpResponse response,
@@ -810,6 +924,32 @@ void AsyncHttpServer::EventLoop::sweep_timeouts() {
         if (connection.deadline <= now) expired.push_back(fd);
     }
     for (const int fd : expired) {
+        const auto it = connections_.find(fd);
+        if (it == connections_.end()) continue;
+        Connection& connection = it->second;
+
+        // A parked request that ran out of budget is answered, not dropped: a
+        // player that asked for a live-edge position the encoder never reached
+        // must still get the playlist as it stands, or it treats the reset as
+        // a media error and rebuffers.
+        if (connection.state == State::Deferred && connection.deferred) {
+            auto deferred = std::move(connection.deferred);
+            connection.deferred.reset();
+            if (deferred->cancel()) {
+                server_.timeouts_.fetch_add(1, std::memory_order_relaxed);
+                HttpResponse response = std::move(deferred->timeout_response);
+                response.deferred.reset();
+                if (response.status == 0) response.status = 503;
+                begin_response(connection, std::move(response), connection.deferred_keep_alive);
+                continue;
+            }
+            // cancel() lost the race: a resolution is already in the mailbox
+            // and will be written on the next drain. Give it a fresh budget
+            // rather than closing the connection out from under it.
+            touch(connection, server_.options_.request_timeout);
+            continue;
+        }
+
         server_.timeouts_.fetch_add(1, std::memory_order_relaxed);
         close_connection(fd);
     }

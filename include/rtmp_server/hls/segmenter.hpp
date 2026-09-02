@@ -46,6 +46,15 @@ struct SegmenterConfig {
     // segmenter must continue after the last published sequence instead of
     // colliding with immutable cached segment-0.ts, segment-1.ts, ... URLs.
     std::uint64_t initial_sequence = 0;
+
+    // Low-Latency HLS: publish the segment in slices this long instead of
+    // only when it is complete. 0 (the default) disables partial segments
+    // entirely and the segmenter behaves exactly as it always did.
+    //
+    // A part is closed at the first access unit at or after the target, so
+    // parts are whole-frame and whole-TS-packet aligned; a player can decode
+    // one without waiting for the rest of the segment.
+    std::chrono::milliseconds part_target_duration{0};
 };
 
 struct SegmenterStats {
@@ -56,6 +65,7 @@ struct SegmenterStats {
     std::uint64_t dropped_frames = 0;      // frames rejected (no config yet, parse error)
     std::uint64_t forced_cuts = 0;         // cuts made on size/duration bound, not a keyframe
     std::uint64_t sequence_header_changes = 0;
+    std::uint64_t parts_produced = 0;      // Low-Latency HLS partial segments
 };
 
 // Turns one publishing RTMP stream's FLV-form audio/video payloads into
@@ -75,7 +85,17 @@ public:
     // short mutex and does no I/O.
     using SegmentCallback = std::function<void(SegmentPtr)>;
 
+    // Invoked once per finished Low-Latency HLS partial segment, on the same
+    // thread and under the same no-blocking contract as SegmentCallback.
+    // Never invoked when SegmenterConfig::part_target_duration is zero.
+    using PartCallback = std::function<void(PartPtr)>;
+
     explicit Segmenter(SegmentCallback on_segment, SegmenterConfig config = {});
+
+    // Must be set before the first media frame arrives. Kept separate from
+    // the constructor so every existing caller (and every test) that does not
+    // use low latency is unaffected.
+    void set_part_callback(PartCallback on_part) { on_part_ = std::move(on_part); }
 
     // --- RecorderSink (never throws, never propagates errors) ------------
     void on_metadata(const protocol::chunk::RtmpMessage& message) override;
@@ -102,6 +122,10 @@ public:
 private:
     // Closes the open segment (if any) and delivers it via the callback.
     void flush_segment();
+    // Closes the open part when `timestamp` has reached the part target, or
+    // unconditionally when `force` is set (segment boundary / finalize).
+    // No-op unless low latency is configured.
+    void maybe_close_part(std::uint32_t timestamp, bool force);
     // Decides whether `timestamp` continues the current timeline.
     bool is_discontinuous(std::uint32_t timestamp) const;
     void start_segment(std::uint32_t timestamp);
@@ -121,6 +145,24 @@ private:
     std::uint32_t last_ts_ = 0;
     bool have_last_ts_ = false;
     bool pending_discontinuity_ = false;   // apply to the next segment started
+
+    // Low-Latency HLS part accumulation. `part_start_offset_` is where the
+    // open part begins inside `current_`, so closing a part is one copy of
+    // that slice and never touches the bytes already published.
+    PartCallback on_part_;
+    std::vector<PartPtr> open_parts_;
+    std::size_t part_start_offset_ = 0;
+    std::uint32_t part_index_ = 0;
+    std::uint32_t part_start_ts_ = 0;
+    bool part_independent_ = false;
+    // Whether any access unit has been written into the open part. The
+    // segment's leading program tables are not media, so "part is empty"
+    // cannot be derived from the buffer offset alone.
+    bool part_has_media_ = false;
+    // Bytes from the start of the open segment through the end of its first
+    // keyframe: the independently decodable prefix an EXT-X-I-FRAMES-ONLY
+    // playlist advertises as a byte range. 0 until that keyframe is written.
+    std::uint64_t iframe_prefix_bytes_ = 0;
 
     std::uint64_t next_sequence_ = 0;
     // Monotonic timeline base: added to raw RTMP timestamps so PTS/DTS keep

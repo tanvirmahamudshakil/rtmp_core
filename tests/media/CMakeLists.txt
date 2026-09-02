@@ -2,6 +2,8 @@
 # and run on every platform (including core-only), same as the protocol tests.
 add_executable(rtmp_server_media_tests
     flv_writer_test.cpp
+    sps_test.cpp
+    fmp4_muxer_test.cpp
 )
 
 target_link_libraries(rtmp_server_media_tests PRIVATE

@@ -13,8 +13,10 @@
 #include <vector>
 
 #include "rtmp_server/authentication/rtmp_authenticator.hpp"
+#include "rtmp_server/dash/stream_sink.hpp"
 #include "rtmp_server/control/edge_viewer_stats.hpp"
 #include "rtmp_server/control/async_http_server.hpp"
+#include "rtmp_server/control/dash_http_handler.hpp"
 #include "rtmp_server/control/hls_http_handler.hpp"
 #include "rtmp_server/control/http_server.hpp"
 #include "rtmp_server/control/management_api.hpp"
@@ -206,6 +208,11 @@ int main(int argc, char** argv) {
     // tier (deploy/varnish/streamforge-edge.vcl, deploy/edge/install-edge.sh)
     // is in front. See docs/multi-node-hls.md.
     hls_options.edge_fetch_secret = config.hls_edge_fetch_secret;
+    // Low-Latency HLS and trick play. Both are additive: a player that knows
+    // neither tag sees the same playlist it always did.
+    hls_options.enable_low_latency = config.hls_low_latency;
+    hls_options.blocking_reload_timeout = config.hls_blocking_reload_timeout;
+    hls_options.enable_iframe_playlists = config.hls_iframe_playlists;
     rtmp_server::control::HlsHttpHandler hls_handler(std::move(hls_options));
     // Disabling a stream (or its application) takes its .m3u8 links offline
     // immediately, mirroring the RTMP publish/play gate above — no viewer can
@@ -222,8 +229,26 @@ int main(int argc, char** argv) {
             if (meta && !meta->enabled) return false;
             return true;
         });
+
+    // MPEG-DASH delivery, off the same publish as HLS. Off by default
+    // (config.dash_enabled); when off, dash_handler is still constructed
+    // (cheap -- no representations are ever registered) but chained after
+    // hls_handler regardless, so enabling it later needs no code change,
+    // only a config flag and a restart.
+    rtmp_server::control::DashHttpOptions dash_options;
+    dash_options.edge_fetch_secret = config.hls_edge_fetch_secret;
+    rtmp_server::control::DashHttpHandler dash_handler(std::move(dash_options));
+    dash_handler.set_stream_enabled_checker(
+        [&stream_manager](const std::string& application, const std::string& stream) {
+            const auto app = stream_manager.find_application(application);
+            if (app && !app->enabled) return false;
+            const auto meta = stream_manager.find_stream(application, stream);
+            if (meta && !meta->enabled) return false;
+            return true;
+        });
+
     services.recorder_factory =
-        [&hls_handler](std::string_view application,
+        [&hls_handler, &dash_handler, &config](std::string_view application,
                        std::string_view stream) -> std::shared_ptr<rtmp_server::protocol::commands::RecorderSink> {
             rtmp_server::hls::SegmentStoreConfig store_config;
             // A deeper live window (10 x 6 s = 60 s) gives players a large
@@ -240,10 +265,30 @@ int main(int argc, char** argv) {
             // which a rebroadcast/IPTV audience does not notice. The encoder
             // keyframe interval must divide this (2 s or 3 s GOP).
             store_config.target_duration_seconds = 6;
+            store_config.low_latency = config.hls_low_latency;
+            store_config.part_target_duration = config.hls_part_target_duration;
             auto store = std::make_shared<rtmp_server::hls::SegmentStore>(store_config);
+
+            if (config.hls_encryption_enabled) {
+                rtmp_server::hls::EncryptionConfig encryption;
+                encryption.enabled = true;
+                encryption.rotation_interval = config.hls_key_rotation_interval;
+                // The key sits beside the playlist, so a player resolves it
+                // relative to the same stream path and it passes through the
+                // same playback authorisation as the media it decrypts.
+                encryption.key_uri_template = "key-{kid}.bin";
+                auto encryptor =
+                    std::make_shared<rtmp_server::hls::SegmentEncryptor>(std::move(encryption));
+                store->set_encryptor(encryptor);
+                hls_handler.set_encryptor(std::string(application), std::string(stream),
+                                          std::move(encryptor));
+            }
 
             rtmp_server::hls::SegmenterConfig segmenter_config;
             segmenter_config.target_duration = std::chrono::seconds(6);
+            if (config.hls_low_latency) {
+                segmenter_config.part_target_duration = config.hls_part_target_duration;
+            }
             // Headroom above target so a stream whose keyframe cadence is not
             // a clean divisor of 6 s is still cut on a keyframe rather than
             // force-split mid-GOP.
@@ -251,8 +296,106 @@ int main(int argc, char** argv) {
             segmenter_config.max_segment_bytes = 24u * 1024u * 1024u;
 
             hls_handler.register_stream(std::string(application), std::string(stream), store);
-            return std::make_shared<rtmp_server::hls::StreamSink>(std::move(store),
-                                                                  std::move(segmenter_config));
+            auto hls_sink = std::make_shared<rtmp_server::hls::StreamSink>(std::move(store),
+                                                                          std::move(segmenter_config));
+            if (!config.dash_enabled) return hls_sink;
+
+            // Same 6 s cadence as the HLS store, so both delivery surfaces
+            // advertise the same live window depth for one publisher.
+            rtmp_server::dash::SegmentStoreConfig dash_store_config;
+            dash_store_config.live_window_segments = 10;
+            dash_store_config.retention_grace_segments = 6;
+            dash_store_config.max_total_bytes = 256u * 1024u * 1024u;
+            dash_store_config.target_duration_seconds = 6;
+            auto dash_store = std::make_shared<rtmp_server::dash::SegmentStore>(dash_store_config);
+
+            rtmp_server::dash::SegmenterConfig dash_segmenter_config;
+            dash_segmenter_config.target_duration = std::chrono::seconds(6);
+            dash_segmenter_config.max_segment_duration = std::chrono::seconds(12);
+            dash_segmenter_config.max_segment_bytes = 24u * 1024u * 1024u;
+            auto dash_sink = std::make_shared<rtmp_server::dash::StreamSink>(
+                dash_store, std::move(dash_segmenter_config));
+
+            const std::string app_str(application);
+            const std::string stream_str(stream);
+            // The representation id doubles as the DASH URL path component
+            // ({prefix}/{app}/{stream}/{rep}/...); reusing the stream name
+            // itself keeps a single-rendition publish's DASH URL as
+            // predictable as its HLS one.
+            dash_handler.register_representation(app_str, stream_str, stream_str, dash_store);
+
+            // The manifest needs bandwidth/codecs/geometry up front, but
+            // those are only known once the first sequence headers arrive.
+            // Poll for them lazily from a background-cheap lambda invoked on
+            // the first manifest request that finds no representations
+            // declared yet would be more invasive than this: instead,
+            // publish_start_handler_ below (re-)declares the representation
+            // once the segmenter has both configs, which happens within the
+            // first GOP -- well before any player's first manifest fetch in
+            // practice, and a fetch that races it simply sees an empty
+            // manifest once and a populated one on the player's retry.
+            struct CombinedSink final : rtmp_server::protocol::commands::RecorderSink {
+                std::shared_ptr<rtmp_server::hls::StreamSink> hls;
+                std::shared_ptr<rtmp_server::dash::StreamSink> dash;
+                rtmp_server::control::DashHttpHandler* handler;
+                std::string application;
+                std::string stream;
+                std::string representation_id;
+                bool declared = false;
+
+                void maybe_declare() {
+                    if (declared) return;
+                    if (!dash->segmenter().has_video_config() || !dash->segmenter().has_audio_config()) {
+                        return;
+                    }
+                    rtmp_server::dash::Representation rep;
+                    rep.id = representation_id;
+                    rep.codecs = dash->segmenter().codecs_attribute();
+                    rep.mime_type = "video/mp4";
+                    rep.init_template = "{rep}/init.mp4";
+                    rep.media_template = "{rep}/chunk-$Number$.m4s";
+                    // Passthrough ingest, so bitrate is whatever the
+                    // publisher sends; a fixed planning figure keeps the MPD
+                    // valid without measuring live throughput per rendition
+                    // (matches the HLS master playlist, which has the same
+                    // gap -- see docs/hls.md "Multiple renditions").
+                    rep.bandwidth = 3'000'000;
+                    std::vector<rtmp_server::dash::Representation> reps{std::move(rep)};
+                    handler->set_representations(application, stream, std::move(reps),
+                                                 rtmp_server::media::mp4::kVideoTimescale,
+                                                 6 * rtmp_server::media::mp4::kVideoTimescale);
+                    declared = true;
+                }
+
+                void on_metadata(const rtmp_server::protocol::chunk::RtmpMessage& message) override {
+                    hls->on_metadata(message);
+                    dash->on_metadata(message);
+                    maybe_declare();
+                }
+                void on_audio(const rtmp_server::protocol::chunk::RtmpMessage& message) override {
+                    hls->on_audio(message);
+                    dash->on_audio(message);
+                    maybe_declare();
+                }
+                void on_video(const rtmp_server::protocol::chunk::RtmpMessage& message) override {
+                    hls->on_video(message);
+                    dash->on_video(message);
+                    maybe_declare();
+                }
+                void finalize() override {
+                    hls->finalize();
+                    dash->finalize();
+                }
+            };
+
+            auto combined = std::make_shared<CombinedSink>();
+            combined->hls = std::move(hls_sink);
+            combined->dash = std::move(dash_sink);
+            combined->handler = &dash_handler;
+            combined->application = app_str;
+            combined->stream = stream_str;
+            combined->representation_id = stream_str;
+            return combined;
         };
 
     services.viewer_attached_handler =
@@ -295,8 +438,9 @@ int main(int argc, char** argv) {
             return rtmp_server::control::apply_settings_updates(config_path, updates);
         });
     management_api.set_stream_deleted_handler(
-        [&hls_handler](std::string_view application, std::string_view stream) {
+        [&hls_handler, &dash_handler](std::string_view application, std::string_view stream) {
             hls_handler.unregister_stream(std::string(application), std::string(stream));
+            dash_handler.unregister_stream(std::string(application), std::string(stream));
         });
     // Real per-link viewer counting. The origin only ever sees the requests
     // Varnish could not answer from cache -- roughly one per second per link
@@ -559,8 +703,11 @@ int main(int argc, char** argv) {
         });
 #endif
 
-    hls_handler.set_next([&management_api](const rtmp_server::control::HttpRequest& request) {
+    dash_handler.set_next([&management_api](const rtmp_server::control::HttpRequest& request) {
         return management_api.handle(request);
+    });
+    hls_handler.set_next([&dash_handler](const rtmp_server::control::HttpRequest& request) {
+        return dash_handler.handle(request);
     });
     // Origin HTTP delivery for /hls plus the management API.
     //

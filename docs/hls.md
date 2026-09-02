@@ -49,10 +49,93 @@ changes and publisher reconnects, and TS handles both with strictly local
 state. The ~4% overhead is an acceptable price for that, and a CDN absorbs
 the bandwidth difference.
 
-**Consequence:** low-latency HLS (LL-HLS partial segments, blocking playlist
-reload, preload hints) is *not* implemented in this phase. Moving to CMAF is
-the natural prerequisite for it, and is recorded as the recommended follow-up
-in `docs/phase-6-report.md`.
+**Update:** low-latency HLS is now implemented, and on MPEG-TS rather than
+CMAF. The "awkward" row above turned out to be a misjudgement: RFC 8216bis
+only requires a partial segment to be an independently addressable resource,
+not a CMAF chunk, and a TS part is exactly the segment's next run of whole TS
+packets. Serving parts as their own URIs (rather than byte ranges of a
+growing segment) also keeps every object immutable, which is what the shared
+Varnish tier in front of this origin needs. Staying on TS means low latency
+costs no init-segment coordination and no reconnect fragility.
+
+A CMAF/fMP4 muxer does now exist (`media::mp4::Fmp4Muxer`) for the one thing
+TS genuinely cannot do — sharing segments with MPEG-DASH — but the HLS
+delivery path is unchanged and still all TS.
+
+### Low-Latency HLS
+
+Off by default (`hls_low_latency`). When on, the segmenter cuts each segment
+into `hls_part_target_duration` slices and publishes each one the moment it is
+closed, so a player runs roughly one part behind the encoder instead of
+roughly three segments behind it.
+
+| Piece | Where |
+|---|---|
+| Part cutting, independence marking | `hls::Segmenter`, `SegmenterConfig::part_target_duration` |
+| Part storage, live edge, readiness | `hls::SegmentStore::add_part` / `live_edge` / `has_reached` |
+| `EXT-X-PART`, `PART-INF`, `PRELOAD-HINT`, `PART-HOLD-BACK` | `hls::build_media_playlist` |
+| Blocking reload (`_HLS_msn`, `_HLS_part`) | `control::HlsHttpHandler`, parked on `control::DeferredResponse` |
+
+A part is named `segment-<sequence>.<index>.ts`, so its URL is as immutable
+and as cacheable as a segment's. `INDEPENDENT=YES` is set only on a part that
+actually opens with a keyframe — never assumed from its position, because a
+segment opened by a forced mid-GOP cut has no keyframe at all.
+
+**Blocking reload does not block a thread.** `AsyncHttpServer` runs handlers
+on its event-loop threads, so waiting inside a handler would stall every other
+connection that loop is carrying. Instead the handler returns a
+`DeferredResponse`, the loop parks the connection (dropping its read interest
+so a pipelined request cannot be answered out of order), and the media thread
+resolves it from `SegmentStore`'s update notifier. Parked requests are bounded
+per stream (`max_blocked_requests_per_stream`) and always answered — on
+timeout with the playlist as it stands, on stream end, and on unregistration —
+because a reset reads to a player as a media failure and costs a reconnect.
+
+**Interaction with the cache tier.** A blocking request carries `_HLS_msn` in
+its query, so it is a distinct cache key per live-edge position and several
+players asking for the same position collapse onto one origin request. Those
+parameters are stripped from the segment and part URIs inside the playlist
+body: a media URL carrying a live-edge position would be a distinct cache
+object per polling player for no benefit. Note that
+`hls_blocking_reload_timeout` must stay below the cache tier's own backend
+timeout, or Varnish gives up on the held request before the origin answers it.
+
+### Segment encryption
+
+Off by default (`hls_encryption_enabled`). AES-128-CBC over the whole segment
+with PKCS#7 padding and `EXT-X-KEY`, which every HLS player implements.
+
+Signed playback tokens stop an unauthorised player from *fetching* media, but
+anything that obtains a segment URL gets plaintext. With encryption on, media
+is useless without a key from `key-<id>.bin` under the same stream path, which
+passes the same authorisation gate as the playlist and is served
+`private, no-store`. `hls_key_rotation_interval` bounds how much media one
+leaked key exposes; retired keys stay fetchable for a few rotations so a
+player holding a slightly stale playlist is not stranded.
+
+Encrypted media stays fully cacheable — every viewer receives the identical
+ciphertext. Two consequences are deliberate:
+
+* A partial segment is encrypted under its parent segment's key **and IV**
+  (RFC 8216bis 6.2.3), as its own CBC stream, so it decrypts standalone from
+  what `EXT-X-KEY` already advertises.
+* An encrypted segment's `EXT-X-I-FRAMES-ONLY` byte range is dropped rather
+  than kept: the range would point into ciphertext, and trick play that
+  produces garbage is worse than trick play that is absent.
+
+SAMPLE-AES is not offered. It needs codec-aware partial encryption and, in
+practice, a DRM system's key delivery to be worth anything over this.
+
+### Trick play
+
+`iframe.m3u8` per stream, advertised from the master playlist as
+`EXT-X-I-FRAME-STREAM-INF` for any rendition whose `iframe_uri` is set. The
+segmenter records, as a side effect of packaging, the byte length of each
+segment's leading run through its first keyframe — program tables included, so
+the range is independently decodable — and the playlist emits it as
+`EXT-X-BYTERANGE:<length>@0`. Granularity is therefore one I-frame per
+segment; later keyframes inside a segment are not listed, because a range
+starting at one would not carry its own PAT/PMT.
 
 ## Input format
 
@@ -362,12 +445,17 @@ origin-shield node.
 
 ## Known limitations
 
-- No LL-HLS (partial segments, blocking playlist reload). Requires CMAF.
-- No `EXT-X-KEY` / AES-128 segment encryption; access control is via signed
-  URL tokens only.
-- No I-frame-only (trick play) playlists.
 - Segments are in-memory only, so they do not survive a process restart —
   a restarting server starts a fresh live window. This is correct for live
   but means HLS cannot serve VOD of a past stream; use the FLV recording for
   that.
 - Single-range Range requests only.
+- MPEG-DASH delivery now exists as a separate module (`docs/dash.md`),
+  not folded into this document because it is a distinct delivery surface
+  with its own container (fMP4/CMAF) and manifest format (MPD) — HLS itself
+  is unaffected and stays all-TS.
+- No WebRTC (WHIP/WHEP) or SRT ingest; RTMP is the only publish protocol.
+- Multi-node edges are stood up by script (`deploy/edge/install-edge.sh`),
+  not by a control plane that discovers or rebalances them.
+- SAMPLE-AES and DRM key systems (Widevine/FairPlay/PlayReady) are out of
+  scope; `EXT-X-KEY` here is AES-128 with the identity key format.

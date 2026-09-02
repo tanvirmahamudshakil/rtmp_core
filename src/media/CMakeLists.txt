@@ -12,7 +12,10 @@
 add_library(rtmp_server_media STATIC
     flv/flv_writer.cpp
     h264/avc.cpp
+    h264/sps.cpp
+    hevc/sps.cpp
     aac/adts.cpp
+    mp4/fmp4_muxer.cpp
     ts/ts_muxer.cpp
     ts/ts_demuxer.cpp
     ${CMAKE_SOURCE_DIR}/src/recording/recorder.cpp

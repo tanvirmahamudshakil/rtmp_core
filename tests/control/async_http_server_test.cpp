@@ -7,6 +7,9 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -427,6 +430,229 @@ TEST(AsyncHttpServer, StopIsIdempotentAndSafeWithLiveConnections) {
     server.stop();
     server.stop(); // must not double-join or crash
     EXPECT_FALSE(server.running());
+}
+
+// ---------------------------------------------------------------------------
+// Deferred responses (Low-Latency HLS blocking playlist reload)
+// ---------------------------------------------------------------------------
+
+TEST(AsyncHttpServer, DeferredResponseIsWrittenWhenAnotherThreadResolvesIt) {
+    using rtmp_server::control::DeferredResponse;
+
+    std::shared_ptr<DeferredResponse> captured;
+    std::mutex captured_mutex;
+    std::condition_variable captured_ready;
+
+    AsyncHttpServer server(test_options());
+    server.set_handler([&](const HttpRequest&) {
+        auto deferred = std::make_shared<DeferredResponse>();
+        deferred->timeout = 5s;
+        deferred->timeout_response.status = 504;
+        {
+            std::lock_guard lock(captured_mutex);
+            captured = deferred;
+        }
+        captured_ready.notify_one();
+        HttpResponse pending;
+        pending.deferred = std::move(deferred);
+        return pending;
+    });
+    ASSERT_TRUE(server.start());
+
+    Client client(server.bound_port());
+    ASSERT_TRUE(client.connected());
+    ASSERT_TRUE(client.send_raw("GET /wait HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"));
+
+    std::shared_ptr<DeferredResponse> deferred;
+    {
+        std::unique_lock lock(captured_mutex);
+        ASSERT_TRUE(captured_ready.wait_for(lock, 5s, [&] { return captured != nullptr; }));
+        deferred = captured;
+    }
+
+    // Resolving from a thread that is not the event loop's is the whole point:
+    // the media is produced elsewhere, and the loop must not have been blocked
+    // waiting for it.
+    HttpResponse answer;
+    answer.content_type = "text/plain";
+    answer.body = "resolved-late";
+    std::thread producer([deferred, answer]() mutable {
+        std::this_thread::sleep_for(50ms);
+        deferred->resolve(std::move(answer));
+    });
+
+    const std::string response = client.read_all();
+    producer.join();
+
+    EXPECT_EQ(status_of(response), 200);
+    EXPECT_EQ(body_of(response), "resolved-late");
+    server.stop();
+}
+
+TEST(AsyncHttpServer, DeferredResponseResolvedBeforeParkingIsStillDelivered) {
+    using rtmp_server::control::DeferredResponse;
+
+    // The producer can win the race and resolve before the loop has attached
+    // its completion. The response must still be written, not lost.
+    AsyncHttpServer server(test_options());
+    server.set_handler([](const HttpRequest&) {
+        auto deferred = std::make_shared<DeferredResponse>();
+        deferred->timeout = 5s;
+        HttpResponse answer;
+        answer.content_type = "text/plain";
+        answer.body = "resolved-early";
+        deferred->resolve(std::move(answer));
+
+        HttpResponse pending;
+        pending.deferred = std::move(deferred);
+        return pending;
+    });
+    ASSERT_TRUE(server.start());
+
+    Client client(server.bound_port());
+    ASSERT_TRUE(client.connected());
+    ASSERT_TRUE(client.send_raw("GET /wait HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"));
+    const std::string response = client.read_all();
+
+    EXPECT_EQ(status_of(response), 200);
+    EXPECT_EQ(body_of(response), "resolved-early");
+    server.stop();
+}
+
+TEST(AsyncHttpServer, UnresolvedDeferralIsAnsweredWithItsTimeoutResponse) {
+    using rtmp_server::control::DeferredResponse;
+
+    // A player that asks for a live-edge position the encoder never reaches
+    // must get an answer, not a reset: a reset reads as a media failure and
+    // costs a reconnect.
+    auto options = test_options();
+    options.request_timeout = 300ms;
+    AsyncHttpServer server(options);
+    server.set_handler([](const HttpRequest&) {
+        auto deferred = std::make_shared<DeferredResponse>();
+        deferred->timeout = 100ms;
+        deferred->timeout_response.status = 200;
+        deferred->timeout_response.content_type = "text/plain";
+        deferred->timeout_response.body = "stale-playlist";
+        HttpResponse pending;
+        pending.deferred = std::move(deferred);
+        return pending;
+    });
+    ASSERT_TRUE(server.start());
+
+    Client client(server.bound_port());
+    ASSERT_TRUE(client.connected());
+    ASSERT_TRUE(client.send_raw("GET /wait HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"));
+    const std::string response = client.read_all();
+
+    EXPECT_EQ(status_of(response), 200);
+    EXPECT_EQ(body_of(response), "stale-playlist");
+    server.stop();
+}
+
+TEST(AsyncHttpServer, ManyDeferredRequestsAreParkedConcurrentlyWithoutBlockingTheLoops) {
+    using rtmp_server::control::DeferredResponse;
+
+    // Far more parked requests than the server has loop threads. If a
+    // deferral consumed a thread the way the blocking server would, this
+    // would deadlock rather than complete.
+    constexpr int kClients = 40;
+    std::mutex mutex;
+    std::vector<std::shared_ptr<DeferredResponse>> parked;
+
+    auto options = test_options();
+    options.event_loops = 2;
+    AsyncHttpServer server(options);
+    server.set_handler([&](const HttpRequest&) {
+        auto deferred = std::make_shared<DeferredResponse>();
+        deferred->timeout = 10s;
+        deferred->timeout_response.status = 504;
+        {
+            std::lock_guard lock(mutex);
+            parked.push_back(deferred);
+        }
+        HttpResponse pending;
+        pending.deferred = std::move(deferred);
+        return pending;
+    });
+    ASSERT_TRUE(server.start());
+
+    std::vector<std::unique_ptr<Client>> clients;
+    for (int i = 0; i < kClients; ++i) {
+        auto client = std::make_unique<Client>(server.bound_port());
+        ASSERT_TRUE(client->connected());
+        ASSERT_TRUE(client->send_raw("GET /wait HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"));
+        clients.push_back(std::move(client));
+    }
+
+    // Wait for every request to reach the handler and park.
+    const auto deadline = std::chrono::steady_clock::now() + 10s;
+    while (std::chrono::steady_clock::now() < deadline) {
+        std::lock_guard lock(mutex);
+        if (parked.size() == static_cast<std::size_t>(kClients)) break;
+        std::this_thread::sleep_for(5ms);
+    }
+    {
+        std::lock_guard lock(mutex);
+        ASSERT_EQ(parked.size(), static_cast<std::size_t>(kClients));
+        for (auto& deferred : parked) {
+            HttpResponse answer;
+            answer.content_type = "text/plain";
+            answer.body = "ok";
+            deferred->resolve(std::move(answer));
+        }
+    }
+
+    for (auto& client : clients) {
+        const std::string response = client->read_all();
+        EXPECT_EQ(status_of(response), 200);
+        EXPECT_EQ(body_of(response), "ok");
+    }
+    server.stop();
+}
+
+TEST(AsyncHttpServer, ResolvingAfterTheServerStopsIsSafeAndDropsTheResponse) {
+    using rtmp_server::control::DeferredResponse;
+
+    std::shared_ptr<DeferredResponse> captured;
+    std::mutex mutex;
+    std::condition_variable ready;
+
+    auto server = std::make_unique<AsyncHttpServer>(test_options());
+    server->set_handler([&](const HttpRequest&) {
+        auto deferred = std::make_shared<DeferredResponse>();
+        deferred->timeout = 30s;
+        {
+            std::lock_guard lock(mutex);
+            captured = deferred;
+        }
+        ready.notify_one();
+        HttpResponse pending;
+        pending.deferred = std::move(deferred);
+        return pending;
+    });
+    ASSERT_TRUE(server->start());
+
+    auto client = std::make_unique<Client>(server->bound_port());
+    ASSERT_TRUE(client->connected());
+    ASSERT_TRUE(client->send_raw("GET /wait HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"));
+
+    std::shared_ptr<DeferredResponse> deferred;
+    {
+        std::unique_lock lock(mutex);
+        ASSERT_TRUE(ready.wait_for(lock, 5s, [&] { return captured != nullptr; }));
+        deferred = captured;
+    }
+
+    server->stop();
+    server.reset();
+
+    // The producer still holds the deferral and resolves into an event loop
+    // that no longer exists. This must be a no-op, not a use-after-free.
+    HttpResponse answer;
+    answer.body = "too-late";
+    deferred->resolve(std::move(answer));
+    SUCCEED();
 }
 
 TEST(AsyncHttpServer, ReportsWithoutAHandler) {

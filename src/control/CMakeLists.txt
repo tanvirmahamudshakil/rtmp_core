@@ -18,6 +18,7 @@ add_library(rtmp_server_control STATIC
     async_http_server.cpp
     management_api.cpp
     hls_http_handler.cpp
+    dash_http_handler.cpp
     viewer_session_tracker.cpp
     edge_viewer_stats.cpp
     settings_schema.cpp
@@ -35,6 +36,7 @@ target_link_libraries(rtmp_server_control
         rtmp_server_management
         rtmp_server_persistence
         rtmp_server_hls
+        rtmp_server_dash
         rtmp_server_warnings
         rtmp_server_sanitizers
 )

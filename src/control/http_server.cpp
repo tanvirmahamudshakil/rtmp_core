@@ -321,6 +321,17 @@ void HttpServer::handle_connection(int client_fd, std::string client_ip) {
             response.body = R"({"error":"no_handler"})";
         }
 
+        // This server owns one blocking thread per connection, so parking a
+        // request would consume a worker for the whole wait -- the exact
+        // coupling AsyncHttpServer exists to remove. Take the handler's own
+        // fallback answer instead of holding the thread.
+        if (response.deferred) {
+            auto deferred = std::move(response.deferred);
+            response = deferred->cancel() ? std::move(deferred->timeout_response) : HttpResponse{};
+            response.deferred.reset();
+            if (response.status == 0) response.status = 503;
+        }
+
         // HTTP/1.1 defaults to persistent; HTTP/1.0 defaults to close unless
         // the client opts in. Either side can veto with "Connection: close".
         auto conn_it = request.headers.find("connection");

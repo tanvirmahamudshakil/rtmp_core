@@ -95,6 +95,57 @@ void Segmenter::start_segment(std::uint32_t timestamp) {
     segment_start_ts_ = timestamp;
     // Every segment is independently decodable: PAT/PMT at the head.
     muxer_.write_program_tables(current_);
+
+    open_parts_.clear();
+    part_start_offset_ = 0;
+    part_index_ = 0;
+    part_start_ts_ = timestamp;
+    // Independence is decided when a keyframe is actually written into an
+    // empty part, not assumed here: a segment opened by a forced mid-GOP cut
+    // starts with no keyframe at all, and advertising that part as
+    // INDEPENDENT=YES would send a joining player into an undecodable slice.
+    part_independent_ = false;
+    part_has_media_ = false;
+    iframe_prefix_bytes_ = 0;
+}
+
+void Segmenter::maybe_close_part(std::uint32_t timestamp, bool force) {
+    if (config_.part_target_duration.count() <= 0) return;
+    if (!segment_open_) return;
+    if (current_.size() <= part_start_offset_) return; // nothing new to publish
+
+    if (!force) {
+        const std::int64_t elapsed =
+            static_cast<std::int64_t>(timestamp) - static_cast<std::int64_t>(part_start_ts_);
+        if (elapsed < config_.part_target_duration.count()) return;
+    }
+
+    auto part = std::make_shared<Part>();
+    part->segment_sequence = next_sequence_;
+    part->index = part_index_;
+    // "segment-42.3.ts": the part index sits between the sequence and the
+    // suffix so a part URL is as immutable and as cacheable as a segment URL.
+    part->name = config_.segment_name_prefix + std::to_string(next_sequence_) + "." +
+                 std::to_string(part_index_) + config_.segment_name_suffix;
+    part->data = core::SharedBuffer::copy_from(
+        std::span<const std::byte>(current_.data() + part_start_offset_,
+                                   current_.size() - part_start_offset_));
+    const std::int64_t span_ms =
+        static_cast<std::int64_t>(timestamp) - static_cast<std::int64_t>(part_start_ts_);
+    part->duration = std::chrono::milliseconds(span_ms > 0 ? span_ms : 0);
+    part->independent = part_independent_;
+
+    part_start_offset_ = current_.size();
+    part_start_ts_ = timestamp;
+    part_index_ += 1;
+    // Only a part that begins with a keyframe may be marked independent, and
+    // within one segment only the first one does.
+    part_independent_ = false;
+    part_has_media_ = false;
+    stats_.parts_produced += 1;
+
+    open_parts_.push_back(part);
+    if (on_part_) on_part_(std::move(part));
 }
 
 void Segmenter::flush_segment() {
@@ -110,6 +161,11 @@ void Segmenter::flush_segment() {
         return;
     }
 
+    // The tail of the segment is still an unpublished part; close it before
+    // the segment itself so a low-latency player's last EXT-X-PART and the
+    // segment it belongs to describe exactly the same bytes.
+    maybe_close_part(last_ts_, /*force=*/true);
+
     auto segment = std::make_shared<Segment>();
     segment->sequence = next_sequence_++;
     segment->name = config_.segment_name_prefix + std::to_string(segment->sequence) +
@@ -118,11 +174,18 @@ void Segmenter::flush_segment() {
         static_cast<std::int64_t>(last_ts_) - static_cast<std::int64_t>(segment_start_ts_);
     segment->duration = std::chrono::milliseconds(span_ms > 0 ? span_ms : 0);
     segment->discontinuity = pending_discontinuity_;
+    segment->parts = std::move(open_parts_);
+    segment->iframe_prefix_bytes = iframe_prefix_bytes_;
     // Move the accumulated bytes into immutable shared storage: from here on
     // every viewer shares these bytes, never a copy (3.8).
     segment->data = core::SharedBuffer::adopt(std::move(current_));
 
     current_ = std::vector<std::byte>{};
+    open_parts_.clear();
+    part_start_offset_ = 0;
+    part_index_ = 0;
+    part_has_media_ = false;
+    iframe_prefix_bytes_ = 0;
     segment_open_ = false;
     if (pending_discontinuity_) {
         stats_.discontinuities += 1;
@@ -227,11 +290,24 @@ void Segmenter::on_video(const protocol::chunk::RtmpMessage& message) {
 
     const std::uint64_t dts = to_90k(message.timestamp);
     const std::uint64_t pts = to_90k(static_cast<std::int64_t>(message.timestamp) + tag.composition_time_ms);
+    // A part that opens with a keyframe is one a player may start at.
+    if (tag.is_keyframe && !part_has_media_) part_independent_ = true;
     (void)muxer_.write_video(current_, annexb, pts, dts, tag.is_keyframe);
+    part_has_media_ = true;
+
+    // The first keyframe of a segment, together with the program tables that
+    // precede it, is the independently decodable prefix a trick-play playlist
+    // points at. Later keyframes in the same segment are not recorded: they
+    // are not preceded by their own PAT/PMT, so a byte range starting at one
+    // would not decode on its own.
+    if (tag.is_keyframe && iframe_prefix_bytes_ == 0) {
+        iframe_prefix_bytes_ = current_.size();
+    }
 
     stats_.video_frames += 1;
     last_ts_ = message.timestamp;
     have_last_ts_ = true;
+    maybe_close_part(message.timestamp, /*force=*/false);
 }
 
 void Segmenter::on_audio(const protocol::chunk::RtmpMessage& message) {
@@ -281,11 +357,15 @@ void Segmenter::on_audio(const protocol::chunk::RtmpMessage& message) {
     adts.insert(adts.end(), tag.body.begin(), tag.body.end());
 
     (void)muxer_.write_audio(current_, adts, to_90k(message.timestamp));
+    part_has_media_ = true;
     stats_.audio_frames += 1;
     if (!have_last_ts_) {
         last_ts_ = message.timestamp;
         have_last_ts_ = true;
     }
+    // An audio-only stretch between video frames must still advance the part
+    // cadence, or a low-latency player sees the live edge stall.
+    maybe_close_part(message.timestamp, /*force=*/false);
 }
 
 void Segmenter::finalize() {

@@ -32,6 +32,19 @@ std::unordered_map<std::string, std::string> parse_query(std::string_view query)
     return params;
 }
 
+// Blocking playlist reload parameters (RFC 8216bis 6.2.5.2). They name a
+// position on the live edge, so they are stripped from the query copied onto
+// child segment/part URIs — a segment URL carrying them would be a distinct
+// cache object per polling player for no benefit.
+constexpr std::string_view kBlockingMsnParam = "_HLS_msn";
+constexpr std::string_view kBlockingPartParam = "_HLS_part";
+// Prefix of the per-stream key delivery resource, "key-<id>.bin". Kept as one
+// path component rather than a "key/<id>" subpath so every HLS route stays
+// exactly three components deep and the existing traversal-checked splitter
+// needs no special case.
+constexpr std::string_view kKeyResourcePrefix = "key-";
+constexpr std::string_view kKeyResourceSuffix = ".bin";
+
 constexpr std::string_view kPlaybackSessionParam = "viewer_session";
 constexpr std::string_view kPlaybackStreamParam = "viewer_stream";
 constexpr std::string_view kSharedCacheParam = "viewer_cache";
@@ -84,6 +97,35 @@ std::string query_without_session_params(std::string_view query) {
         pos = amp + 1;
     }
     return out;
+}
+
+// Drops the blocking-reload parameters, keeping everything else in order.
+std::string query_without_blocking_params(std::string_view query) {
+    std::string out;
+    std::size_t pos = 0;
+    while (pos < query.size()) {
+        const auto amp = query.find('&', pos);
+        const auto pair =
+            query.substr(pos, amp == std::string_view::npos ? std::string_view::npos : amp - pos);
+        const auto key = pair.substr(0, pair.find('='));
+        if (!pair.empty() && key != kBlockingMsnParam && key != kBlockingPartParam) {
+            if (!out.empty()) out.push_back('&');
+            out.append(pair);
+        }
+        if (amp == std::string_view::npos) break;
+        pos = amp + 1;
+    }
+    return out;
+}
+
+// Parses an unsigned decimal query value. Returns false for anything else, so
+// a malformed `_HLS_msn` is ignored rather than parked on forever.
+bool parse_unsigned(std::string_view text, std::uint64_t& value) {
+    if (text.empty() || text.size() > 20) return false;
+    const auto* begin = text.data();
+    const auto* finish = text.data() + text.size();
+    const auto result = std::from_chars(begin, finish, value);
+    return result.ec == std::errc{} && result.ptr == finish;
 }
 
 std::string playback_session_from_query(std::string_view query) {
@@ -224,6 +266,39 @@ HlsHttpHandler::HlsHttpHandler(HlsHttpOptions options) : options_(std::move(opti
     }
 }
 
+HlsHttpHandler::~HlsHttpHandler() { detach_stores(); }
+
+void HlsHttpHandler::detach_stores() {
+    std::vector<std::shared_ptr<hls::SegmentStore>> stores;
+    std::vector<StreamEntryPtr> entries;
+    {
+        std::shared_lock lock(streams_mutex_);
+        for (const auto& [key, entry] : streams_) {
+            if (!entry) continue;
+            entries.push_back(entry);
+            if (auto store = entry->store.load(std::memory_order_acquire)) {
+                stores.push_back(std::move(store));
+            }
+        }
+    }
+    // Clearing the notifier first guarantees no store can call back into this
+    // handler while the parked requests below are being answered.
+    for (const auto& store : stores) store->set_update_notifier({});
+    for (const auto& entry : entries) {
+        std::vector<PlaylistWaiter> waiters;
+        {
+            std::lock_guard lock(entry->waiters_mutex);
+            waiters.swap(entry->waiters);
+        }
+        for (auto& waiter : waiters) {
+            if (!waiter.deferred) continue;
+            auto response = plain(503, "stream is shutting down");
+            response.headers["Cache-Control"] = "no-store";
+            waiter.deferred->resolve(std::move(response));
+        }
+    }
+}
+
 HlsHttpHandler::StreamEntryPtr HlsHttpHandler::find_entry(const std::string& application,
                                                           const std::string& stream) const {
     std::shared_lock lock(streams_mutex_);
@@ -252,12 +327,61 @@ void HlsHttpHandler::register_stream(const std::string& application, const std::
     // deliberately keeps the existing entry, so its accumulated byte count
     // and live viewer sessions survive the swap instead of resetting the
     // link's stats to zero mid-audience.
-    find_or_create_entry(application, stream)->store.store(std::move(store), std::memory_order_release);
+    const auto entry = find_or_create_entry(application, stream);
+    if (options_.enable_low_latency && store) {
+        // The notifier runs on the producing (media) thread with no store
+        // lock held. It captures the entry weakly so a stream unregistered
+        // while its last segment is still being published cannot resurrect
+        // it, and the store raw-by-reference only for the duration of the
+        // call, which the shared_ptr the notifier is installed on keeps alive.
+        std::weak_ptr<StreamEntry> weak_entry = entry;
+        hls::SegmentStore* raw_store = store.get();
+        store->set_update_notifier([this, weak_entry, raw_store] {
+            const auto locked = weak_entry.lock();
+            if (!locked) return;
+            // Only the store this notifier belongs to may release waiters; a
+            // republish that swapped in a new store leaves the old one's
+            // notifier pointing at an entry that has moved on.
+            const auto current = locked->store.load(std::memory_order_acquire);
+            if (current.get() != raw_store) return;
+            release_waiters(locked, *current);
+        });
+    }
+    entry->store.store(std::move(store), std::memory_order_release);
+}
+
+void HlsHttpHandler::set_encryptor(const std::string& application, const std::string& stream,
+                                   std::shared_ptr<hls::SegmentEncryptor> encryptor) {
+    find_or_create_entry(application, stream)
+        ->encryptor.store(std::move(encryptor), std::memory_order_release);
 }
 
 void HlsHttpHandler::unregister_stream(const std::string& application, const std::string& stream) {
-    std::unique_lock lock(streams_mutex_);
-    streams_.erase(application + "/" + stream);
+    StreamEntryPtr entry;
+    {
+        std::unique_lock lock(streams_mutex_);
+        const auto it = streams_.find(application + "/" + stream);
+        if (it == streams_.end()) return;
+        entry = it->second;
+        streams_.erase(it);
+    }
+    if (!entry) return;
+    // Detach before answering: the store must not be able to call back into
+    // an entry that is no longer reachable from the registry.
+    if (auto store = entry->store.load(std::memory_order_acquire)) {
+        store->set_update_notifier({});
+    }
+    std::vector<PlaylistWaiter> waiters;
+    {
+        std::lock_guard lock(entry->waiters_mutex);
+        waiters.swap(entry->waiters);
+    }
+    for (auto& waiter : waiters) {
+        if (!waiter.deferred) continue;
+        auto response = plain(404, "stream not found");
+        response.headers["Cache-Control"] = "no-store";
+        waiter.deferred->resolve(std::move(response));
+    }
 }
 
 std::shared_ptr<hls::SegmentStore> HlsHttpHandler::find_stream(const std::string& application,
@@ -397,16 +521,13 @@ void HlsHttpHandler::decorate(HttpResponse& response, const std::string& cache_c
     if (options_.enable_range_requests) response.headers["Accept-Ranges"] = "bytes";
 }
 
-HttpResponse HlsHttpHandler::serve_media_playlist(const HttpRequest& request, hls::SegmentStore& store,
-                                                  const std::string& application,
-                                                  const std::string& stream) {
-    (void)application;
-    (void)stream;
+HttpResponse HlsHttpHandler::render_media_playlist(hls::SegmentStore& store,
+                                                   const std::string& child_query) {
     // Preserve the caller's query string on segment URIs so a token-gated
     // stream stays playable: the player copies the URI verbatim.
     std::string body = store.playlist({});
     if (options_.propagate_query_to_playlist_uris) {
-        append_query_to_playlist_uris(body, request.query);
+        append_query_to_playlist_uris(body, child_query);
     }
 
     HttpResponse response;
@@ -415,6 +536,89 @@ HttpResponse HlsHttpHandler::serve_media_playlist(const HttpRequest& request, hl
     response.body = std::move(body);
     decorate(response, options_.playlist_cache_control);
     return response;
+}
+
+HttpResponse HlsHttpHandler::serve_media_playlist(const HttpRequest& request, hls::SegmentStore& store,
+                                                  const std::string& application,
+                                                  const std::string& stream) {
+    (void)application;
+    (void)stream;
+    return render_media_playlist(store, request.query);
+}
+
+HttpResponse HlsHttpHandler::serve_iframe_playlist(const HttpRequest& request,
+                                                   hls::SegmentStore& store) {
+    std::string body = store.iframe_playlist({});
+    if (options_.propagate_query_to_playlist_uris) {
+        append_query_to_playlist_uris(body, request.query);
+    }
+    HttpResponse response;
+    response.status = 200;
+    response.content_type = kContentTypeM3u8;
+    response.body = std::move(body);
+    decorate(response, options_.playlist_cache_control);
+    return response;
+}
+
+HttpResponse HlsHttpHandler::serve_key(hls::SegmentEncryptor* encryptor,
+                                       const std::string& resource) {
+    if (encryptor == nullptr || !encryptor->enabled()) {
+        auto response = plain(404, "stream is not encrypted");
+        response.headers["Cache-Control"] = "no-store";
+        return response;
+    }
+    const std::string id =
+        resource.substr(kKeyResourcePrefix.size(),
+                        resource.size() - kKeyResourcePrefix.size() - kKeyResourceSuffix.size());
+    const auto key = encryptor->find_key(id);
+    if (!key) {
+        // An unknown or already-retired id gets a 404, never a freshly minted
+        // key: minting on demand would let anyone with playback authorisation
+        // obtain a key for media they never had a playlist for.
+        auto response = plain(404, "key not found");
+        response.headers["Cache-Control"] = "no-store";
+        return response;
+    }
+
+    HttpResponse response;
+    response.status = 200;
+    response.content_type = kContentTypeKey;
+    response.body.assign(reinterpret_cast<const char*>(key->bytes.data()), key->bytes.size());
+    response.headers["Cache-Control"] = options_.key_cache_control;
+    if (!options_.cors_allow_origin.empty()) {
+        response.headers["Access-Control-Allow-Origin"] = options_.cors_allow_origin;
+    }
+    return response;
+}
+
+void HlsHttpHandler::release_waiters(const StreamEntryPtr& entry, hls::SegmentStore& store) {
+    std::vector<PlaylistWaiter> ready;
+    {
+        std::lock_guard lock(entry->waiters_mutex);
+        if (entry->waiters.empty()) return;
+        // Partition in place: satisfied waiters move out, the rest stay.
+        // has_reached() takes the store's own mutex, never this one, so the
+        // two locks are always acquired in this order and cannot deadlock.
+        std::vector<PlaylistWaiter> remaining;
+        remaining.reserve(entry->waiters.size());
+        for (auto& waiter : entry->waiters) {
+            if (!waiter.deferred || waiter.deferred->resolved()) continue; // timed out already
+            if (store.has_reached(waiter.sequence, waiter.part_index)) {
+                ready.push_back(std::move(waiter));
+            } else {
+                remaining.push_back(std::move(waiter));
+            }
+        }
+        entry->waiters = std::move(remaining);
+    }
+
+    // Rendering and resolving happen with no lock of ours held: resolve()
+    // reaches into the HTTP server's event loop, and this runs on the media
+    // thread (docs/v2_promot.md 3.7).
+    for (auto& waiter : ready) {
+        auto response = render_media_playlist(store, waiter.child_query);
+        waiter.deferred->resolve(std::move(response));
+    }
 }
 
 HttpResponse HlsHttpHandler::serve_master_playlist(const HttpRequest& request,
@@ -471,17 +675,26 @@ HttpResponse HlsHttpHandler::serve_master_playlist(const HttpRequest& request,
 
 HttpResponse HlsHttpHandler::serve_segment(const HttpRequest& request, hls::SegmentStore& store,
                                            const std::string& name) {
+    core::SharedBuffer payload;
     auto segment = store.find_segment(name);
-    if (!segment) {
-        // A segment that has scrolled out of retention. 404 is correct and
-        // is what makes bounded cleanup safe for players (they re-fetch the
+    if (segment) {
+        payload = segment->data;
+    } else if (const auto part = store.find_part(name)) {
+        // A Low-Latency HLS partial segment. Same immutable-shared-bytes
+        // path as a whole segment, and just as cacheable: its name embeds
+        // both the segment sequence and the part index, so it is never
+        // reused for different bytes.
+        payload = part->data;
+    } else {
+        // Media that has scrolled out of retention. 404 is correct and is
+        // what makes bounded cleanup safe for players (they re-fetch the
         // playlist), so it must not be cached.
         auto response = plain(404, "segment not found");
         response.headers["Cache-Control"] = "no-store";
         return response;
     }
 
-    const auto view = segment->data.view();
+    const auto view = payload.view();
     const std::size_t size = view.size();
 
     const auto range_header = request.headers.find("range");
@@ -493,7 +706,7 @@ HttpResponse HlsHttpHandler::serve_segment(const HttpRequest& request, hls::Segm
             HttpResponse response;
             response.status = 206;
             response.content_type = kContentTypeMpegTs;
-            response.shared_body = segment->data;
+            response.shared_body = payload;
             response.shared_body_offset = start;
             response.shared_body_length = end - start + 1;
             decorate(response, options_.segment_cache_control);
@@ -512,7 +725,7 @@ HttpResponse HlsHttpHandler::serve_segment(const HttpRequest& request, hls::Segm
     HttpResponse response;
     response.status = 200;
     response.content_type = kContentTypeMpegTs;
-    response.shared_body = segment->data;
+    response.shared_body = payload;
     response.shared_body_length = size;
     decorate(response, options_.segment_cache_control);
     return response;
@@ -685,14 +898,81 @@ HttpResponse HlsHttpHandler::handle(const HttpRequest& request) {
         const auto renditions = entry->renditions.load(std::memory_order_acquire);
         static const std::vector<hls::Rendition> kNoRenditions;
         response = serve_master_playlist(request, renditions ? *renditions : kNoRenditions, application);
+    } else if (resource == "iframe.m3u8") {
+        if (!options_.enable_iframe_playlists) {
+            stats_.not_found.fetch_add(1, std::memory_order_relaxed);
+            return plain(404, "not found");
+        }
+        stats_.playlist_requests.fetch_add(1, std::memory_order_relaxed);
+        response = serve_iframe_playlist(request, *store);
     } else if (ends_with(resource, ".m3u8")) {
         stats_.playlist_requests.fetch_add(1, std::memory_order_relaxed);
+        // Low-Latency HLS blocking reload: a player names the live-edge
+        // position it wants and the origin holds the request open until the
+        // encoder produces it, instead of the player polling and mostly
+        // receiving a playlist it already has.
+        if (options_.enable_low_latency && request.method == "GET") {
+            const auto params = parse_query(request.query);
+            const auto msn_it = params.find(std::string(kBlockingMsnParam));
+            std::uint64_t wanted_sequence = 0;
+            if (msn_it != params.end() && parse_unsigned(msn_it->second, wanted_sequence)) {
+                std::int64_t wanted_part = -1;
+                const auto part_it = params.find(std::string(kBlockingPartParam));
+                std::uint64_t part_value = 0;
+                if (part_it != params.end() && parse_unsigned(part_it->second, part_value)) {
+                    wanted_part = static_cast<std::int64_t>(part_value);
+                }
+
+                if (!store->has_reached(wanted_sequence, wanted_part)) {
+                    const std::string child_query =
+                        options_.propagate_query_to_playlist_uris
+                            ? query_without_blocking_params(request.query)
+                            : std::string{};
+
+                    auto deferred = std::make_shared<DeferredResponse>();
+                    deferred->timeout = options_.blocking_reload_timeout;
+                    // Whatever the live edge holds when the budget runs out is
+                    // a better answer than a dropped connection: the player
+                    // takes it, sees its position is still ahead, and asks
+                    // again rather than treating this as a media failure.
+                    deferred->timeout_response = render_media_playlist(*store, child_query);
+
+                    bool parked = false;
+                    {
+                        std::lock_guard lock(entry->waiters_mutex);
+                        if (entry->waiters.size() < options_.max_blocked_requests_per_stream) {
+                            entry->waiters.push_back(
+                                PlaylistWaiter{wanted_sequence, wanted_part, child_query, deferred});
+                            parked = true;
+                        }
+                    }
+
+                    if (parked) {
+                        // The live edge may have advanced between the check
+                        // above and the push; re-run the release pass so a
+                        // waiter can never be parked on a position that has
+                        // already been reached.
+                        release_waiters(entry, *store);
+                        HttpResponse pending;
+                        pending.deferred = std::move(deferred);
+                        return pending;
+                    }
+                    // Over the parked-request ceiling: answer now rather than
+                    // let one stream's blocked requests grow without bound.
+                }
+            }
+        }
         response = serve_media_playlist(request, *store, application, stream);
         countable = true;
     } else if (ends_with(resource, ".ts")) {
         stats_.segment_requests.fetch_add(1, std::memory_order_relaxed);
         response = serve_segment(request, *store, resource);
         countable = true;
+    } else if (resource.size() > kKeyResourcePrefix.size() + kKeyResourceSuffix.size() &&
+               resource.compare(0, kKeyResourcePrefix.size(), kKeyResourcePrefix) == 0 &&
+               ends_with(resource, kKeyResourceSuffix)) {
+        const auto encryptor = entry->encryptor.load(std::memory_order_acquire);
+        response = serve_key(encryptor.get(), resource);
     } else {
         stats_.not_found.fetch_add(1, std::memory_order_relaxed);
         return plain(404, "not found");

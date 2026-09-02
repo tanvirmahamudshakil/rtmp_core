@@ -21,6 +21,8 @@ namespace rtmp_server::control {
 // MIME types HLS delivery requires.
 inline constexpr const char* kContentTypeM3u8 = "application/vnd.apple.mpegurl";
 inline constexpr const char* kContentTypeMpegTs = "video/mp2t";
+// AES-128 content keys are 16 raw bytes with no structure of their own.
+inline constexpr const char* kContentTypeKey = "application/octet-stream";
 
 struct HlsHttpOptions {
     // URL prefix these routes live under, e.g. "/hls".
@@ -134,6 +136,33 @@ struct HlsHttpOptions {
     // fast-join hack (RTMP_FAST_JOIN_APPLICATION/STREAM/RENDITION), which
     // only ever worked for one hardcoded stream.
     bool enable_fast_join = false;
+
+    // --- Low-Latency HLS -------------------------------------------------
+    // Serve partial segments and honour blocking playlist reload
+    // (`_HLS_msn` / `_HLS_part`, RFC 8216bis 6.2.5.2). The producing
+    // Segmenter and SegmentStore must also be configured for low latency, or
+    // there are no parts to serve and every blocking request simply waits out
+    // its budget.
+    bool enable_low_latency = false;
+    // How long a blocking reload may be held before the playlist as it stands
+    // is returned anyway. RFC 8216bis says a server SHOULD answer within
+    // three target durations; holding longer makes a player treat the
+    // request as failed and reconnect, which costs more than a slightly
+    // stale playlist.
+    std::chrono::milliseconds blocking_reload_timeout{9000};
+    // Ceiling on requests parked on one stream's live edge. Past it a
+    // blocking request is answered immediately with the current playlist:
+    // a parked request costs a socket and a small allocation, and this is
+    // the bound that keeps that from being unlimited.
+    std::size_t max_blocked_requests_per_stream = 20000;
+
+    // Serve `iframe.m3u8` (EXT-X-I-FRAMES-ONLY) per stream. The master
+    // playlist advertises it only for renditions whose `iframe_uri` is set.
+    bool enable_iframe_playlists = true;
+
+    // Cache-Control for a content key. Keys are the authorisation boundary,
+    // so they must never land in a shared cache.
+    std::string key_cache_control = "private, no-store";
 };
 
 // Serves HLS playlists and segments over the existing Phase 5
@@ -155,12 +184,19 @@ struct HlsHttpOptions {
 class HlsHttpHandler {
 public:
     explicit HlsHttpHandler(HlsHttpOptions options);
+    ~HlsHttpHandler();
 
     // Registers/unregisters a stream's segment store. The store is owned by
     // the caller's stream lifecycle; a shared_ptr keeps it alive for the
     // duration of any in-flight request.
     void register_stream(const std::string& application, const std::string& stream,
                          std::shared_ptr<hls::SegmentStore> store);
+
+    // Declares the encryptor whose keys this stream's segments are encrypted
+    // under, so `key-<id>.bin` requests under the stream's path can be
+    // answered. The same encryptor must have been given to the SegmentStore.
+    void set_encryptor(const std::string& application, const std::string& stream,
+                       std::shared_ptr<hls::SegmentEncryptor> encryptor);
     void unregister_stream(const std::string& application, const std::string& stream);
     [[nodiscard]] std::shared_ptr<hls::SegmentStore> find_stream(const std::string& application,
                                                                  const std::string& stream) const;
@@ -174,6 +210,11 @@ public:
     // Handler entry point. Suitable for HttpServer::set_handler directly, or
     // chained: set_next() is invoked for any path outside the prefix.
     [[nodiscard]] HttpResponse handle(const HttpRequest& request);
+
+    // Detaches this handler from every registered store's update notifier.
+    // Must run before the stores outlive the handler; the destructor does it
+    // too, so ordinary teardown needs no explicit call.
+    void detach_stores();
     void set_next(HttpHandler next) { next_ = std::move(next); }
 
     // Predicate consulted on every request: when it returns false for a
@@ -247,6 +288,17 @@ private:
     // atomic or internally sharded, so concurrent requests to the same
     // stream do not serialise against each other -- which is the whole
     // point once the HTTP layer stops being one-thread-per-connection.
+    // One request parked on the live edge by a blocking playlist reload.
+    struct PlaylistWaiter {
+        std::uint64_t sequence = 0;
+        std::int64_t part_index = -1;
+        // The query the playlist body's child URIs must carry, already
+        // stripped of the blocking parameters (they name a position, and
+        // copying them onto segment URIs would be meaningless).
+        std::string child_query;
+        DeferredResponsePtr deferred;
+    };
+
     struct StreamEntry {
         // Swapped by register_stream()/set_renditions() while readers may
         // hold the entry, so both are atomic shared_ptrs rather than plain
@@ -257,8 +309,17 @@ private:
         std::atomic<std::shared_ptr<hls::SegmentStore>> store;
         std::atomic<std::shared_ptr<const std::vector<hls::Rendition>>> renditions;
 
+        // Set alongside the store when the stream's media is encrypted, so
+        // a key request can be resolved without a second registry.
+        std::atomic<std::shared_ptr<hls::SegmentEncryptor>> encryptor;
+
         std::atomic<std::uint64_t> bytes_total{0};
         ViewerSessionTracker sessions{kViewerWindow, kMaxTrackedViewerSessions};
+
+        // Requests parked on this stream's live edge. Short critical section,
+        // never held while a response is built or written.
+        std::mutex waiters_mutex;
+        std::vector<PlaylistWaiter> waiters;
     };
     using StreamEntryPtr = std::shared_ptr<StreamEntry>;
 
@@ -293,6 +354,16 @@ private:
                                                      const std::string& application);
     [[nodiscard]] HttpResponse serve_segment(const HttpRequest& request, hls::SegmentStore& store,
                                              const std::string& name);
+    [[nodiscard]] HttpResponse serve_iframe_playlist(const HttpRequest& request,
+                                                     hls::SegmentStore& store);
+    [[nodiscard]] HttpResponse serve_key(hls::SegmentEncryptor* encryptor, const std::string& resource);
+    // Builds the media-playlist response body for a (possibly parked)
+    // request. `child_query` is what child URIs carry.
+    [[nodiscard]] HttpResponse render_media_playlist(hls::SegmentStore& store,
+                                                     const std::string& child_query);
+    // Resolves every waiter on this stream whose position the store has now
+    // reached. Invoked from the store's update notifier, on the media thread.
+    void release_waiters(const StreamEntryPtr& entry, hls::SegmentStore& store);
     void decorate(HttpResponse& response, const std::string& cache_control) const;
 
     HlsHttpOptions options_;

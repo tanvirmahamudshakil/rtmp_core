@@ -140,6 +140,44 @@ struct ServerConfig {
     // `openssl rand -hex 32`).
     std::string hls_edge_fetch_secret;
 
+    // --- Low-Latency HLS -------------------------------------------------
+    // Publish partial segments (EXT-X-PART) and answer blocking playlist
+    // reloads, cutting live latency from roughly three segment durations to
+    // roughly one part. Costs one extra cached object per part and holds one
+    // socket per blocked player, so it is off unless asked for.
+    bool hls_low_latency = false;
+    // Target partial-segment duration. RFC 8216bis wants a part no longer
+    // than the target duration divided by two; 250-500 ms is the useful
+    // range for a 2-6 s segment. Ignored unless hls_low_latency is set.
+    std::chrono::milliseconds hls_part_target_duration{333};
+    // How long the origin may hold a blocking playlist reload before
+    // answering with the playlist as it stands.
+    std::chrono::milliseconds hls_blocking_reload_timeout{9000};
+
+    // --- Segment encryption ----------------------------------------------
+    // AES-128-CBC whole-segment encryption with EXT-X-KEY. Media becomes
+    // useless without a key fetched through the same authorisation gate as
+    // the playlist, which signed URLs alone cannot provide once a segment
+    // URL leaks. Encrypted segments stay fully cacheable: every viewer gets
+    // the same ciphertext.
+    bool hls_encryption_enabled = false;
+    // How long one content key stays current. 0 never rotates. Rotation
+    // bounds how much media a single leaked key exposes.
+    std::chrono::seconds hls_key_rotation_interval{0};
+
+    // Serve each stream's EXT-X-I-FRAMES-ONLY playlist and advertise it from
+    // the master playlist, so a player can scrub without fetching whole
+    // segments. Costs nothing when unused: the byte ranges are recorded by
+    // the segmenter as a side effect of packaging.
+    bool hls_iframe_playlists = true;
+
+    // --- MPEG-DASH delivery ------------------------------------------------
+    // Packages the same RTMP ingest into fMP4/CMAF segments and serves an
+    // MPD alongside the existing HLS delivery, off the same publish — see
+    // docs/dash.md. Off by default: it doubles the packaging and storage
+    // cost per publisher for an audience this deployment may not have.
+    bool dash_enabled = false;
+
     std::chrono::milliseconds handshake_timeout{5000};
     std::chrono::milliseconds authentication_timeout{5000};
     std::chrono::milliseconds idle_timeout{60000};

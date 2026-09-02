@@ -360,6 +360,24 @@ Result<ServerConfig> load_config(const std::string& path) {
     u32("maximum_rtmp_message_size", cfg.maximum_rtmp_message_size);
     boolean("enable_hls_fast_join", cfg.enable_hls_fast_join);
     str("hls_edge_fetch_secret", cfg.hls_edge_fetch_secret);
+    boolean("hls_low_latency", cfg.hls_low_latency);
+    duration("hls_part_target_duration", cfg.hls_part_target_duration);
+    duration("hls_blocking_reload_timeout", cfg.hls_blocking_reload_timeout);
+    boolean("hls_encryption_enabled", cfg.hls_encryption_enabled);
+    {
+        // The only seconds-granularity duration in the file. parse_duration
+        // works in milliseconds, so convert rather than add a second parser
+        // that could disagree with it about units.
+        std::chrono::milliseconds rotation{0};
+        const auto before = rotation;
+        duration("hls_key_rotation_interval", rotation);
+        if (rotation != before) {
+            cfg.hls_key_rotation_interval =
+                std::chrono::duration_cast<std::chrono::seconds>(rotation);
+        }
+    }
+    boolean("hls_iframe_playlists", cfg.hls_iframe_playlists);
+    boolean("dash_enabled", cfg.dash_enabled);
 
     duration("handshake_timeout", cfg.handshake_timeout);
     duration("authentication_timeout", cfg.authentication_timeout);

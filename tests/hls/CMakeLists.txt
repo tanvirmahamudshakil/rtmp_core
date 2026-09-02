@@ -8,6 +8,8 @@ add_executable(rtmp_server_hls_tests
     ts_demuxer_test.cpp
     rendition_feed_test.cpp
     playlist_test.cpp
+    low_latency_test.cpp
+    encryption_test.cpp
     segmenter_test.cpp
     segment_store_test.cpp
     hls_http_test.cpp
