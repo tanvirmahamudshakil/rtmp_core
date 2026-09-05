@@ -1,0 +1,28 @@
+// polkit rule granting the rtmp-server user permission to start/stop exactly
+// two systemd units (rtmp-server, litestream) without full root — the least
+// privilege the HA agent needs to promote/demote this node.
+//
+// Install: copy to /etc/polkit-1/rules.d/49-streamforge-ha.rules and restart
+// polkit (systemctl restart polkit). Requires polkit >= 0.106 (JS rules).
+//
+// NOT EXECUTED IN THIS REPOSITORY'S DEVELOPMENT ENVIRONMENT (macOS has no
+// polkit) -- reviewed against the polkit JS rules API, not loaded by a
+// running polkitd. Verify with `pkcheck` on the target host.
+polkit.addRule(function (action, subject) {
+    const managedUnits = ["rtmp-server.service", "litestream.service"];
+    const controlledActions = [
+        "org.freedesktop.systemd1.manage-units",
+    ];
+
+    if (controlledActions.indexOf(action.id) === -1) return polkit.Result.NOT_HANDLED;
+    if (subject.user !== "rtmp-server") return polkit.Result.NOT_HANDLED;
+
+    const unit = action.lookup("unit");
+    if (managedUnits.indexOf(unit) === -1) return polkit.Result.NOT_HANDLED;
+
+    const verb = action.lookup("verb"); // "start", "stop", "restart", ...
+    if (verb === "start" || verb === "stop" || verb === "restart") {
+        return polkit.Result.YES;
+    }
+    return polkit.Result.NOT_HANDLED;
+});

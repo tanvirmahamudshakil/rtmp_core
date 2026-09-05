@@ -18,6 +18,7 @@
 
 #include "rtmp_server/authentication/rtmp_authenticator.hpp"
 #include "rtmp_server/cluster/node_registry.hpp"
+#include "rtmp_server/dispatch/transcoder_dispatch_manager.hpp"
 #include "rtmp_server/dash/stream_sink.hpp"
 #include "rtmp_server/control/edge_viewer_stats.hpp"
 #include "rtmp_server/control/async_http_server.hpp"
@@ -248,12 +249,9 @@ int main(int argc, char** argv) {
     // not a secret credential. Requiring an existing enabled application and
     // stream preserves deterministic routing and the operator's disable
     // control without adding authentication.
-    services.key_validator =
-        [&stream_manager](std::string_view application, std::string_view stream_name) {
-            const auto app = stream_manager.find_application(application);
-            const auto stream = stream_manager.find_stream(application, stream_name);
-            return app && app->enabled && stream && stream->enabled;
-        };
+    // key_validator is assigned below, once the transcoder-dispatch manager
+    // exists: a dispatched rendition publishes with no StreamManager row, so
+    // the validator has to consult both.
     // The publish argument is already the canonical public fan-out name.
     services.stream_id_resolver = {};
     services.playback_authorizer = authenticator.playback_authorizer();
@@ -343,6 +341,49 @@ int main(int argc, char** argv) {
     // the table is what /v1/cluster/locate places viewers from.
     rtmp_server::cluster::NodeRegistry node_registry(store.get(), {});
     node_registry.load_from_store();
+
+    // Transcoder-tier remote dispatch: a job's ladder is decoded/encoded on a
+    // separate transcoder node and pushed back here as ordinary RTMP
+    // publishes (docs/transcoder-dispatch.md). No codec-library dependency on
+    // this side -- only placement and HTTP dispatch.
+    rtmp_server::dispatch::TranscoderDispatchManager::Hooks dispatch_hooks;
+    dispatch_hooks.set_renditions = [&hls_handler](const std::string& application,
+                                                   const std::string& master,
+                                                   std::vector<rtmp_server::hls::Rendition> renditions) {
+        hls_handler.set_renditions(application, master, std::move(renditions));
+    };
+    dispatch_hooks.unset_renditions = [&hls_handler](const std::string& application,
+                                                     const std::string& master) {
+        hls_handler.unregister_stream(application, master);
+    };
+    rtmp_server::dispatch::TranscoderDispatchManager::Options dispatch_options;
+    // A transcoder node needs a real, reachable address for this origin, not
+    // whatever this process happens to bind for its own listener (0.0.0.0 by
+    // default) -- STREAMFORGE_NODE_ADDRESS is the same env var the cluster
+    // heartbeat already uses for exactly this purpose.
+    {
+        const auto address = environment_or("STREAMFORGE_NODE_ADDRESS", config.public_rtmp_hostname);
+        dispatch_options.origin_rtmp_host = address.empty() ? "127.0.0.1" : address;
+    }
+    dispatch_options.origin_rtmp_port = config.rtmp_port;
+    rtmp_server::dispatch::TranscoderDispatchManager transcoder_dispatch(
+        &node_registry, store.get(), std::move(dispatch_hooks), dispatch_options);
+    transcoder_dispatch.load_from_store();
+
+    // A dispatched rendition arrives as a real publish with no StreamManager
+    // row, so it needs its own admission check alongside the normal one.
+    services.key_validator =
+        [&stream_manager, &transcoder_dispatch](std::string_view application,
+                                                std::string_view stream_name) {
+            const auto app = stream_manager.find_application(application);
+            const auto stream = stream_manager.find_stream(application, stream_name);
+            if (app && app->enabled && stream && stream->enabled) return true;
+            return transcoder_dispatch.is_expected_publish(application, stream_name);
+        };
+    services.publish_start_handler = [&transcoder_dispatch](
+        const rtmp_server::protocol::commands::StreamRegistration& registration) {
+        transcoder_dispatch.note_publish_state(registration.app, registration.stream_key, true);
+    };
 
     // Outbound RTMP: pushing this server's publishes to another origin (the
     // relay/repeater, which is how ingest scales past this box) or to an
@@ -818,6 +859,13 @@ int main(int argc, char** argv) {
                << R"(,"utilization":)" << snapshot.utilization << R"(,"scale_out_recommended":)"
                << (snapshot.scale_out_recommended ? "true" : "false") << '}';
             return os.str();
+        },
+        [&node_registry](std::string_view id, bool draining) -> rtmp_server::core::Result<std::string> {
+            const auto now = static_cast<std::int64_t>(std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count());
+            auto status = node_registry.set_forced_draining(id, draining, now);
+            if (!status) return status.error();
+            return cluster_node_json(status.value());
         });
 
     // Stream targets: relay to another origin, or push to an external ingest.
@@ -885,6 +933,110 @@ int main(int argc, char** argv) {
            << target.activations << R"(,"bytes_in":)" << target.bytes_in << '}';
         return os.str();
     };
+    // Transcoder-tier jobs: dispatch a pull-and-transcode job to a transcoder
+    // node. Renditions are a compact "name:output_stream:width:height:
+    // video_bitrate:audio_bitrate" list separated by ';' -- a flat string
+    // field, matching every other route on this API (parse_flat_json has no
+    // nested-array support), not the JSON array shape the agent protocol
+    // itself uses internally.
+    const auto transcoder_job_json = [](const rtmp_server::dispatch::TranscoderJobStatus& job) {
+        const auto state = [&] {
+            switch (job.state) {
+                case rtmp_server::dispatch::TranscoderJobState::Assigning: return "assigning";
+                case rtmp_server::dispatch::TranscoderJobState::Running: return "running";
+                case rtmp_server::dispatch::TranscoderJobState::Unassignable: return "unassignable";
+                case rtmp_server::dispatch::TranscoderJobState::Lost: return "lost";
+                case rtmp_server::dispatch::TranscoderJobState::Stopped: return "stopped";
+            }
+            return "stopped";
+        }();
+        std::ostringstream os;
+        os << R"({"id":")" << json_escape(job.application + ":" + job.name) << R"(","application":")"
+           << json_escape(job.application) << R"(","name":")" << json_escape(job.name)
+           << R"(","source_url":")" << json_escape(job.source_url) << R"(","assigned_node_id":")"
+           << json_escape(job.assigned_node_id) << R"(","state":")" << state << R"(","detail":")"
+           << json_escape(job.detail) << R"(","outputs":[)";
+        for (std::size_t i = 0; i < job.renditions.size(); ++i) {
+            const auto& r = job.renditions[i];
+            if (i) os << ',';
+            os << R"({"name":")" << json_escape(r.name) << R"(","stream":")"
+               << json_escape(r.output_stream) << R"(","width":)" << r.width << R"(,"height":)"
+               << r.height << R"(,"video_bitrate":)" << r.video_bitrate << R"(,"audio_bitrate":)"
+               << r.audio_bitrate << '}';
+        }
+        os << "]}";
+        return os.str();
+    };
+    management_api.set_transcoder_job_handlers(
+        [&transcoder_dispatch, transcoder_job_json](std::string_view application)
+            -> rtmp_server::core::Result<std::string> {
+            std::ostringstream os;
+            os << R"({"items":[)";
+            const auto jobs = transcoder_dispatch.list(application);
+            for (std::size_t i = 0; i < jobs.size(); ++i) {
+                if (i) os << ',';
+                os << transcoder_job_json(jobs[i]);
+            }
+            os << "]}";
+            return os.str();
+        },
+        [&transcoder_dispatch, transcoder_job_json](
+            std::string_view application, std::string_view name,
+            const std::unordered_map<std::string, std::string>& fields)
+            -> rtmp_server::core::Result<std::string> {
+            const auto field = [&fields](const char* key) -> std::string {
+                const auto it = fields.find(key);
+                return it == fields.end() ? std::string{} : it->second;
+            };
+            rtmp_server::dispatch::TranscoderJobConfig config;
+            config.application = std::string(application);
+            config.name = std::string(name);
+            config.source_url = field("source_url");
+            const auto fps_text = field("fps");
+            if (!fps_text.empty()) {
+                errno = 0;
+                const auto value = std::strtoul(fps_text.c_str(), nullptr, 10);
+                if (errno == 0 && value > 0) config.fps = static_cast<std::uint32_t>(value);
+            }
+
+            std::stringstream renditions_stream(field("renditions"));
+            std::string rendition_text;
+            while (std::getline(renditions_stream, rendition_text, ';')) {
+                if (rendition_text.empty()) continue;
+                std::stringstream fields_stream(rendition_text);
+                std::vector<std::string> parts;
+                std::string part;
+                while (std::getline(fields_stream, part, ':')) parts.push_back(part);
+                if (parts.size() != 6) {
+                    return rtmp_server::core::Error(
+                        rtmp_server::core::ErrorCode::InvalidConfiguration,
+                        rtmp_server::core::ErrorCategory::Configuration,
+                        "each rendition needs name:output_stream:width:height:video_bitrate:"
+                        "audio_bitrate");
+                }
+                rtmp_server::dispatch::DispatchedRendition rendition;
+                rendition.name = parts[0];
+                rendition.output_stream = parts[1];
+                rendition.width = static_cast<std::uint32_t>(std::strtoul(parts[2].c_str(), nullptr, 10));
+                rendition.height = static_cast<std::uint32_t>(std::strtoul(parts[3].c_str(), nullptr, 10));
+                rendition.video_bitrate =
+                    static_cast<std::uint32_t>(std::strtoul(parts[4].c_str(), nullptr, 10));
+                rendition.audio_bitrate =
+                    static_cast<std::uint32_t>(std::strtoul(parts[5].c_str(), nullptr, 10));
+                config.renditions.push_back(std::move(rendition));
+            }
+
+            const auto now = static_cast<std::int64_t>(std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count());
+            auto status = transcoder_dispatch.create(config, now);
+            if (!status) return status.error();
+            return transcoder_job_json(status.value());
+        },
+        [&transcoder_dispatch](std::string_view application,
+                              std::string_view name) -> rtmp_server::core::Result<void> {
+            return transcoder_dispatch.remove(application, name);
+        });
+
     management_api.set_backup_publisher_handlers(
         [&backup_publishers, backup_publisher_json](std::string_view application)
             -> rtmp_server::core::Result<std::string> {
@@ -1256,6 +1408,30 @@ int main(int argc, char** argv) {
             if (auto beaten = node_registry.heartbeat(beat, now); !beaten) {
                 RTMP_LOG(rtmp_server::observability::LogLevel::Warn, "cluster",
                          "origin heartbeat failed", {{"error", beaten.error().message()}});
+            }
+
+            // Transcoder-tier bookkeeping, piggybacked on the same tick:
+            // place any job still waiting for a transcoder node, and detect a
+            // rendition that has gone quiet. There is no publisher-disconnect
+            // push notification at this layer (see publish_start_handler's own
+            // comment for the push side), so "stopped publishing" is this
+            // periodic poll against the live registry, same pattern
+            // BackupPublisherManager's own monitor loop uses.
+            transcoder_dispatch.retry_unassigned(now);
+            {
+                const auto live = stream_registry.snapshot();
+                const auto is_live = [&](const std::string& application, const std::string& stream) {
+                    return std::ranges::any_of(live, [&](const auto& registration) {
+                        return registration.app == application && registration.stream_key == stream;
+                    });
+                };
+                for (const auto& job : transcoder_dispatch.list("")) {
+                    for (const auto& rendition : job.renditions) {
+                        transcoder_dispatch.note_publish_state(
+                            job.application, rendition.output_stream,
+                            is_live(job.application, rendition.output_stream));
+                    }
+                }
             }
             // Well inside NodeRegistryOptions::heartbeat_timeout (30 s), so a
             // single slow tick never marks this origin unhealthy. Slept in

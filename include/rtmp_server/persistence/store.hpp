@@ -74,6 +74,19 @@ struct BackupPublisherRow {
     std::uint32_t failover_after_seconds = 15;
 };
 
+// A job dispatched to a transcoder-tier node: which node (if any) currently
+// runs it, and enough of the job's own definition to redispatch it after a
+// control-plane restart. `renditions_json` is an opaque array this layer does
+// not interpret, same treatment as every other opaque-JSON-blob field this
+// store round-trips untouched (TranscodingAssignmentRow::rules, etc.).
+struct TranscoderJobRow {
+    std::string application;
+    std::string name;
+    std::string source_url;
+    std::uint32_t fps = 30;
+    std::string renditions_json;
+};
+
 // A node of this deployment as last seen by the control plane: an origin, an
 // HTTP cache edge, an origin shield, or a transcoder. Heartbeats refresh
 // `last_seen_unix`; a node that stops heartbeating is reported unhealthy and
@@ -89,6 +102,12 @@ struct ClusterNodeRow {
     std::uint32_t active_viewers = 0;
     std::uint32_t active_publishers = 0;
     bool draining = false;
+    // Set by the control plane (an operator or an autoscaler), independent of
+    // whatever the node itself reports in `draining` above. Survives the
+    // node's own heartbeats -- a node that cannot be reached directly (an
+    // autoscaler acting through a cloud API has no SSH access to it) can
+    // still be told to stop taking new viewers before it is torn down.
+    bool forced_draining = false;
 };
 
 // A transcoding template as authored in the admin panel: a name plus its list
@@ -170,10 +189,28 @@ public:
 
     // Optional for storage implementations used by older unit tests. The
     // production SQLite store overrides all three methods.
+    virtual core::Result<void> upsert_transcoder_job(const TranscoderJobRow&) {
+        return core::Result<void>{};
+    }
+    virtual core::Result<void> delete_transcoder_job(std::string_view, std::string_view) {
+        return core::Result<void>{};
+    }
+    [[nodiscard]] virtual core::Result<std::vector<TranscoderJobRow>> load_transcoder_jobs() {
+        return std::vector<TranscoderJobRow>{};
+    }
+
+    // Optional for storage implementations used by older unit tests. The
+    // production SQLite store overrides all three methods.
     virtual core::Result<void> upsert_cluster_node(const ClusterNodeRow&) {
         return core::Result<void>{};
     }
     virtual core::Result<void> delete_cluster_node(std::string_view) { return core::Result<void>{}; }
+    // Optional; the production SQLite store overrides it. Never resets the
+    // rest of the row -- see upsert_cluster_node's own comment on why the two
+    // are kept as separate write paths.
+    virtual core::Result<void> update_cluster_node_forced_draining(std::string_view, bool) {
+        return core::Result<void>{};
+    }
     [[nodiscard]] virtual core::Result<std::vector<ClusterNodeRow>> load_cluster_nodes() {
         return std::vector<ClusterNodeRow>{};
     }

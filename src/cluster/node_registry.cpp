@@ -62,6 +62,7 @@ void NodeRegistry::load_from_store() {
     std::lock_guard<std::mutex> lock(mutex_);
     for (auto& row : rows.value()) {
         if (!parse_node_role(row.role)) continue;
+        forced_draining_[row.id] = row.forced_draining;
         nodes_[row.id] = std::move(row);
     }
 }
@@ -77,7 +78,12 @@ NodeStatus NodeRegistry::status_of_locked(const persistence::ClusterNodeRow& row
     status.capacity_viewers = row.capacity_viewers;
     status.active_viewers = row.active_viewers;
     status.active_publishers = row.active_publishers;
-    status.draining = row.draining;
+    // The node's own heartbeat OR a control-plane-issued override, whichever
+    // says drain. forced_draining_ is authoritative for the override (see its
+    // member comment); row.draining reflects only what this node last
+    // reported about itself.
+    const auto forced = forced_draining_.find(row.id);
+    status.draining = row.draining || (forced != forced_draining_.end() && forced->second);
     // A heartbeat from the future (clock skew between nodes) counts as fresh
     // rather than as a node that has been silent for a negative time.
     status.seconds_since_seen = std::max<std::int64_t>(0, now_unix - row.last_seen_unix);
@@ -134,11 +140,32 @@ core::Result<void> NodeRegistry::remove(std::string_view id) {
         if (nodes_.erase(std::string(id)) == 0) {
             return node_error(core::ErrorCode::NotFound, "no such cluster node");
         }
+        forced_draining_.erase(std::string(id));
     }
     if (store_ != nullptr) {
         if (auto deleted = store_->delete_cluster_node(id); !deleted) return deleted.error();
     }
     return {};
+}
+
+core::Result<NodeStatus> NodeRegistry::set_forced_draining(std::string_view id, bool draining,
+                                                           std::int64_t now_unix) {
+    NodeStatus status;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const auto node = nodes_.find(std::string(id));
+        if (node == nodes_.end()) {
+            return node_error(core::ErrorCode::NotFound, "no such cluster node");
+        }
+        forced_draining_[std::string(id)] = draining;
+        status = status_of_locked(node->second, now_unix);
+    }
+    if (store_ != nullptr) {
+        if (auto saved = store_->update_cluster_node_forced_draining(id, draining); !saved) {
+            return saved.error();
+        }
+    }
+    return status;
 }
 
 void NodeRegistry::expire_locked(std::int64_t now_unix) {
@@ -148,6 +175,7 @@ void NodeRegistry::expire_locked(std::int64_t now_unix) {
     }
     for (const auto& id : gone) {
         nodes_.erase(id);
+        forced_draining_.erase(id);
         if (store_ != nullptr) {
             // A failure here only means the row outlives the process's view of
             // it; the next load_from_store expires it again.
@@ -199,6 +227,17 @@ NodeRegistry::CapacitySnapshot NodeRegistry::capacity(std::int64_t now_unix,
     }
     snapshot.scale_out_recommended = snapshot.healthy_edges > 0 && snapshot.utilization >= high_water;
     return snapshot;
+}
+
+std::optional<NodeStatus> NodeRegistry::least_loaded(NodeRole role, std::int64_t now_unix) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::optional<NodeStatus> best;
+    for (const auto& [id, row] : nodes_) {
+        const auto candidate = status_of_locked(row, now_unix);
+        if (candidate.role != role || !candidate.healthy || candidate.draining) continue;
+        if (!best || candidate.load < best->load) best = candidate;
+    }
+    return best;
 }
 
 std::optional<NodeStatus> NodeRegistry::locate(std::string_view region_hint,

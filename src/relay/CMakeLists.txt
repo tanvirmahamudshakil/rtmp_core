@@ -8,6 +8,7 @@ add_library(rtmp_server_relay STATIC
     stream_target.cpp
     stream_target_manager.cpp
     backup_publisher.cpp
+    rtmp_tag_builder.cpp
 )
 
 target_include_directories(rtmp_server_relay PUBLIC

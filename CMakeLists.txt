@@ -93,6 +93,9 @@ add_subdirectory(src/cluster)
 # POSIX sockets, so it builds everywhere alongside the rest of the control
 # plane.
 add_subdirectory(src/relay)
+# Transcoder-tier placement/dispatch (origin side): no codec-library
+# dependency, so it builds everywhere alongside the rest of the control plane.
+add_subdirectory(src/dispatch)
 # Builds everywhere — POSIX sockets, not io_uring.
 add_subdirectory(src/control)
 
@@ -124,4 +127,5 @@ if(RTMP_SERVER_BUILD_TESTS)
     add_subdirectory(tests/transcoding)
     add_subdirectory(tests/cluster)
     add_subdirectory(tests/relay)
+    add_subdirectory(tests/dispatch)
 endif()

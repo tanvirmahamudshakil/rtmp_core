@@ -1,0 +1,53 @@
+# systemd unit for the HA lease/failover agent (deploy/ha/ha-agent.sh).
+#
+# NOT EXECUTED IN THIS REPOSITORY'S DEVELOPMENT ENVIRONMENT (macOS has no
+# systemd) -- reviewed against systemd.unit(5)/systemd.service(5) but not
+# loaded by a running systemd. Run `systemd-analyze verify` on the target
+# host. See docs/high-availability.md.
+#
+# Install on every candidate origin:
+#   sudo install -d -m 0750 -o rtmp-server -g rtmp-server /etc/streamforge/ha-hooks
+#   sudo install -m 0755 deploy/ha/ha-agent.sh /usr/local/bin/streamforge-ha-agent
+#   sudo install -m 0640 -o rtmp-server -g rtmp-server \
+#       deploy/systemd/rtmp-server.env.example /etc/streamforge/ha-agent.env
+#   # edit /etc/streamforge/ha-agent.env with this node's STREAMFORGE_HA_*
+#   # values (see the top of ha-agent.sh for the full list), then:
+#   sudo cp deploy/ha/streamforge-ha-agent.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now streamforge-ha-agent
+#
+# rtmp-server.service and litestream.service must both be `systemctl disable`d
+# (not enabled at boot): the agent starts and stops them itself based on
+# leadership, and a unit enabled at boot would race the agent on every reboot.
+
+[Unit]
+Description=StreamForge HA lease/failover agent
+After=network-online.target
+Wants=network-online.target
+# Deliberately NOT `Requires=rtmp-server.service` or `litestream.service` --
+# this unit controls their lifecycle, not the other way around.
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/streamforge/ha-agent.env
+ExecStart=/usr/local/bin/streamforge-ha-agent
+
+# This agent's own job is to fence a misbehaving leader by stopping units via
+# systemctl; it therefore needs to reach the system's own D-Bus/systemd, which
+# rules out the same aggressive sandboxing rtmp-server.service uses (that
+# service intentionally cannot control other units). Still run as a
+# constrained user, not root, via polkit/sudoers rules scoped to exactly the
+# two units and systemctl start/stop -- see docs/high-availability.md
+# "Least privilege for the agent" for the polkit rule this assumes.
+User=rtmp-server
+Group=rtmp-server
+
+Restart=always
+RestartSec=2s
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=streamforge-ha-agent
+
+[Install]
+WantedBy=multi-user.target

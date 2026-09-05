@@ -46,6 +46,12 @@ public:
         nodes.erase(std::string(id));
         return {};
     }
+    rtmp_server::core::Result<void> update_cluster_node_forced_draining(std::string_view id,
+                                                                        bool draining) override {
+        const auto it = nodes.find(std::string(id));
+        if (it != nodes.end()) it->second.forced_draining = draining;
+        return {};
+    }
     rtmp_server::core::Result<std::vector<rtmp_server::persistence::ClusterNodeRow>>
     load_cluster_nodes() override {
         std::vector<rtmp_server::persistence::ClusterNodeRow> rows;
@@ -220,6 +226,51 @@ TEST(NodeRegistryTest, ClockSkewFromANodeDoesNotMakeItLookSilent) {
     const auto status = registry.list(1'000).front();
     EXPECT_EQ(status.seconds_since_seen, 0);
     EXPECT_TRUE(status.healthy);
+}
+
+TEST(NodeRegistryTest, ForcedDrainingSurvivesTheNodesOwnHeartbeat) {
+    FakeStore store;
+    NodeRegistry registry(&store, {});
+    ASSERT_TRUE(registry.heartbeat(beat("edge-1", NodeRole::Edge, "eu", 1000, 500), 1'000));
+    EXPECT_FALSE(registry.list(1'000).front().draining);
+
+    auto forced = registry.set_forced_draining("edge-1", true, 1'000);
+    ASSERT_TRUE(forced) << forced.error().message();
+    EXPECT_TRUE(forced.value().draining);
+    EXPECT_TRUE(store.nodes.at("edge-1").forced_draining);
+
+    // The node itself keeps reporting draining=false in its own heartbeat --
+    // an autoscaler-issued drain order must not be a one-shot flag the node
+    // can accidentally clear just by heartbeating normally.
+    ASSERT_TRUE(registry.heartbeat(beat("edge-1", NodeRole::Edge, "eu", 1000, 500), 1'010));
+    EXPECT_TRUE(registry.list(1'010).front().draining);
+
+    // A healthy, forcibly-drained node must never be handed a new viewer.
+    EXPECT_FALSE(registry.locate("eu", 1'010).has_value());
+
+    ASSERT_TRUE(registry.set_forced_draining("edge-1", false, 1'020));
+    EXPECT_FALSE(registry.list(1'020).front().draining);
+    EXPECT_TRUE(registry.locate("eu", 1'020).has_value());
+}
+
+TEST(NodeRegistryTest, SetForcedDrainingRejectsAnUnknownNode) {
+    FakeStore store;
+    NodeRegistry registry(&store, {});
+    auto result = registry.set_forced_draining("ghost", true, 1'000);
+    ASSERT_FALSE(result);
+    EXPECT_EQ(result.error().code(), ErrorCode::NotFound);
+}
+
+TEST(NodeRegistryTest, ForcedDrainingSurvivesAControlPlaneRestart) {
+    FakeStore store;
+    {
+        NodeRegistry registry(&store, {});
+        ASSERT_TRUE(registry.heartbeat(beat("edge-1", NodeRole::Edge, "eu"), 1'000));
+        ASSERT_TRUE(registry.set_forced_draining("edge-1", true, 1'000));
+    }
+    NodeRegistry restarted(&store, {});
+    restarted.load_from_store();
+    EXPECT_TRUE(restarted.list(1'000).front().draining);
 }
 
 TEST(NodeRegistryTest, CapacityAggregatesHealthyEdgesOnly) {

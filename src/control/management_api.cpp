@@ -290,6 +290,9 @@ HttpResponse ManagementApi::route(const HttpRequest& request, const std::string&
         if (parts.size() == 4 && parts[2] == "nodes" && request.method == "DELETE") {
             return handle_delete_cluster_node(percent_decode(parts[3]));
         }
+        if (parts.size() == 4 && parts[2] == "nodes" && request.method == "PATCH") {
+            return handle_patch_cluster_node(percent_decode(parts[3]), request);
+        }
         if (parts.size() == 3 && parts[2] == "locate" && request.method == "GET") {
             return handle_cluster_locate(request);
         }
@@ -299,6 +302,14 @@ HttpResponse ManagementApi::route(const HttpRequest& request, const std::string&
         }
         if (parts.size() == 3 && parts[2] == "capacity" && request.method == "GET") {
             return handle_cluster_capacity();
+        }
+    }
+    if (parts.size() >= 2 && parts[0] == "v1" && parts[1] == "transcoder-jobs") {
+        if (parts.size() == 2 && request.method == "GET") return handle_list_transcoder_jobs(request);
+        if (parts.size() == 3) {
+            auto [application, name] = split_stream_id(parts[2]);
+            if (request.method == "PUT") return handle_create_transcoder_job(application, name, request);
+            if (request.method == "DELETE") return handle_delete_transcoder_job(application, name);
         }
     }
     if (parts.size() >= 2 && parts[0] == "v1" && parts[1] == "backup-publishers") {
@@ -465,6 +476,25 @@ HttpResponse ManagementApi::handle_delete_cluster_node(std::string_view id) {
     return HttpResponse::json(200, R"({"deleted":true})");
 }
 
+HttpResponse ManagementApi::handle_patch_cluster_node(std::string_view id,
+                                                      const HttpRequest& request) {
+    if (!cluster_node_drain_setter_) {
+        return HttpResponse::json(503, R"({"error":"cluster_unavailable"})");
+    }
+    auto fields = parse_flat_json(request.body);
+    const auto draining = fields.find("draining");
+    if (draining == fields.end()) {
+        return HttpResponse::json(400, error_body("validation_error", "draining is required", ""));
+    }
+    auto result = cluster_node_drain_setter_(id, draining->second == "true" || draining->second == "1");
+    audit("set_cluster_node_draining", std::string(id), "", result.ok());
+    if (!result) {
+        return HttpResponse::json(http_status_for(result.error().code()),
+                                  error_body("request_failed", result.error().message(), ""));
+    }
+    return HttpResponse::json(200, std::move(result).value());
+}
+
 HttpResponse ManagementApi::handle_cluster_locate(const HttpRequest& request) {
     if (!cluster_locate_provider_) {
         return HttpResponse::json(503, R"({"error":"cluster_unavailable"})");
@@ -520,6 +550,57 @@ HttpResponse ManagementApi::handle_cluster_capacity() {
         return HttpResponse::json(500, error_body("request_failed", result.error().message(), ""));
     }
     return HttpResponse::json(200, std::move(result).value());
+}
+
+HttpResponse ManagementApi::handle_list_transcoder_jobs(const HttpRequest& request) {
+    if (!transcoder_jobs_provider_) {
+        return HttpResponse::json(503, R"({"error":"transcoder_dispatch_unavailable"})");
+    }
+    const auto params = parse_query_params(request.query);
+    const auto application = params.find("application");
+    auto result = transcoder_jobs_provider_(
+        application == params.end() ? std::string_view{} : percent_decode(application->second));
+    if (!result) {
+        return HttpResponse::json(500, error_body("request_failed", result.error().message(), ""));
+    }
+    return HttpResponse::json(200, std::move(result).value());
+}
+
+HttpResponse ManagementApi::handle_create_transcoder_job(std::string_view application,
+                                                         std::string_view name,
+                                                         const HttpRequest& request) {
+    if (!transcoder_job_creator_) {
+        return HttpResponse::json(503, R"({"error":"transcoder_dispatch_unavailable"})");
+    }
+    if (application.empty() || name.empty()) {
+        return HttpResponse::json(400, error_body("validation_error",
+                                                  "id must be application:name", ""));
+    }
+    auto fields = parse_flat_json(request.body);
+    if (fields.empty()) {
+        return HttpResponse::json(400, error_body("validation_error", "no recognized fields in body", ""));
+    }
+    auto result = transcoder_job_creator_(application, name, fields);
+    audit("create_transcoder_job", std::string(application), std::string(name), result.ok());
+    if (!result) {
+        return HttpResponse::json(http_status_for(result.error().code()),
+                                  error_body("validation_error", result.error().message(), ""));
+    }
+    return HttpResponse::json(200, std::move(result).value());
+}
+
+HttpResponse ManagementApi::handle_delete_transcoder_job(std::string_view application,
+                                                         std::string_view name) {
+    if (!transcoder_job_remover_) {
+        return HttpResponse::json(503, R"({"error":"transcoder_dispatch_unavailable"})");
+    }
+    auto result = transcoder_job_remover_(application, name);
+    audit("delete_transcoder_job", std::string(application), std::string(name), result.ok());
+    if (!result) {
+        return HttpResponse::json(http_status_for(result.error().code()),
+                                  error_body("request_failed", result.error().message(), ""));
+    }
+    return HttpResponse::json(200, R"({"deleted":true})");
 }
 
 HttpResponse ManagementApi::handle_list_backup_publishers(const HttpRequest& request) {

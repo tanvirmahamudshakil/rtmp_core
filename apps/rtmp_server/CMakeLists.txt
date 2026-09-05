@@ -9,6 +9,9 @@ target_link_libraries(rtmp_server PRIVATE
     rtmp_server_persistence
     rtmp_server_control
     rtmp_server_transcoding
+    rtmp_server_cluster
+    rtmp_server_relay
+    rtmp_server_dispatch
     rtmp_server_warnings
     rtmp_server_sanitizers
 )

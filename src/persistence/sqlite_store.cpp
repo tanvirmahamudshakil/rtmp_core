@@ -55,6 +55,14 @@ CREATE TABLE IF NOT EXISTS backup_publishers (
     failover_after_seconds INTEGER NOT NULL,
     PRIMARY KEY (application, stream)
 );
+CREATE TABLE IF NOT EXISTS transcoder_jobs (
+    application TEXT NOT NULL,
+    name TEXT NOT NULL,
+    source_url TEXT NOT NULL,
+    fps INTEGER NOT NULL,
+    renditions_json TEXT NOT NULL,
+    PRIMARY KEY (application, name)
+);
 CREATE TABLE IF NOT EXISTS cluster_nodes (
     id TEXT PRIMARY KEY,
     role TEXT NOT NULL,
@@ -64,7 +72,8 @@ CREATE TABLE IF NOT EXISTS cluster_nodes (
     capacity_viewers INTEGER NOT NULL,
     active_viewers INTEGER NOT NULL,
     active_publishers INTEGER NOT NULL,
-    draining INTEGER NOT NULL
+    draining INTEGER NOT NULL,
+    forced_draining INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS templates (
     id TEXT PRIMARY KEY,
@@ -326,12 +335,63 @@ Result<std::vector<BackupPublisherRow>> SqliteStore::load_backup_publishers() {
     return rows;
 }
 
+Result<void> SqliteStore::upsert_transcoder_job(const TranscoderJobRow& row) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    Statement stmt(db_, "INSERT INTO transcoder_jobs "
+                        "(application, name, source_url, fps, renditions_json) VALUES (?, ?, ?, ?, ?) "
+                        "ON CONFLICT(application, name) DO UPDATE SET "
+                        "source_url = excluded.source_url, fps = excluded.fps, "
+                        "renditions_json = excluded.renditions_json");
+    if (!stmt.valid()) return sqlite_error(db_, "prepare upsert_transcoder_job");
+    sqlite3_bind_text(stmt.get(), 1, row.application.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 2, row.name.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 3, row.source_url.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(stmt.get(), 4, static_cast<sqlite3_int64>(row.fps));
+    sqlite3_bind_text(stmt.get(), 5, row.renditions_json.c_str(), -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(stmt.get()) != SQLITE_DONE) return sqlite_error(db_, "step upsert_transcoder_job");
+    return {};
+}
+
+Result<void> SqliteStore::delete_transcoder_job(std::string_view application, std::string_view name) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    Statement stmt(db_, "DELETE FROM transcoder_jobs WHERE application = ? AND name = ?");
+    if (!stmt.valid()) return sqlite_error(db_, "prepare delete_transcoder_job");
+    sqlite3_bind_text(stmt.get(), 1, application.data(), static_cast<int>(application.size()), SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 2, name.data(), static_cast<int>(name.size()), SQLITE_TRANSIENT);
+    if (sqlite3_step(stmt.get()) != SQLITE_DONE) return sqlite_error(db_, "step delete_transcoder_job");
+    return {};
+}
+
+Result<std::vector<TranscoderJobRow>> SqliteStore::load_transcoder_jobs() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    Statement stmt(db_, "SELECT application, name, source_url, fps, renditions_json "
+                        "FROM transcoder_jobs ORDER BY application, name");
+    if (!stmt.valid()) return sqlite_error(db_, "prepare load_transcoder_jobs");
+    std::vector<TranscoderJobRow> rows;
+    int rc = SQLITE_OK;
+    while ((rc = sqlite3_step(stmt.get())) == SQLITE_ROW) {
+        TranscoderJobRow row;
+        row.application = reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 0));
+        row.name = reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 1));
+        row.source_url = reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 2));
+        row.fps = static_cast<std::uint32_t>(sqlite3_column_int64(stmt.get(), 3));
+        row.renditions_json = reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 4));
+        rows.push_back(std::move(row));
+    }
+    if (rc != SQLITE_DONE) return sqlite_error(db_, "step load_transcoder_jobs");
+    return rows;
+}
+
 Result<void> SqliteStore::upsert_cluster_node(const ClusterNodeRow& row) {
     std::lock_guard<std::mutex> lock(mutex_);
+    // forced_draining is deliberately NOT part of the update set: a routine
+    // heartbeat upsert must never clear a control-plane-issued drain order --
+    // only update_cluster_node_forced_draining below may change it. On first
+    // insert it defaults to 0 (a brand-new node has never been told to drain).
     Statement stmt(db_, "INSERT INTO cluster_nodes "
                         "(id, role, address, region, last_seen_unix, capacity_viewers, "
-                        "active_viewers, active_publishers, draining) "
-                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                        "active_viewers, active_publishers, draining, forced_draining) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0) "
                         "ON CONFLICT(id) DO UPDATE SET role = excluded.role, "
                         "address = excluded.address, region = excluded.region, "
                         "last_seen_unix = excluded.last_seen_unix, "
@@ -353,6 +413,18 @@ Result<void> SqliteStore::upsert_cluster_node(const ClusterNodeRow& row) {
     return {};
 }
 
+Result<void> SqliteStore::update_cluster_node_forced_draining(std::string_view id, bool draining) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    Statement stmt(db_, "UPDATE cluster_nodes SET forced_draining = ? WHERE id = ?");
+    if (!stmt.valid()) return sqlite_error(db_, "prepare update_cluster_node_forced_draining");
+    sqlite3_bind_int(stmt.get(), 1, draining ? 1 : 0);
+    sqlite3_bind_text(stmt.get(), 2, id.data(), static_cast<int>(id.size()), SQLITE_TRANSIENT);
+    if (sqlite3_step(stmt.get()) != SQLITE_DONE) {
+        return sqlite_error(db_, "step update_cluster_node_forced_draining");
+    }
+    return {};
+}
+
 Result<void> SqliteStore::delete_cluster_node(std::string_view id) {
     std::lock_guard<std::mutex> lock(mutex_);
     Statement stmt(db_, "DELETE FROM cluster_nodes WHERE id = ?");
@@ -365,7 +437,8 @@ Result<void> SqliteStore::delete_cluster_node(std::string_view id) {
 Result<std::vector<ClusterNodeRow>> SqliteStore::load_cluster_nodes() {
     std::lock_guard<std::mutex> lock(mutex_);
     Statement stmt(db_, "SELECT id, role, address, region, last_seen_unix, capacity_viewers, "
-                        "active_viewers, active_publishers, draining FROM cluster_nodes ORDER BY id");
+                        "active_viewers, active_publishers, draining, forced_draining "
+                        "FROM cluster_nodes ORDER BY id");
     if (!stmt.valid()) return sqlite_error(db_, "prepare load_cluster_nodes");
     std::vector<ClusterNodeRow> rows;
     int rc = SQLITE_OK;
@@ -380,6 +453,7 @@ Result<std::vector<ClusterNodeRow>> SqliteStore::load_cluster_nodes() {
         row.active_viewers = static_cast<std::uint32_t>(sqlite3_column_int64(stmt.get(), 6));
         row.active_publishers = static_cast<std::uint32_t>(sqlite3_column_int64(stmt.get(), 7));
         row.draining = sqlite3_column_int(stmt.get(), 8) != 0;
+        row.forced_draining = sqlite3_column_int(stmt.get(), 9) != 0;
         rows.push_back(std::move(row));
     }
     if (rc != SQLITE_DONE) return sqlite_error(db_, "step load_cluster_nodes");

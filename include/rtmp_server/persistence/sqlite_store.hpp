@@ -50,8 +50,14 @@ public:
                                                std::string_view stream) override;
     [[nodiscard]] core::Result<std::vector<BackupPublisherRow>> load_backup_publishers() override;
 
+    core::Result<void> upsert_transcoder_job(const TranscoderJobRow& row) override;
+    core::Result<void> delete_transcoder_job(std::string_view application,
+                                             std::string_view name) override;
+    [[nodiscard]] core::Result<std::vector<TranscoderJobRow>> load_transcoder_jobs() override;
+
     core::Result<void> upsert_cluster_node(const ClusterNodeRow& row) override;
     core::Result<void> delete_cluster_node(std::string_view id) override;
+    core::Result<void> update_cluster_node_forced_draining(std::string_view id, bool draining) override;
     [[nodiscard]] core::Result<std::vector<ClusterNodeRow>> load_cluster_nodes() override;
 
     core::Result<void> upsert_transcoding_assignment(const TranscodingAssignmentRow& row) override;

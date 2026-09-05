@@ -2,6 +2,7 @@ add_executable(rtmp_server_relay_tests
     rtmp_push_client_test.cpp
     stream_target_test.cpp
     backup_publisher_test.cpp
+    rtmp_tag_builder_test.cpp
 )
 
 target_link_libraries(rtmp_server_relay_tests PRIVATE

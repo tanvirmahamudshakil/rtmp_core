@@ -106,6 +106,15 @@ public:
     // silent expiry of `forget_after`.
     [[nodiscard]] core::Result<void> remove(std::string_view id);
 
+    // Control-plane-issued drain order, independent of whatever the node
+    // itself reports in its own heartbeat (NodeHeartbeat::draining). Set by
+    // an operator or the autoscaler on a node it cannot otherwise reach (a
+    // cloud API has no SSH access), and survives every subsequent heartbeat
+    // from that node until explicitly cleared or the node is removed.
+    // NodeStatus::draining is `heartbeat draining || forced draining`.
+    [[nodiscard]] core::Result<NodeStatus> set_forced_draining(std::string_view id, bool draining,
+                                                               std::int64_t now_unix);
+
     [[nodiscard]] std::vector<NodeStatus> list(std::int64_t now_unix) const;
 
     // Picks the node a new viewer should be sent to: healthy, not draining,
@@ -121,6 +130,13 @@ public:
     void expire(std::int64_t now_unix);
 
     [[nodiscard]] std::size_t healthy_count(NodeRole role, std::int64_t now_unix) const;
+
+    // Least-loaded healthy, non-draining node of the given role -- used for
+    // transcoder-tier job placement (see dispatch::TranscoderDispatchManager).
+    // Unlike locate(), this has no region preference or edge-vs-origin
+    // ordering: any healthy node of the requested role is an equally valid
+    // placement target, so the choice is load alone.
+    [[nodiscard]] std::optional<NodeStatus> least_loaded(NodeRole role, std::int64_t now_unix) const;
 
     // Aggregate edge capacity/utilisation, for an external autoscaler to poll.
     // This is a signal, not an action: nothing in this process provisions or
@@ -147,6 +163,12 @@ private:
     NodeRegistryOptions options_;
     mutable std::mutex mutex_;
     std::unordered_map<std::string, persistence::ClusterNodeRow> nodes_;
+    // A heartbeat's own upsert never clears forced_draining (see
+    // SqliteStore::upsert_cluster_node), but nodes_'s in-memory row IS
+    // overwritten wholesale by every heartbeat -- so the forced flag is kept
+    // here too, out of the heartbeat's reach, and re-merged into the row on
+    // every heartbeat and every read.
+    std::unordered_map<std::string, bool> forced_draining_;
 };
 
 } // namespace rtmp_server::cluster

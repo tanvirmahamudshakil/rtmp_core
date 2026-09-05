@@ -88,6 +88,10 @@ public:
     using ClusterHeartbeatHandler =
         std::function<core::Result<std::string>(const std::unordered_map<std::string, std::string>&)>;
     using ClusterNodeRemover = std::function<core::Result<void>(std::string_view id)>;
+    // Control-plane drain override (see NodeRegistry::set_forced_draining) --
+    // what an autoscaler calls on a node it cannot reach directly.
+    using ClusterNodeDrainSetter =
+        std::function<core::Result<std::string>(std::string_view id, bool draining)>;
     // Placement: which node a new viewer in `region` should be sent to. Used by
     // an external load balancer, a redirector, or the panel when it builds a
     // playback URL.
@@ -128,6 +132,16 @@ public:
         const std::unordered_map<std::string, std::string>& fields)>;
     using BackupPublisherRemover =
         std::function<core::Result<void>(std::string_view application, std::string_view stream)>;
+
+    // Transcoder-tier jobs: dispatch a pull-and-transcode job to a transcoder
+    // node instead of running it on this origin.
+    using TranscoderJobsProvider =
+        std::function<core::Result<std::string>(std::string_view application)>;
+    using TranscoderJobCreator = std::function<core::Result<std::string>(
+        std::string_view application, std::string_view name,
+        const std::unordered_map<std::string, std::string>& fields)>;
+    using TranscoderJobRemover =
+        std::function<core::Result<void>(std::string_view application, std::string_view name)>;
 
     // Settings page: reads/writes the on-disk server config file. The
     // provider returns the schema-joined-with-current-values JSON body
@@ -182,13 +196,15 @@ public:
     void set_cluster_handlers(ClusterNodesProvider provider, ClusterHeartbeatHandler heartbeat,
                               ClusterNodeRemover remover, ClusterLocateProvider locate,
                               ClusterRedirectProvider redirect = {},
-                              ClusterCapacityProvider capacity = {}) {
+                              ClusterCapacityProvider capacity = {},
+                              ClusterNodeDrainSetter drain_setter = {}) {
         cluster_nodes_provider_ = std::move(provider);
         cluster_heartbeat_handler_ = std::move(heartbeat);
         cluster_node_remover_ = std::move(remover);
         cluster_locate_provider_ = std::move(locate);
         cluster_redirect_provider_ = std::move(redirect);
         cluster_capacity_provider_ = std::move(capacity);
+        cluster_node_drain_setter_ = std::move(drain_setter);
     }
     void set_stream_target_handlers(StreamTargetsProvider provider, StreamTargetUpserter upserter,
                                     StreamTargetRemover remover,
@@ -204,6 +220,12 @@ public:
         backup_publishers_provider_ = std::move(provider);
         backup_publisher_upserter_ = std::move(upserter);
         backup_publisher_remover_ = std::move(remover);
+    }
+    void set_transcoder_job_handlers(TranscoderJobsProvider provider, TranscoderJobCreator creator,
+                                     TranscoderJobRemover remover) {
+        transcoder_jobs_provider_ = std::move(provider);
+        transcoder_job_creator_ = std::move(creator);
+        transcoder_job_remover_ = std::move(remover);
     }
     void set_settings_handlers(SettingsProvider provider, SettingsUpdater updater) {
         settings_provider_ = std::move(provider);
@@ -249,6 +271,14 @@ private:
                                                        std::string_view stream,
                                                        const HttpRequest& request);
     [[nodiscard]] HttpResponse handle_cluster_capacity();
+    [[nodiscard]] HttpResponse handle_patch_cluster_node(std::string_view id,
+                                                         const HttpRequest& request);
+    [[nodiscard]] HttpResponse handle_list_transcoder_jobs(const HttpRequest& request);
+    [[nodiscard]] HttpResponse handle_create_transcoder_job(std::string_view application,
+                                                            std::string_view name,
+                                                            const HttpRequest& request);
+    [[nodiscard]] HttpResponse handle_delete_transcoder_job(std::string_view application,
+                                                            std::string_view name);
     [[nodiscard]] HttpResponse handle_list_backup_publishers(const HttpRequest& request);
     [[nodiscard]] HttpResponse handle_put_backup_publisher(std::string_view application,
                                                            std::string_view stream,
@@ -302,6 +332,10 @@ private:
     ClusterLocateProvider cluster_locate_provider_;
     ClusterRedirectProvider cluster_redirect_provider_;
     ClusterCapacityProvider cluster_capacity_provider_;
+    ClusterNodeDrainSetter cluster_node_drain_setter_;
+    TranscoderJobsProvider transcoder_jobs_provider_;
+    TranscoderJobCreator transcoder_job_creator_;
+    TranscoderJobRemover transcoder_job_remover_;
     BackupPublishersProvider backup_publishers_provider_;
     BackupPublisherUpserter backup_publisher_upserter_;
     BackupPublisherRemover backup_publisher_remover_;

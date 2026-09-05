@@ -1,0 +1,29 @@
+# systemd unit for litestream, replicating /var/lib/rtmp-server/rtmp.db to
+# object storage (deploy/ha/litestream.yml.example). Started and stopped by
+# streamforge-ha-agent.service based on leadership -- do NOT `systemctl
+# enable` this unit; it must not start at boot on a standby node.
+#
+# NOT EXECUTED IN THIS REPOSITORY'S DEVELOPMENT ENVIRONMENT (macOS has no
+# systemd) -- reviewed, not loaded by a running systemd.
+[Unit]
+Description=litestream (StreamForge control-plane database replication)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/litestream replicate -config /etc/litestream.yml
+EnvironmentFile=-/etc/streamforge/ha-agent.env
+
+User=rtmp-server
+Group=rtmp-server
+
+Restart=on-failure
+RestartSec=2s
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=litestream
+
+# Deliberately no [Install] section: enabling this at boot would let it start
+# outside the agent's control on a node that should be a standby.
