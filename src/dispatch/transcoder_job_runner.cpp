@@ -33,6 +33,13 @@ std::string target_url_for(const TranscoderJobAssignment& assignment,
     return url.str();
 }
 
+void wait_before_retry(const std::atomic<bool>& running) {
+    // Keep shutdown responsive even while an upstream or origin is down.
+    for (int i = 0; i < 50 && running.load(); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+}
+
 } // namespace
 
 // One rendition's push side: a queue fed by the shared decode/encode pipeline
@@ -89,7 +96,7 @@ struct TranscoderJobRunner::RenditionPusher {
                 state.store(TranscoderJobRunnerState::Error);
                 RTMP_LOG(observability::LogLevel::Warn, "transcoder-agent", "rendition push failed",
                          {{"target", target_url}, {"error", result.error().message()}});
-                std::this_thread::sleep_for(std::chrono::seconds(5));
+                wait_before_retry(running);
             }
         }
         state.store(TranscoderJobRunnerState::Stopped);
@@ -98,12 +105,21 @@ struct TranscoderJobRunner::RenditionPusher {
 
 TranscoderJobRunner::TranscoderJobRunner(TranscoderJobAssignment assignment)
     : assignment_(std::move(assignment)) {
-    for (const auto& rendition : assignment_.renditions) {
-        auto pusher = std::make_unique<RenditionPusher>(target_url_for(assignment_, rendition));
-        pusher->thread = std::thread([p = pusher.get()] { p->run(); });
-        pushers_.push_back(std::move(pusher));
+    // Reserve before any thread starts: if vector growth threw after a thread
+    // had been attached to a not-yet-inserted pusher, std::thread's destructor
+    // would terminate the process during unwinding.
+    pushers_.reserve(assignment_.renditions.size());
+    try {
+        for (const auto& rendition : assignment_.renditions) {
+            auto pusher = std::make_unique<RenditionPusher>(target_url_for(assignment_, rendition));
+            pusher->thread = std::thread([p = pusher.get()] { p->run(); });
+            pushers_.push_back(std::move(pusher));
+        }
+        pull_thread_ = std::thread([this] { run(); });
+    } catch (...) {
+        stop();
+        throw;
     }
-    pull_thread_ = std::thread([this] { run(); });
 }
 
 TranscoderJobRunner::~TranscoderJobRunner() { stop(); }
@@ -162,6 +178,7 @@ void TranscoderJobRunner::run() {
     // the decoder variant is fixed at construction, so it must wait until the
     // source's real codec is known from the first video tag.
     const auto ensure_transcoder = [&](SourceVideoCodec codec) -> bool {
+        if (pipeline_error) return false;
         if (transcoder) return true;
         transcoder.emplace(specs, std::max<std::uint32_t>(assignment_.fps, 1), codec);
         transcoder->set_video_output(
@@ -255,8 +272,13 @@ void TranscoderJobRunner::run() {
                     auto unit = converter.convert_audio(message.payload, message.timestamp);
                     if (!unit) return unit.error();
                     if (!unit.value()) return {};
-                    if (!ensure_transcoder(converter.has_video_codec() ? converter.video_codec()
-                                                                       : SourceVideoCodec::H264)) {
+                    // Audio commonly arrives before the first video tag. Do
+                    // not lock the decoder to H.264 by guessing here: an HEVC
+                    // source would then fail as soon as its first picture
+                    // arrived. The first few audio frames are expendable; the
+                    // first video tag selects the real decoder.
+                    if (!converter.has_video_codec()) return {};
+                    if (!ensure_transcoder(converter.video_codec())) {
                         return pipeline_error.value_or(core::Error(
                             core::ErrorCode::Unknown, core::ErrorCategory::Internal,
                             "transcoder failed to start"));
@@ -277,7 +299,7 @@ void TranscoderJobRunner::run() {
             RTMP_LOG(observability::LogLevel::Warn, "transcoder-agent", "source pull failed",
                      {{"id", assignment_.id}, {"error", result.error().message()}});
             if (transcoder) transcoder->mark_discontinuity();
-            std::this_thread::sleep_for(std::chrono::seconds(5));
+            wait_before_retry(running_);
         }
     }
     state_.store(TranscoderJobRunnerState::Stopped);

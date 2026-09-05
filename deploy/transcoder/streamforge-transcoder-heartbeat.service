@@ -1,0 +1,9 @@
+[Unit]
+Description=Report StreamForge transcoder capacity to the origin
+After=streamforge-transcoder-agent.service
+Requires=streamforge-transcoder-agent.service
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/etc/streamforge/transcoder-agent.env
+ExecStart=/usr/local/lib/streamforge/streamforge-node-heartbeat.sh

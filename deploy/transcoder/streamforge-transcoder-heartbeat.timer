@@ -1,0 +1,11 @@
+[Unit]
+Description=StreamForge transcoder heartbeat timer
+
+[Timer]
+OnBootSec=5s
+OnUnitActiveSec=10s
+AccuracySec=1s
+Unit=streamforge-transcoder-heartbeat.service
+
+[Install]
+WantedBy=timers.target

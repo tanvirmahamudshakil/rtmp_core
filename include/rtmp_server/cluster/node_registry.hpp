@@ -40,9 +40,9 @@ struct NodeHeartbeat {
     // deployment's player URLs are built from.
     std::string address;
     std::string region;
-    // Viewer ceiling this node was sized for (bandwidth / per-viewer bitrate).
-    // Zero means "unknown", which excludes the node from load comparison but
-    // not from selection.
+    // Capacity/load units are role-relative: viewer slots for origins/edges,
+    // job slots for transcoders. Zero means "unknown", which excludes the
+    // node from preferential load comparison but not from selection.
     std::uint32_t capacity_viewers = 0;
     std::uint32_t active_viewers = 0;
     std::uint32_t active_publishers = 0;
@@ -65,8 +65,8 @@ struct NodeStatus {
     // never selected, but its row is kept so an operator can see what is down.
     bool healthy = true;
     std::int64_t seconds_since_seen = 0;
-    // active/capacity, or 1.0 when capacity is unknown so an unsized node is
-    // only chosen when nothing better exists.
+    // active/capacity in the role-relative unit above, or 1.0 when capacity is
+    // unknown so an unsized node is only chosen when nothing better exists.
     double load = 1.0;
 };
 

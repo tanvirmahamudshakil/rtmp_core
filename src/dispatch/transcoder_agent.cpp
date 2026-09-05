@@ -187,16 +187,27 @@ core::Result<void> validate(const TranscoderJobAssignment& assignment) {
         return assignment_error(core::ErrorCode::InvalidConfiguration,
                                 "id must be application/name");
     }
-    if (!assignment.source_url.starts_with("rtmp://") || assignment.source_url.size() > 4096) {
+    if (!assignment.source_url.starts_with("rtmp://") || assignment.source_url.size() > 4096 ||
+        std::ranges::any_of(assignment.source_url, [](char c) {
+            return static_cast<unsigned char>(c) <= 0x20 || c == 0x7f;
+        })) {
         return assignment_error(core::ErrorCode::InvalidConfiguration,
                                 "source_url must be an rtmp:// URL");
     }
-    if (!valid_component(assignment.target_application)) {
+    const auto application = std::string_view(assignment.id).substr(0, slash);
+    const auto job_name = std::string_view(assignment.id).substr(slash + 1);
+    if (!valid_component(assignment.target_application) ||
+        assignment.target_application != application) {
         return assignment_error(core::ErrorCode::InvalidConfiguration,
-                                "target_application is invalid");
+                                "target_application must match the id application");
     }
-    if (assignment.origin_rtmp_host.empty() || assignment.origin_rtmp_host.size() > 253 ||
-        assignment.origin_rtmp_port == 0) {
+    const bool invalid_origin_host =
+        assignment.origin_rtmp_host.empty() || assignment.origin_rtmp_host.size() > 253 ||
+        std::ranges::any_of(assignment.origin_rtmp_host, [](char c) {
+            return static_cast<unsigned char>(c) <= 0x20 || c == '/' || c == '?' || c == '#' ||
+                   c == '@';
+        });
+    if (invalid_origin_host || assignment.origin_rtmp_port == 0) {
         return assignment_error(core::ErrorCode::InvalidConfiguration,
                                 "origin RTMP host and port are required");
     }
@@ -214,12 +225,18 @@ core::Result<void> validate(const TranscoderJobAssignment& assignment) {
             return assignment_error(core::ErrorCode::InvalidConfiguration,
                                     "every output_stream must be a valid path component");
         }
+        if (rendition.output_stream == job_name) {
+            return assignment_error(core::ErrorCode::InvalidConfiguration,
+                                    "an output_stream may not reuse the job name");
+        }
         if (!outputs.insert(rendition.output_stream).second) {
             return assignment_error(core::ErrorCode::InvalidConfiguration,
                                     "output_stream values must be unique");
         }
-        if (rendition.width > 16384 || rendition.height > 16384 ||
-            rendition.video_bitrate == 0 || rendition.audio_bitrate == 0) {
+        const auto pixels = static_cast<std::uint64_t>(rendition.width) * rendition.height;
+        if (rendition.width > 8192 || rendition.height > 8192 || pixels > 7680u * 4320u ||
+            rendition.video_bitrate == 0 || rendition.video_bitrate > 200'000'000 ||
+            rendition.audio_bitrate == 0 || rendition.audio_bitrate > 2'000'000) {
             return assignment_error(core::ErrorCode::InvalidConfiguration,
                                     "rendition geometry or bitrate is invalid");
         }
@@ -353,9 +370,10 @@ core::Result<TranscoderJobRunnerStatus> TranscoderAgent::upsert(
                                 "runner factory returned no transcoder job");
     }
     auto status = runner->status();
+    const auto id = assignment.id;
     {
         std::lock_guard jobs_lock(jobs_mutex_);
-        jobs_.emplace(assignment.id, Entry{std::move(assignment), std::move(runner)});
+        jobs_.emplace(id, Entry{std::move(assignment), std::move(runner)});
     }
     return status;
 }

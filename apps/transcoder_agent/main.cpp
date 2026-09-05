@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <atomic>
 #include <charconv>
 #include <chrono>
@@ -151,6 +152,12 @@ rtmp_server::control::HttpResponse handle_request(
 
 int main() {
     using namespace rtmp_server;
+    // HttpServer uses ordinary send(2); a client closing between request and
+    // response must fail that request, not terminate every transcode job.
+    std::signal(SIGPIPE, SIG_IGN);
+    std::signal(SIGINT, request_stop);
+    std::signal(SIGTERM, request_stop);
+
     const auto bind = environment_or("RTMP_TRANSCODER_BIND", "0.0.0.0");
     const auto port = environment_number<std::uint16_t>("RTMP_TRANSCODER_PORT", 9200, 1, 65535);
     const auto max_jobs = environment_number<std::size_t>(
@@ -178,8 +185,6 @@ int main() {
         return 1;
     }
 
-    std::signal(SIGINT, request_stop);
-    std::signal(SIGTERM, request_stop);
     std::cout << "transcoder_agent listening on " << bind << ':' << server.bound_port()
               << " (max jobs " << max_jobs << ")\n";
     while (stop_requested == 0) std::this_thread::sleep_for(std::chrono::milliseconds(200));

@@ -3,6 +3,8 @@
 # layer's TS muxer and codec helpers — no sockets, no io_uring, no disk — so
 # it builds on every platform including RTMP_SERVER_CORE_ONLY. HTTP delivery
 # lives in rtmp_server_control (the existing Phase 5 server), not here.
+find_package(OpenSSL REQUIRED COMPONENTS Crypto)
+
 add_library(rtmp_server_hls STATIC
     playlist.cpp
     encryption.cpp
@@ -23,6 +25,11 @@ target_link_libraries(rtmp_server_hls
         rtmp_server_media
         rtmp_server_warnings
         rtmp_server_sanitizers
+    PRIVATE
+        # encryption.cpp calls EVP directly. rtmp_server_core also uses
+        # OpenSSL, but keeps that dependency private, so HLS must declare its
+        # own include/link requirement (notably required by Homebrew layouts).
+        OpenSSL::Crypto
 )
 
 target_compile_features(rtmp_server_hls PUBLIC cxx_std_23)

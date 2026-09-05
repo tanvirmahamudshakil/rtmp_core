@@ -1,0 +1,20 @@
+[Unit]
+Description=StreamForge dedicated transcoder agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/streamforge/transcoder-agent.env
+ExecStart=/usr/local/bin/transcoder_agent
+Restart=always
+RestartSec=3
+TimeoutStopSec=30
+LimitNOFILE=1048576
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

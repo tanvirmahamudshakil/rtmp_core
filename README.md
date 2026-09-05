@@ -257,7 +257,9 @@ should be sent to (region, then edge-over-origin, then least loaded), and
 placement into one-hop routing with no separate load balancer required for a
 small deployment. `/v1/cluster/capacity` reports aggregate edge utilisation
 and a scale-out recommendation for an external autoscaler to poll — this
-process only reports the signal, it does not provision anything itself.
+process only reports the signal, it does not provision anything itself. See
+`docs/transcoder-dispatch.md` for running dedicated pull/transcode/push worker
+nodes behind that registry.
 
 Not included: WebRTC, SRT, multi-node state replication, leader election or
 origin failover (lose the origin process and you lose the control plane —

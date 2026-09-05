@@ -26,6 +26,8 @@
 #   STREAMFORGE_NODE_DRAINING   "1" to keep serving existing sessions while
 #                               taking no new viewers.
 #   STREAMFORGE_VARNISH_PORT    Local Varnish port, for the viewer count.
+#   STREAMFORGE_TRANSCODER_AGENT_URL
+#                               Local agent URL when role=transcoder.
 set -euo pipefail
 
 MANAGEMENT_URL="${STREAMFORGE_MANAGEMENT_URL:-}"
@@ -35,6 +37,7 @@ NODE_REGION="${STREAMFORGE_NODE_REGION:-}"
 NODE_ADDRESS="${STREAMFORGE_NODE_ADDRESS:-$(hostname -f 2>/dev/null || hostname)}"
 NODE_CAPACITY="${STREAMFORGE_NODE_CAPACITY:-0}"
 NODE_DRAINING="${STREAMFORGE_NODE_DRAINING:-0}"
+TRANSCODER_AGENT_URL="${STREAMFORGE_TRANSCODER_AGENT_URL:-http://127.0.0.1:9200}"
 
 if [[ -z "${MANAGEMENT_URL}" ]]; then
   echo "[heartbeat] STREAMFORGE_MANAGEMENT_URL is required" >&2
@@ -45,6 +48,18 @@ fi
 # a gauge, so the live number comes from the sessions Varnish currently holds
 # open; a node without varnishstat reports zero rather than guessing.
 active_viewers() {
+  if [[ "${NODE_ROLE}" == "transcoder" ]]; then
+    # For a transcoder, the generic cluster capacity/load fields carry job
+    # slots and active jobs. Do not report a healthy node when its local
+    # agent is unreachable.
+    local jobs
+    jobs=$(curl -fsS --max-time 5 "${TRANSCODER_AGENT_URL%/}/jobs") || {
+      echo "[heartbeat] local transcoder agent is unreachable" >&2
+      return 1
+    }
+    printf '%s' "${jobs}" | awk -F'"id":' '{ count += NF - 1 } END { print count + 0 }'
+    return
+  fi
   if ! command -v varnishstat >/dev/null 2>&1; then
     echo 0
     return
@@ -59,9 +74,10 @@ active_viewers() {
 
 draining="false"
 [[ "${NODE_DRAINING}" == "1" || "${NODE_DRAINING}" == "true" ]] && draining="true"
+active=$(active_viewers)
 
 payload=$(cat <<JSON
-{"id":"${NODE_ID}","role":"${NODE_ROLE}","address":"${NODE_ADDRESS}","region":"${NODE_REGION}","capacity_viewers":"${NODE_CAPACITY}","active_viewers":"$(active_viewers)","draining":"${draining}"}
+{"id":"${NODE_ID}","role":"${NODE_ROLE}","address":"${NODE_ADDRESS}","region":"${NODE_REGION}","capacity_viewers":"${NODE_CAPACITY}","active_viewers":"${active}","active_publishers":"${active}","draining":"${draining}"}
 JSON
 )
 
