@@ -99,6 +99,13 @@ add_subdirectory(src/dispatch)
 # Builds everywhere — POSIX sockets, not io_uring.
 add_subdirectory(src/control)
 
+# A dedicated pull/transcode/push worker. It is intentionally a separate
+# process from the origin and only exists when the native codec stack is
+# available.
+if(RTMP_NATIVE_TRANSCODE_AVAILABLE)
+    add_subdirectory(apps/transcoder_agent)
+endif()
+
 if(NOT RTMP_SERVER_CORE_ONLY AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
     add_subdirectory(src/io/io_uring)
     add_subdirectory(apps/rtmp_server)

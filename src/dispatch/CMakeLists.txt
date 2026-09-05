@@ -6,8 +6,13 @@
 # dispatching to it never does.
 add_library(rtmp_server_dispatch STATIC
     agent_http_client.cpp
+    transcoder_agent.cpp
     transcoder_dispatch_manager.cpp
 )
+
+if(RTMP_NATIVE_TRANSCODE_AVAILABLE)
+    target_sources(rtmp_server_dispatch PRIVATE transcoder_job_runner.cpp)
+endif()
 
 target_include_directories(rtmp_server_dispatch PUBLIC
     ${CMAKE_SOURCE_DIR}/include
@@ -19,6 +24,7 @@ target_link_libraries(rtmp_server_dispatch
         rtmp_server_cluster
         rtmp_server_hls
         rtmp_server_persistence
+        rtmp_server_relay
         rtmp_server_transcoding
         rtmp_server_warnings
         rtmp_server_sanitizers

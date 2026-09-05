@@ -1,5 +1,6 @@
 add_executable(rtmp_server_dispatch_tests
     agent_http_client_test.cpp
+    transcoder_agent_test.cpp
     transcoder_dispatch_manager_test.cpp
     # http_server.cpp/http_message.cpp are compiled directly here rather than
     # via rtmp_server_control: that library also builds hls_http_handler.cpp,
