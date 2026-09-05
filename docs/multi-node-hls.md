@@ -146,6 +146,10 @@ Existing install: add `RTMP_SERVER_HLS_EDGE_FETCH_SECRET=<token>` to
 `/etc/varnish/streamforge.vcl`, then
 `systemctl restart rtmp-server varnish`.
 
+The origin VCL also requires the distribution's `varnish-vmod-digest`
+package. This is separate from `varnish-modules`; both Ubuntu 24.04 and Debian
+13 package it against their matching Varnish ABI.
+
 The token is printed in `/root/streamforge-credentials.txt`.
 
 ### 2. Add each edge

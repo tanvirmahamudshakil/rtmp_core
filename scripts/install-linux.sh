@@ -424,10 +424,22 @@ fi
 log "Installing or refreshing compiler, runtime, web server and network tooling"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
+
+# Ubuntu keeps the digest VMOD in universe. Minimal cloud images sometimes
+# enable only main, so make the supported package visible before the combined
+# install below. Debian 13 carries it in the normal archive.
+if ! apt-cache show varnish-vmod-digest >/dev/null 2>&1 && [[ "${ID}" == "ubuntu" ]]; then
+  apt-get install -y --no-install-recommends "${APT_REINSTALL_ARGS[@]}" software-properties-common
+  add-apt-repository -y universe
+  apt-get update
+fi
+apt-cache show varnish-vmod-digest >/dev/null 2>&1 ||
+  die "varnish-vmod-digest is unavailable from the configured ${ID} repositories."
+
 apt-get install -y --no-install-recommends "${APT_REINSTALL_ARGS[@]}" \
   build-essential cmake ninja-build pkg-config git ca-certificates curl gnupg \
   liburing-dev liburing2 libssl-dev libsqlite3-dev libsqlite3-0 sqlite3 \
-  iproute2 ethtool kmod varnish varnish-modules nftables
+  iproute2 ethtool kmod varnish varnish-modules varnish-vmod-digest nftables
 
 # The distribution's default "clang" meta-package tracks whatever major
 # version that release shipped with — fine on 24.04 (clang-18) but not
@@ -1401,15 +1413,24 @@ if [[ -n "${EDGE_TOKEN}" ]]; then
     /etc/varnish/streamforge.vcl
 fi
 
-# The VCL imports the digest vmod (libvmod-digest, from the varnish-modules
-# package installed above) to mint the per-viewer session id at the edge
+# The VCL imports the digest VMOD (libvmod_digest.so, provided by the separate
+# varnish-vmod-digest package installed above -- it is NOT part of the
+# similarly named varnish-modules collection) to mint the per-viewer session
+# id at the edge
 # instead of round-tripping every fresh join to the origin. An import that
 # fails to resolve fails the WHOLE VCL load, not just that one feature, so a
 # missing or version-mismatched module would otherwise surface as Varnish
 # refusing to start with no config left in place -- caught here instead,
 # same fail-loud-before-activating posture as `caddy validate` below.
-varnishd -C -f /etc/varnish/streamforge.vcl >/dev/null ||
-  die "generated /etc/varnish/streamforge.vcl failed to compile -- check 'varnishd -C -f /etc/varnish/streamforge.vcl' and that varnish-modules matches the installed varnish version"
+VCL_CHECK_OUTPUT="$(mktemp /tmp/streamforge-vcl-check.XXXXXX)"
+if ! varnishd -C -f /etc/varnish/streamforge.vcl >"${VCL_CHECK_OUTPUT}" 2>&1; then
+  # VCC diagnostics are part of varnishd's normal output and were previously
+  # redirected away, leaving only the unhelpful "exited with 2" wrapper.
+  sed 's/^/[varnishd] /' "${VCL_CHECK_OUTPUT}" >&2
+  rm -f -- "${VCL_CHECK_OUTPUT}"
+  die "generated /etc/varnish/streamforge.vcl failed to compile -- verify that varnish and varnish-vmod-digest come from the same distribution release"
+fi
+rm -f -- "${VCL_CHECK_OUTPUT}"
 
 install -d -m 0755 /etc/systemd/system/varnish.service.d
 cat > /etc/systemd/system/varnish.service.d/streamforge.conf <<EOF
