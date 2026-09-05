@@ -5,6 +5,7 @@
 # RTMP_SERVER_CORE_ONLY.
 add_library(rtmp_server_protocol STATIC
     handshake/handshake_session.cpp
+    rtmp_url.cpp
     chunk/chunk_decoder.cpp
     chunk/chunk_encoder.cpp
     amf0/amf0_encoder.cpp

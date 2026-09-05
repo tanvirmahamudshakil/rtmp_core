@@ -15,6 +15,9 @@ add_library(rtmp_server_media STATIC
     h264/sps.cpp
     hevc/sps.cpp
     aac/adts.cpp
+    # Bounded publisher -> off-thread-worker hand-off and its drop policy,
+    # shared by ingest transcoding and the relay/stream-target publisher.
+    media_handoff_queue.cpp
     mp4/fmp4_muxer.cpp
     ts/ts_muxer.cpp
     ts/ts_demuxer.cpp

@@ -79,6 +79,56 @@ public:
         std::string_view application, std::string_view name, bool enabled)>;
     using SourceJobRestarter = std::function<core::Result<std::string>(
         std::string_view application, std::string_view name)>;
+    // Cluster membership. Nodes that are not this origin (edges, shields,
+    // transcoders) have no database of their own, so they announce themselves
+    // by heartbeat; the provider/remover mirror every other collection here.
+    // The heartbeat handler receives the request body already parsed into flat
+    // fields, so this layer stays free of the cluster domain's types.
+    using ClusterNodesProvider = std::function<core::Result<std::string>()>;
+    using ClusterHeartbeatHandler =
+        std::function<core::Result<std::string>(const std::unordered_map<std::string, std::string>&)>;
+    using ClusterNodeRemover = std::function<core::Result<void>(std::string_view id)>;
+    // Placement: which node a new viewer in `region` should be sent to. Used by
+    // an external load balancer, a redirector, or the panel when it builds a
+    // playback URL.
+    using ClusterLocateProvider = std::function<core::Result<std::string>(std::string_view region)>;
+    // Turns a placement decision into an actual redirect: given a stream and a
+    // region hint, returns the full playback URL on the chosen node (or an
+    // error when nothing can serve it). This is what makes cluster placement a
+    // real routing mechanism rather than only an API a load balancer could
+    // consult -- a player, or a thin redirector in front of this origin, can
+    // hit this route directly and get sent to the right edge with one hop.
+    using ClusterRedirectProvider = std::function<core::Result<std::string>(
+        std::string_view application, std::string_view stream, std::string_view region,
+        std::string_view format)>;
+    // Aggregate edge capacity/utilisation and a scale-out recommendation, for
+    // an external autoscaler to poll. This process only reports the signal --
+    // it does not provision or remove anything itself.
+    using ClusterCapacityProvider = std::function<core::Result<std::string>()>;
+
+    // Stream targets: push this server's own publish to another RTMP server
+    // (a second origin -- the relay/repeater -- or an external ingest).
+    using StreamTargetsProvider =
+        std::function<core::Result<std::string>(std::string_view application)>;
+    using StreamTargetUpserter = std::function<core::Result<std::string>(
+        std::string_view application, std::string_view stream, std::string_view name,
+        const std::unordered_map<std::string, std::string>& fields)>;
+    using StreamTargetRemover = std::function<core::Result<void>(
+        std::string_view application, std::string_view stream, std::string_view name)>;
+    using StreamTargetEnabledSetter = std::function<core::Result<std::string>(
+        std::string_view application, std::string_view stream, std::string_view name, bool enabled)>;
+
+    // Backup publishers: a fallback RTMP source that takes over packaging when
+    // a stream's primary publisher has been absent past its configured grace
+    // period.
+    using BackupPublishersProvider =
+        std::function<core::Result<std::string>(std::string_view application)>;
+    using BackupPublisherUpserter = std::function<core::Result<std::string>(
+        std::string_view application, std::string_view stream,
+        const std::unordered_map<std::string, std::string>& fields)>;
+    using BackupPublisherRemover =
+        std::function<core::Result<void>(std::string_view application, std::string_view stream)>;
+
     // Settings page: reads/writes the on-disk server config file. The
     // provider returns the schema-joined-with-current-values JSON body
     // (secrets never included, only a has_value flag); the updater takes the
@@ -129,6 +179,32 @@ public:
         source_job_enabled_setter_ = std::move(enabled_setter);
         source_job_restarter_ = std::move(restarter);
     }
+    void set_cluster_handlers(ClusterNodesProvider provider, ClusterHeartbeatHandler heartbeat,
+                              ClusterNodeRemover remover, ClusterLocateProvider locate,
+                              ClusterRedirectProvider redirect = {},
+                              ClusterCapacityProvider capacity = {}) {
+        cluster_nodes_provider_ = std::move(provider);
+        cluster_heartbeat_handler_ = std::move(heartbeat);
+        cluster_node_remover_ = std::move(remover);
+        cluster_locate_provider_ = std::move(locate);
+        cluster_redirect_provider_ = std::move(redirect);
+        cluster_capacity_provider_ = std::move(capacity);
+    }
+    void set_stream_target_handlers(StreamTargetsProvider provider, StreamTargetUpserter upserter,
+                                    StreamTargetRemover remover,
+                                    StreamTargetEnabledSetter enabled_setter) {
+        stream_targets_provider_ = std::move(provider);
+        stream_target_upserter_ = std::move(upserter);
+        stream_target_remover_ = std::move(remover);
+        stream_target_enabled_setter_ = std::move(enabled_setter);
+    }
+    void set_backup_publisher_handlers(BackupPublishersProvider provider,
+                                       BackupPublisherUpserter upserter,
+                                       BackupPublisherRemover remover) {
+        backup_publishers_provider_ = std::move(provider);
+        backup_publisher_upserter_ = std::move(upserter);
+        backup_publisher_remover_ = std::move(remover);
+    }
     void set_settings_handlers(SettingsProvider provider, SettingsUpdater updater) {
         settings_provider_ = std::move(provider);
         settings_updater_ = std::move(updater);
@@ -165,6 +241,32 @@ private:
     [[nodiscard]] HttpResponse handle_restart_source_job(std::string_view application, std::string_view name);
     [[nodiscard]] HttpResponse handle_patch_source_job(std::string_view application, std::string_view name,
                                                        const HttpRequest& request);
+    [[nodiscard]] HttpResponse handle_list_cluster_nodes();
+    [[nodiscard]] HttpResponse handle_cluster_heartbeat(const HttpRequest& request);
+    [[nodiscard]] HttpResponse handle_delete_cluster_node(std::string_view id);
+    [[nodiscard]] HttpResponse handle_cluster_locate(const HttpRequest& request);
+    [[nodiscard]] HttpResponse handle_cluster_redirect(std::string_view application,
+                                                       std::string_view stream,
+                                                       const HttpRequest& request);
+    [[nodiscard]] HttpResponse handle_cluster_capacity();
+    [[nodiscard]] HttpResponse handle_list_backup_publishers(const HttpRequest& request);
+    [[nodiscard]] HttpResponse handle_put_backup_publisher(std::string_view application,
+                                                           std::string_view stream,
+                                                           const HttpRequest& request);
+    [[nodiscard]] HttpResponse handle_delete_backup_publisher(std::string_view application,
+                                                              std::string_view stream);
+    [[nodiscard]] HttpResponse handle_list_stream_targets(const HttpRequest& request);
+    [[nodiscard]] HttpResponse handle_put_stream_target(std::string_view application,
+                                                        std::string_view stream,
+                                                        std::string_view name,
+                                                        const HttpRequest& request);
+    [[nodiscard]] HttpResponse handle_patch_stream_target(std::string_view application,
+                                                          std::string_view stream,
+                                                          std::string_view name,
+                                                          const HttpRequest& request);
+    [[nodiscard]] HttpResponse handle_delete_stream_target(std::string_view application,
+                                                            std::string_view stream,
+                                                            std::string_view name);
     [[nodiscard]] HttpResponse handle_list_transcoding_assignments(const HttpRequest& request);
     [[nodiscard]] HttpResponse handle_put_transcoding_assignment(std::string_view application,
                                                                   std::string_view source_stream,
@@ -194,6 +296,19 @@ private:
     TranscodingAssignmentsProvider transcoding_assignments_provider_;
     TranscodingAssignmentUpdater transcoding_assignment_updater_;
     TranscodingAssignmentRemover transcoding_assignment_remover_;
+    ClusterNodesProvider cluster_nodes_provider_;
+    ClusterHeartbeatHandler cluster_heartbeat_handler_;
+    ClusterNodeRemover cluster_node_remover_;
+    ClusterLocateProvider cluster_locate_provider_;
+    ClusterRedirectProvider cluster_redirect_provider_;
+    ClusterCapacityProvider cluster_capacity_provider_;
+    BackupPublishersProvider backup_publishers_provider_;
+    BackupPublisherUpserter backup_publisher_upserter_;
+    BackupPublisherRemover backup_publisher_remover_;
+    StreamTargetsProvider stream_targets_provider_;
+    StreamTargetUpserter stream_target_upserter_;
+    StreamTargetRemover stream_target_remover_;
+    StreamTargetEnabledSetter stream_target_enabled_setter_;
     SourceJobsProvider source_jobs_provider_;
     SourceJobCreator source_job_creator_;
     SourceJobRemover source_job_remover_;

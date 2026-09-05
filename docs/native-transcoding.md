@@ -102,9 +102,84 @@ cmake -S . -B build -DRTMP_ENABLE_NATIVE_TRANSCODE=ON
 cmake --build build
 ```
 
+## Transcoding a stream published to this origin
+
+A stream that an encoder publishes over RTMP can be re-encoded into a rendition
+ladder, so viewers get adaptive bitrate from a single-bitrate publish:
+
+```text
+OBS/encoder --RTMP--> publisher connection (io_uring worker)
+    → IngestMediaQueue          # bounded hand-off, drops rather than blocking the publisher
+    → RtmpTagConverter          # FLV AVCC/HVCC -> Annex B, raw AAC -> ADTS, 90 kHz clock
+    → SourceTranscoder          # decode once (openh264 / libde265 / libfdk-aac)
+        → per rung: libyuv scale + libx264 encode + AAC re-encode
+    → RenditionFeed → Segmenter → SegmentStore
+    → /hls/{app}/{rung}/index.m3u8, advertised from /hls/{app}/{stream}/master.m3u8
+```
+
+Which publishes get a ladder is decided by a **transcoding assignment**: one
+persisted rule per `application/source_stream`, carrying the same
+pipe-delimited preset rules a source-transcode job takes.
+
+```bash
+# One 720p rung and one 480p rung for whatever publishes to live/main-stage.
+curl -X PUT localhost:8080/v1/transcoding/assignments/live:main-stage \
+  -H 'X-Template-Name: ladder' \
+  --data-binary $'live/main-stage|hd|main-stage_720p|default|h264|2500000|high|60|1280|720|letterbox|aac|128000|first|HD\nlive/main-stage|sd|main-stage_480p|default|h264|900000|main|60|854|480|letterbox|aac|96000|first|SD\n'
+
+curl 'localhost:8080/v1/transcoding/assignments?application=live'
+curl -X DELETE localhost:8080/v1/transcoding/assignments/live:main-stage
+```
+
+Assignments are stored in the `transcoding_assignments` table and reloaded at
+startup; a stored rule that no longer parses is skipped with a warning rather
+than failing startup. There is no admin-panel page for them yet — the API and
+the table are the interface.
+
+### How an ingest ladder behaves at runtime
+
+**The passthrough stream is untouched.** `/hls/{app}/{stream}/index.m3u8` still
+serves the publisher's own bytes, never re-encoded, and RTMP playback of the
+published name is unchanged. The ladder is additive: each rung is registered as
+its own HLS stream beside it, and `master.m3u8` lists the rungs. The master
+deliberately does not advertise the passthrough rendition — its real bitrate
+and codec string are whatever the publisher happens to send, which cannot be
+declared in `EXT-X-STREAM-INF` before it arrives. A rung may not reuse the
+source stream's own name; the API rejects that, because the registration would
+replace the passthrough playlist.
+
+**The publisher is never blocked.** Media is copied into a bounded queue
+(`IngestMediaQueue`) and everything expensive happens on the ladder's own
+thread. When the encoders fall behind, the queue drops: a discarded video frame
+puts it in resync, every following frame is dropped until the next keyframe,
+and the transcoder re-anchors over the gap. Audio and sequence headers are
+never dropped for capacity — losing an `AudioSpecificConfig` or an
+`AVCDecoderConfigurationRecord` breaks the rest of the session rather than one
+GOP — with a hard multiple of the ceiling as the last stop for a wedged worker.
+So a ladder too heavy for the box costs transcoded quality, never ingest or
+passthrough delivery.
+
+**A reconnect does not empty the window.** The rungs' `SegmentStore`s belong to
+the manager, not to the sink, so a publisher that drops and comes back resumes
+the same stores and media sequence instead of starting from an empty live
+window. Every rung is re-encoded onto one monotonic output timeline
+(`seamless_fallback_recovery`), so a reconnect needs no `EXT-X-DISCONTINUITY`.
+
+**CPU is reserved and divided.** `transcode_cpu_reservation_percent` splits the
+box; ladders are pinned to the transcode cores and divide them between
+themselves, so encoders cannot starve the io_uring workers carrying ingest and
+delivery. Source-transcode jobs divide the same slice from their own manager,
+so a box running both kinds of transcode can oversubscribe the reservation
+between them — sizing them together needs one process-wide budget owner, which
+neither side has today.
+
+**Changing an assignment restarts the ladder.** Reshaping the rungs means
+rebuilding the encoders, so the running ladder is stopped and the next publish
+builds the new one. The passthrough stream stays live throughout.
+
 ## Source-transcode jobs (pull an external URL)
 
-Beyond transcoding streams published to this origin, the native pipeline can
+Beyond a stream published to this origin, the native pipeline can
 pull an **external source URL**, transcode it per a template, and re-serve it as
 one adaptive master `.m3u8`:
 
@@ -210,6 +285,9 @@ option is on, `RTMP_NATIVE_TRANSCODE` is defined for consumers.
 | `native/aac_decoder.*` | libfdk-aac raw AAC → S16 PCM |
 | `native/aac_encoder.*` | libfdk-aac PCM → ADTS AAC (internal frame buffering) |
 | `native/audio_transcoder.*` | Audio glue: FLV AAC frame → ADTS access units |
+| `native/ingest_media_queue.*` | Bounded publisher → transcode-worker hand-off and its drop policy (no libraries) |
+| `native/rtmp_tag_converter.*` | FLV/RTMP tags → Annex B + ADTS on a monotonic 90 kHz clock (no libraries) |
+| `native/ingest_transcoder.*` | The publish-path `RecorderSink` ladder and the assignment manager behind it |
 
 ## Integration boundary
 

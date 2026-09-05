@@ -15,6 +15,16 @@ add_library(rtmp_server_transcoding STATIC
     # on aac_params above, so it compiles and is tested without the codec
     # libraries even though what it describes is produced by them.
     native/codec_tags.cpp
+    # FLV/RTMP tag -> Annex B + ADTS conversion. Pure byte reframing over the
+    # media layer's codec helpers, so it also builds without the encoders.
+    native/rtmp_tag_converter.cpp
+    # The native RTMP playback client (DNS/TCP, handshake, connect/
+    # createStream/play, chunk/AMF0, ack/ping). Pure sockets + protocol, no
+    # codec libraries -- moved out of the codec-gated block below so backup
+    # publisher failover (src/relay/backup_publisher.cpp), which needs only
+    # this client and no transcoding, works on every host including one
+    # without libx264/x265/openh264 installed.
+    native/rtmp_source_client.cpp
 )
 
 target_include_directories(rtmp_server_transcoding PUBLIC
@@ -49,15 +59,13 @@ if(RTMP_NATIVE_TRANSCODE_AVAILABLE)
         native/audio_transcoder.cpp
         native/source_transcoder.cpp
         native/http_client.cpp
-        # The native RTMP pull client behind an rtmp:// source URL. Omitting
-        # it still compiled every translation unit -- hls_source_puller.cpp
-        # only needs its header -- and failed at link time instead, which is
-        # why it survived: nothing here catches a missing source until the
-        # final executable is linked.
-        native/rtmp_source_client.cpp
         native/paced_segment_publisher.cpp
         native/hls_source_puller.cpp
         native/source_job_manager.cpp
+        # Transcoding of streams published to this origin: the RecorderSink
+        # that turns one publish into a rendition ladder, and the assignment
+        # manager that decides which publishes get one.
+        native/ingest_transcoder.cpp
     )
     target_link_libraries(rtmp_server_transcoding
         PUBLIC

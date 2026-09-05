@@ -40,6 +40,20 @@ public:
     core::Result<void> upsert_stream(const StreamRow& row) override;
     core::Result<void> delete_stream(std::string_view application, std::string_view name) override;
     [[nodiscard]] core::Result<std::vector<StreamRow>> load_streams() override;
+    core::Result<void> upsert_stream_target(const StreamTargetRow& row) override;
+    core::Result<void> delete_stream_target(std::string_view application, std::string_view stream,
+                                            std::string_view name) override;
+    [[nodiscard]] core::Result<std::vector<StreamTargetRow>> load_stream_targets() override;
+
+    core::Result<void> upsert_backup_publisher(const BackupPublisherRow& row) override;
+    core::Result<void> delete_backup_publisher(std::string_view application,
+                                               std::string_view stream) override;
+    [[nodiscard]] core::Result<std::vector<BackupPublisherRow>> load_backup_publishers() override;
+
+    core::Result<void> upsert_cluster_node(const ClusterNodeRow& row) override;
+    core::Result<void> delete_cluster_node(std::string_view id) override;
+    [[nodiscard]] core::Result<std::vector<ClusterNodeRow>> load_cluster_nodes() override;
+
     core::Result<void> upsert_transcoding_assignment(const TranscodingAssignmentRow& row) override;
     core::Result<void> delete_transcoding_assignment(std::string_view application,
                                                       std::string_view source_stream) override;

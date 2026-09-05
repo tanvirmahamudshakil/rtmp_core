@@ -7,6 +7,8 @@ add_executable(rtmp_server_transcoding_tests
     hevc_decoder_test.cpp
     source_job_manager_test.cpp
     codec_tags_test.cpp
+    rtmp_tag_converter_test.cpp
+    ingest_transcoder_test.cpp
 )
 
 target_link_libraries(rtmp_server_transcoding_tests PRIVATE

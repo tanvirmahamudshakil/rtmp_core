@@ -20,6 +20,10 @@ This is the same origin/edge model Wowza's live stream repeater uses; here the
 transport is plain cacheable HTTP, so an "edge" is just a correctly configured
 reverse cache.
 
+For scaling *ingest* rather than delivery — relaying a publish to a second
+origin — and for the cluster node registry that tracks these nodes, see
+[clustering.md](clustering.md).
+
 ## Topology
 
 ```

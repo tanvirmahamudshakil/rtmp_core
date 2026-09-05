@@ -50,6 +50,47 @@ struct SourceJobRow {
     bool enabled = true;
 };
 
+// One outbound push destination for a locally published stream: another
+// origin of this deployment (`relay`), or an external ingest such as a CDN or
+// social platform. `url` carries the destination's stream key, so it is stored
+// like a credential -- never returned by the API in full.
+struct StreamTargetRow {
+    std::string application;
+    std::string stream;
+    std::string name;
+    std::string url;
+    bool enabled = true;
+    bool relay = false;
+};
+
+// A designated fallback ingest for a local stream: when the primary
+// publisher is absent for `failover_after_seconds`, this URL is played and
+// its media takes over packaging until the primary returns.
+struct BackupPublisherRow {
+    std::string application;
+    std::string stream;
+    std::string backup_url;
+    bool enabled = true;
+    std::uint32_t failover_after_seconds = 15;
+};
+
+// A node of this deployment as last seen by the control plane: an origin, an
+// HTTP cache edge, an origin shield, or a transcoder. Heartbeats refresh
+// `last_seen_unix`; a node that stops heartbeating is reported unhealthy and
+// stops being handed out for playback, but its row survives a restart of
+// either side.
+struct ClusterNodeRow {
+    std::string id;
+    std::string role;
+    std::string address;
+    std::string region;
+    std::int64_t last_seen_unix = 0;
+    std::uint32_t capacity_viewers = 0;
+    std::uint32_t active_viewers = 0;
+    std::uint32_t active_publishers = 0;
+    bool draining = false;
+};
+
 // A transcoding template as authored in the admin panel: a name plus its list
 // of encoding presets. The preset list is opaque JSON to the store, same as
 // TranscodingAssignmentRow::rules — the control layer encodes/decodes it.
@@ -100,6 +141,41 @@ public:
     }
     [[nodiscard]] virtual core::Result<std::vector<SourceJobRow>> load_source_jobs() {
         return std::vector<SourceJobRow>{};
+    }
+
+    // Optional for storage implementations used by older unit tests. The
+    // production SQLite store overrides all three methods.
+    virtual core::Result<void> upsert_stream_target(const StreamTargetRow&) {
+        return core::Result<void>{};
+    }
+    virtual core::Result<void> delete_stream_target(std::string_view, std::string_view,
+                                                    std::string_view) {
+        return core::Result<void>{};
+    }
+    [[nodiscard]] virtual core::Result<std::vector<StreamTargetRow>> load_stream_targets() {
+        return std::vector<StreamTargetRow>{};
+    }
+
+    // Optional for storage implementations used by older unit tests. The
+    // production SQLite store overrides all three methods.
+    virtual core::Result<void> upsert_backup_publisher(const BackupPublisherRow&) {
+        return core::Result<void>{};
+    }
+    virtual core::Result<void> delete_backup_publisher(std::string_view, std::string_view) {
+        return core::Result<void>{};
+    }
+    [[nodiscard]] virtual core::Result<std::vector<BackupPublisherRow>> load_backup_publishers() {
+        return std::vector<BackupPublisherRow>{};
+    }
+
+    // Optional for storage implementations used by older unit tests. The
+    // production SQLite store overrides all three methods.
+    virtual core::Result<void> upsert_cluster_node(const ClusterNodeRow&) {
+        return core::Result<void>{};
+    }
+    virtual core::Result<void> delete_cluster_node(std::string_view) { return core::Result<void>{}; }
+    [[nodiscard]] virtual core::Result<std::vector<ClusterNodeRow>> load_cluster_nodes() {
+        return std::vector<ClusterNodeRow>{};
     }
 
     // Optional for storage implementations used by older unit tests. The

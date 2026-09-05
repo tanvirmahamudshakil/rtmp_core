@@ -87,6 +87,12 @@ add_subdirectory(src/hls)
 # MPEG-DASH packaging (MPD, fMP4 segmenter, bounded segment store). Same
 # platform posture as src/hls; must also come before src/control.
 add_subdirectory(src/dash)
+# Cluster membership/placement: which nodes exist and where a viewer goes.
+add_subdirectory(src/cluster)
+# Outbound RTMP (relay to another origin, push to an external ingest). Plain
+# POSIX sockets, so it builds everywhere alongside the rest of the control
+# plane.
+add_subdirectory(src/relay)
 # Builds everywhere — POSIX sockets, not io_uring.
 add_subdirectory(src/control)
 
@@ -116,4 +122,6 @@ if(RTMP_SERVER_BUILD_TESTS)
     add_subdirectory(tests/authentication)
     add_subdirectory(tests/control)
     add_subdirectory(tests/transcoding)
+    add_subdirectory(tests/cluster)
+    add_subdirectory(tests/relay)
 endif()

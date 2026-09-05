@@ -42,6 +42,13 @@
 #   STREAMFORGE_VARNISH_PORT  Internal Varnish listen port. Default 6081.
 #   STREAMFORGE_CADDY_ORIGIN_PORT
 #                             Local outbound TLS-proxy port. Default 8090.
+#   STREAMFORGE_MANAGEMENT_URL  Origin base URL this node heartbeats to so it
+#                             appears in the cluster table and can be handed
+#                             viewers by /v1/cluster/locate. Defaults to
+#                             STREAMFORGE_ORIGIN; set empty to disable.
+#   STREAMFORGE_NODE_REGION   Region label used for placement (e.g. eu, us).
+#   STREAMFORGE_NODE_CAPACITY Viewer ceiling this node was sized for. 0
+#                             (default) = unknown.
 #   STREAMFORGE_EDGE_PROBE    "enabled" (default) health-probes the origin at
 #                             /health/ready; "disabled" removes the probe for
 #                             an origin that does not expose it publicly.
@@ -73,6 +80,9 @@ EDGE_NODE="${STREAMFORGE_EDGE_NODE:-$(hostname -s 2>/dev/null || hostname)}"
 VARNISH_PORT="${STREAMFORGE_VARNISH_PORT:-6081}"
 CADDY_ORIGIN_PORT="${STREAMFORGE_CADDY_ORIGIN_PORT:-8090}"
 EDGE_PROBE="${STREAMFORGE_EDGE_PROBE:-enabled}"
+MANAGEMENT_URL="${STREAMFORGE_MANAGEMENT_URL-${ORIGIN}}"
+NODE_REGION="${STREAMFORGE_NODE_REGION:-}"
+NODE_CAPACITY="${STREAMFORGE_NODE_CAPACITY:-0}"
 CONFIGURE_FIREWALL="${RTMP_CONFIGURE_FIREWALL:-1}"
 
 [[ -n "${ORIGIN}" ]]  || die "STREAMFORGE_ORIGIN is required (e.g. https://stream.example.com)."
@@ -191,10 +201,50 @@ if [[ "${CONFIGURE_FIREWALL}" == "1" ]] && command -v ufw >/dev/null && ufw stat
   ufw --force reload >/dev/null || true
 fi
 
+if [[ -n "${MANAGEMENT_URL}" ]]; then
+  log "Installing cluster heartbeat (node ${EDGE_NODE}, role ${ROLE})"
+  install -m 0755 "$(dirname "$0")/streamforge-node-heartbeat.sh" \
+    /usr/local/bin/streamforge-node-heartbeat
+  cat > /etc/systemd/system/streamforge-node-heartbeat.service <<EOF
+[Unit]
+Description=StreamForge cluster heartbeat
+After=network-online.target varnish.service
+
+[Service]
+Type=oneshot
+Environment=STREAMFORGE_MANAGEMENT_URL=${MANAGEMENT_URL}
+Environment=STREAMFORGE_NODE_ID=${EDGE_NODE}
+Environment=STREAMFORGE_NODE_ROLE=${ROLE}
+Environment=STREAMFORGE_NODE_REGION=${NODE_REGION}
+Environment=STREAMFORGE_NODE_ADDRESS=$([[ -n "${DOMAIN}" ]] && echo "${DOMAIN}" || echo "${EDGE_NODE}")
+Environment=STREAMFORGE_NODE_CAPACITY=${NODE_CAPACITY}
+ExecStart=/usr/local/bin/streamforge-node-heartbeat
+EOF
+  # Every 10 s, comfortably inside the origin's 30 s heartbeat window, so one
+  # missed run never marks this node unhealthy.
+  cat > /etc/systemd/system/streamforge-node-heartbeat.timer <<EOF
+[Unit]
+Description=StreamForge cluster heartbeat timer
+
+[Timer]
+OnBootSec=15s
+OnUnitActiveSec=10s
+AccuracySec=1s
+
+[Install]
+WantedBy=timers.target
+EOF
+else
+  log "Cluster heartbeat disabled (STREAMFORGE_MANAGEMENT_URL empty)"
+fi
+
 log "Starting services"
 systemctl daemon-reload
 systemctl enable --now caddy >/dev/null
 systemctl restart varnish
+if [[ -n "${MANAGEMENT_URL}" ]]; then
+  systemctl enable --now streamforge-node-heartbeat.timer >/dev/null
+fi
 systemctl --quiet is-active varnish || die "varnish failed to start -- check: journalctl -u varnish -n 50"
 
 log "Verifying delivery path to the origin"
@@ -216,6 +266,7 @@ $(printf '\033[1;32m[edge] %s node ready\033[0m' "${ROLE}")
   Fetches from   : ${UPSTREAM_BARE}
   Viewer entry   : $([[ -n "${DOMAIN}" ]] && echo "https://${DOMAIN}" || echo "http://<this-host-ip>  (no domain set)")
   Cache store    : ${CACHE_SIZE} (malloc)
+  Cluster        : $([[ -n "${MANAGEMENT_URL}" ]] && echo "heartbeating to ${MANAGEMENT_URL} as ${EDGE_NODE}" || echo "not registered (no STREAMFORGE_MANAGEMENT_URL)")
   HLS link shape : <viewer-entry>/hls/<app>/<stream>/index.m3u8
 
 Next:

@@ -1,4 +1,7 @@
+#include <unistd.h>
+
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <csignal>
 #include <cstdio>
@@ -6,6 +9,7 @@
 #include <limits>
 #include <memory>
 #include <sstream>
+#include <stop_token>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -13,6 +17,7 @@
 #include <vector>
 
 #include "rtmp_server/authentication/rtmp_authenticator.hpp"
+#include "rtmp_server/cluster/node_registry.hpp"
 #include "rtmp_server/dash/stream_sink.hpp"
 #include "rtmp_server/control/edge_viewer_stats.hpp"
 #include "rtmp_server/control/async_http_server.hpp"
@@ -32,8 +37,12 @@
 #include "rtmp_server/persistence/sqlite_store.hpp"
 #include "rtmp_server/protocol/commands/stream_ids.hpp"
 #include "rtmp_server/protocol/commands/stream_registry.hpp"
+#include "rtmp_server/relay/backup_publisher.hpp"
+#include "rtmp_server/relay/stream_target.hpp"
+#include "rtmp_server/relay/stream_target_manager.hpp"
 #include "rtmp_server/transcoding/preset.hpp"
 #ifdef RTMP_NATIVE_TRANSCODE
+#include "rtmp_server/transcoding/native/ingest_transcoder.hpp"
 #include "rtmp_server/transcoding/native/source_job_manager.hpp"
 #endif
 
@@ -62,6 +71,50 @@ void install_signal_handlers() {
     ::signal(SIGPIPE, SIG_IGN);
 }
 
+// Fans one publisher's media out to several packaging sinks. The publish path
+// hands a stream exactly one RecorderSink, and a stream can now need more than
+// one: passthrough HLS, optionally DASH, and -- when a transcoding assignment
+// covers it -- a re-encoded rendition ladder.
+class FanOutSink final : public rtmp_server::protocol::commands::RecorderSink {
+public:
+    using Sink = rtmp_server::protocol::commands::RecorderSink;
+
+    explicit FanOutSink(std::vector<std::shared_ptr<Sink>> sinks) : sinks_(std::move(sinks)) {}
+
+    void on_metadata(const rtmp_server::protocol::chunk::RtmpMessage& message) override {
+        for (auto& sink : sinks_) sink->on_metadata(message);
+    }
+    void on_audio(const rtmp_server::protocol::chunk::RtmpMessage& message) override {
+        for (auto& sink : sinks_) sink->on_audio(message);
+    }
+    void on_video(const rtmp_server::protocol::chunk::RtmpMessage& message) override {
+        for (auto& sink : sinks_) sink->on_video(message);
+    }
+    void finalize() override {
+        for (auto& sink : sinks_) sink->finalize();
+    }
+
+private:
+    std::vector<std::shared_ptr<Sink>> sinks_;
+};
+
+// Cluster identity comes from the environment rather than server.yaml: the
+// installer already writes systemd environment for a node, edges are not
+// running this binary at all (they heartbeat from a shell timer, see
+// deploy/edge/), and an id that differs per machine does not belong in a file
+// that is copied between them.
+std::string environment_or(const char* name, std::string fallback) {
+    const char* value = std::getenv(name);
+    if (value == nullptr || *value == '\0') return fallback;
+    return std::string(value);
+}
+
+std::string local_hostname() {
+    std::array<char, 256> buffer{};
+    if (::gethostname(buffer.data(), buffer.size() - 1) != 0) return "origin";
+    return std::string(buffer.data());
+}
+
 std::string json_escape(std::string_view value) {
     std::string result;
     result.reserve(value.size() + 8);
@@ -76,6 +129,44 @@ std::string json_escape(std::string_view value) {
         }
     }
     return result;
+}
+
+std::string cluster_node_json(const rtmp_server::cluster::NodeStatus& node) {
+    std::ostringstream os;
+    os << R"({"id":")" << json_escape(node.id) << R"(","role":")"
+       << json_escape(rtmp_server::cluster::to_string(node.role)) << R"(","address":")"
+       << json_escape(node.address) << R"(","region":")" << json_escape(node.region)
+       << R"(","healthy":)" << (node.healthy ? "true" : "false") << R"(,"draining":)"
+       << (node.draining ? "true" : "false") << R"(,"seconds_since_seen":)"
+       << node.seconds_since_seen << R"(,"capacity_viewers":)" << node.capacity_viewers
+       << R"(,"active_viewers":)" << node.active_viewers << R"(,"active_publishers":)"
+       << node.active_publishers << R"(,"load":)" << node.load << '}';
+    return os.str();
+}
+
+std::string stream_target_json(const rtmp_server::relay::StreamTargetStatus& target) {
+    const auto state = [&] {
+        switch (target.state) {
+            case rtmp_server::relay::StreamTargetState::Connecting: return "connecting";
+            case rtmp_server::relay::StreamTargetState::Publishing: return "publishing";
+            case rtmp_server::relay::StreamTargetState::Error: return "error";
+            case rtmp_server::relay::StreamTargetState::Stopped: return "stopped";
+        }
+        return "stopped";
+    }();
+    std::ostringstream os;
+    // `url` is deliberately the redacted form: the stored URL ends in the
+    // destination's stream key, which this API must never hand back out.
+    os << R"({"id":")" << json_escape(target.application + ":" + target.stream + ":" + target.name)
+       << R"(","application":")" << json_escape(target.application) << R"(","stream":")"
+       << json_escape(target.stream) << R"(","name":")" << json_escape(target.name)
+       << R"(","url":")" << json_escape(target.url_redacted) << R"(","relay":)"
+       << (target.relay ? "true" : "false") << R"(,"enabled":)"
+       << (target.enabled ? "true" : "false") << R"(,"state":")" << state << R"(","detail":")"
+       << json_escape(target.detail) << R"(","bytes_sent":)" << target.bytes_sent
+       << R"(,"frames_dropped":)" << target.frames_dropped << R"(,"reconnects":)"
+       << target.reconnects << '}';
+    return os.str();
 }
 
 } // namespace
@@ -247,8 +338,65 @@ int main(int argc, char** argv) {
             return true;
         });
 
+    // Cluster membership. Edges, shields and transcoder nodes run no database
+    // of their own, so they announce themselves to this origin by heartbeat;
+    // the table is what /v1/cluster/locate places viewers from.
+    rtmp_server::cluster::NodeRegistry node_registry(store.get(), {});
+    node_registry.load_from_store();
+
+    // Outbound RTMP: pushing this server's publishes to another origin (the
+    // relay/repeater, which is how ingest scales past this box) or to an
+    // external ingest (stream targets).
+    rtmp_server::relay::StreamTargetManager stream_targets(store.get(), {});
+    stream_targets.load_from_store();
+
+#ifdef RTMP_NATIVE_TRANSCODE
+    // Transcoding of streams published *to* this origin. A stream with a
+    // transcoding assignment keeps its untranscoded /hls/<app>/<stream>/
+    // index.m3u8 exactly as before and additionally gets a re-encoded ladder,
+    // one HLS stream per rung, advertised together from
+    // /hls/<app>/<stream>/master.m3u8. Streams without an assignment -- the
+    // common case -- are untouched: create_sink returns nullptr and the
+    // publish path is byte-for-byte the passthrough one.
+    rtmp_server::transcoding::native::IngestTranscodeManager::Hooks ingest_hooks;
+    ingest_hooks.set_renditions = [&hls_handler](const std::string& application,
+                                                 const std::string& master,
+                                                 std::vector<rtmp_server::hls::Rendition> renditions) {
+        hls_handler.set_renditions(application, master, std::move(renditions));
+    };
+    ingest_hooks.register_output = [&hls_handler](const std::string& application,
+                                                  const std::string& stream,
+                                                  std::shared_ptr<rtmp_server::hls::SegmentStore> store) {
+        hls_handler.register_stream(application, stream, std::move(store));
+    };
+    ingest_hooks.unregister_output = [&hls_handler](const std::string& application,
+                                                    const std::string& stream) {
+        hls_handler.unregister_stream(application, stream);
+    };
+    rtmp_server::transcoding::native::IngestTranscodeOptions ingest_options;
+    // Same segment shape as the passthrough sink below, so both surfaces of
+    // one publish advertise the same window depth and target duration.
+    ingest_options.target_duration_seconds = 6;
+    ingest_options.live_window_segments = 10;
+    ingest_options.retention_grace_segments = 6;
+    ingest_options.max_total_bytes_per_rendition = 256u * 1024u * 1024u;
+    ingest_options.segment_target_duration = std::chrono::seconds(6);
+    ingest_options.max_segment_duration = std::chrono::seconds(12);
+    if (config.hls_low_latency) {
+        ingest_options.part_target_duration = config.hls_part_target_duration;
+    }
+    ingest_options.transcode_cpu_reservation_percent = config.transcode_cpu_reservation_percent;
+    rtmp_server::transcoding::native::IngestTranscodeManager ingest_transcoder(
+        std::move(ingest_hooks), store.get(), ingest_options);
+    ingest_transcoder.load_from_store();
+#endif
+
     services.recorder_factory =
-        [&hls_handler, &dash_handler, &config](std::string_view application,
+        [&hls_handler, &dash_handler, &config, &stream_targets
+#ifdef RTMP_NATIVE_TRANSCODE
+         , &ingest_transcoder
+#endif
+        ](std::string_view application,
                        std::string_view stream) -> std::shared_ptr<rtmp_server::protocol::commands::RecorderSink> {
             rtmp_server::hls::SegmentStoreConfig store_config;
             // A deeper live window (10 x 6 s = 60 s) gives players a large
@@ -298,7 +446,27 @@ int main(int argc, char** argv) {
             hls_handler.register_stream(std::string(application), std::string(stream), store);
             auto hls_sink = std::make_shared<rtmp_server::hls::StreamSink>(std::move(store),
                                                                           std::move(segmenter_config));
-            if (!config.dash_enabled) return hls_sink;
+
+            // The transcoded ladder, when an assignment covers this stream.
+            // Null for every unassigned publish, which is the common case and
+            // keeps that path exactly as it was.
+            std::shared_ptr<rtmp_server::protocol::commands::RecorderSink> transcode_sink;
+#ifdef RTMP_NATIVE_TRANSCODE
+            transcode_sink = ingest_transcoder.create_sink(application, stream);
+#endif
+            // Outbound pushes (relay origins, CDN/social ingests), likewise
+            // null unless this stream has enabled targets.
+            auto target_sink = stream_targets.create_sink(application, stream);
+
+            std::vector<std::shared_ptr<rtmp_server::protocol::commands::RecorderSink>> extra;
+            if (transcode_sink) extra.push_back(std::move(transcode_sink));
+            if (target_sink) extra.push_back(std::move(target_sink));
+
+            if (!config.dash_enabled) {
+                if (extra.empty()) return hls_sink;
+                extra.insert(extra.begin(), std::move(hls_sink));
+                return std::make_shared<FanOutSink>(std::move(extra));
+            }
 
             // Same 6 s cadence as the HLS store, so both delivery surfaces
             // advertise the same live window depth for one publisher.
@@ -395,8 +563,29 @@ int main(int argc, char** argv) {
             combined->application = app_str;
             combined->stream = stream_str;
             combined->representation_id = stream_str;
-            return combined;
+            if (extra.empty()) return combined;
+            extra.insert(extra.begin(), std::move(combined));
+            return std::make_shared<FanOutSink>(std::move(extra));
         };
+
+    // Backup publisher failover: when a stream's primary publisher has been
+    // absent past its configured grace period, a designated backup RTMP
+    // source is played and fed into the same packaging path a real publish
+    // uses -- reusing recorder_factory itself (copied here, before it is
+    // moved into WorkerPool below) means a failover produces the identical
+    // HLS/DASH/transcode/target fan-out, with no separate code path to keep
+    // in sync.
+    const auto backup_publisher_sink_factory = services.recorder_factory;
+    rtmp_server::relay::BackupPublisherManager backup_publishers(
+        store.get(),
+        [&stream_registry](std::string_view application, std::string_view stream) {
+            const auto registrations = stream_registry.snapshot();
+            return std::ranges::any_of(registrations, [&](const auto& registration) {
+                return registration.app == application && registration.stream_key == stream;
+            });
+        },
+        backup_publisher_sink_factory);
+    backup_publishers.load_from_store();
 
     services.viewer_attached_handler =
         [&authenticator](std::string_view application, std::string_view stream_name) {
@@ -438,9 +627,20 @@ int main(int argc, char** argv) {
             return rtmp_server::control::apply_settings_updates(config_path, updates);
         });
     management_api.set_stream_deleted_handler(
-        [&hls_handler, &dash_handler](std::string_view application, std::string_view stream) {
+        [&hls_handler, &dash_handler, &stream_targets
+#ifdef RTMP_NATIVE_TRANSCODE
+         , &ingest_transcoder
+#endif
+        ](std::string_view application, std::string_view stream) {
             hls_handler.unregister_stream(std::string(application), std::string(stream));
             dash_handler.unregister_stream(std::string(application), std::string(stream));
+#ifdef RTMP_NATIVE_TRANSCODE
+            // A deleted stream's transcoded rungs are derived from it and must
+            // not outlive it; the assignment itself is left alone, so
+            // recreating the stream brings its ladder back.
+            ingest_transcoder.release(application, stream);
+#endif
+            stream_targets.release(application, stream);
         });
     // Real per-link viewer counting. The origin only ever sees the requests
     // Varnish could not answer from cache -- roughly one per second per link
@@ -516,6 +716,218 @@ int main(int argc, char** argv) {
         metrics.set_gauge("hls_egress_bytes_total", static_cast<std::int64_t>(edge.total_bytes));
         metrics.set_gauge("hls_egress_bitrate", static_cast<std::int64_t>(edge.total_bitrate_bps));
     });
+
+    // Cluster: membership, heartbeats and viewer placement.
+    management_api.set_cluster_handlers(
+        [&node_registry]() -> rtmp_server::core::Result<std::string> {
+            const auto now = static_cast<std::int64_t>(std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count());
+            std::ostringstream os;
+            os << R"({"items":[)";
+            const auto nodes = node_registry.list(now);
+            for (std::size_t i = 0; i < nodes.size(); ++i) {
+                if (i) os << ',';
+                os << cluster_node_json(nodes[i]);
+            }
+            os << "]}";
+            return os.str();
+        },
+        [&node_registry](const std::unordered_map<std::string, std::string>& fields)
+            -> rtmp_server::core::Result<std::string> {
+            const auto field = [&fields](const char* key) -> std::string {
+                const auto it = fields.find(key);
+                return it == fields.end() ? std::string{} : it->second;
+            };
+            const auto number = [&field](const char* key) -> std::uint32_t {
+                const auto text = field(key);
+                if (text.empty()) return 0;
+                errno = 0;
+                const auto value = std::strtoull(text.c_str(), nullptr, 10);
+                if (errno != 0 || value > std::numeric_limits<std::uint32_t>::max()) return 0;
+                return static_cast<std::uint32_t>(value);
+            };
+            const auto role = rtmp_server::cluster::parse_node_role(field("role"));
+            if (!role) {
+                return rtmp_server::core::Error(
+                    rtmp_server::core::ErrorCode::InvalidConfiguration,
+                    rtmp_server::core::ErrorCategory::Configuration,
+                    "role must be origin, edge, shield or transcoder");
+            }
+            rtmp_server::cluster::NodeHeartbeat beat;
+            beat.id = field("id");
+            beat.role = *role;
+            beat.address = field("address");
+            beat.region = field("region");
+            beat.capacity_viewers = number("capacity_viewers");
+            beat.active_viewers = number("active_viewers");
+            beat.active_publishers = number("active_publishers");
+            beat.draining = field("draining") == "true" || field("draining") == "1";
+            const auto now = static_cast<std::int64_t>(std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count());
+            auto status = node_registry.heartbeat(beat, now);
+            if (!status) return status.error();
+            return cluster_node_json(status.value());
+        },
+        [&node_registry](std::string_view id) -> rtmp_server::core::Result<void> {
+            return node_registry.remove(id);
+        },
+        [&node_registry](std::string_view region) -> rtmp_server::core::Result<std::string> {
+            const auto now = static_cast<std::int64_t>(std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count());
+            const auto node = node_registry.locate(region, now);
+            if (!node) {
+                return rtmp_server::core::Error(rtmp_server::core::ErrorCode::NotFound,
+                                                rtmp_server::core::ErrorCategory::Configuration,
+                                                "no healthy node can take a new viewer");
+            }
+            return cluster_node_json(*node);
+        },
+        [&node_registry](std::string_view application, std::string_view stream,
+                         std::string_view region,
+                         std::string_view format) -> rtmp_server::core::Result<std::string> {
+            const auto now = static_cast<std::int64_t>(std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count());
+            const auto node = node_registry.locate(region, now);
+            if (!node) {
+                return rtmp_server::core::Error(rtmp_server::core::ErrorCode::NotFound,
+                                                rtmp_server::core::ErrorCategory::Configuration,
+                                                "no healthy node can take a new viewer");
+            }
+            // The address a node heartbeats with is a bare host (see
+            // STREAMFORGE_NODE_ADDRESS); the scheme is always https, matching
+            // every deployment's viewer-facing entry (Caddy terminates TLS on
+            // both an origin and an edge).
+            std::string base = node->address;
+            if (!base.starts_with("http://") && !base.starts_with("https://")) {
+                base = "https://" + base;
+            }
+            if (format == "dash") {
+                return base + "/dash/" + std::string(application) + "/" + std::string(stream) +
+                       "/manifest.mpd";
+            }
+            return base + "/hls/" + std::string(application) + "/" + std::string(stream) +
+                   "/index.m3u8";
+        },
+        [&node_registry]() -> rtmp_server::core::Result<std::string> {
+            const auto now = static_cast<std::int64_t>(std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count());
+            const auto snapshot = node_registry.capacity(now);
+            std::ostringstream os;
+            os << R"({"healthy_edges":)" << snapshot.healthy_edges << R"(,"capacity_viewers":)"
+               << snapshot.capacity_viewers << R"(,"active_viewers":)" << snapshot.active_viewers
+               << R"(,"utilization":)" << snapshot.utilization << R"(,"scale_out_recommended":)"
+               << (snapshot.scale_out_recommended ? "true" : "false") << '}';
+            return os.str();
+        });
+
+    // Stream targets: relay to another origin, or push to an external ingest.
+    management_api.set_stream_target_handlers(
+        [&stream_targets](std::string_view application) -> rtmp_server::core::Result<std::string> {
+            std::ostringstream os;
+            os << R"({"items":[)";
+            const auto targets = stream_targets.list(application);
+            for (std::size_t i = 0; i < targets.size(); ++i) {
+                if (i) os << ',';
+                os << stream_target_json(targets[i]);
+            }
+            os << "]}";
+            return os.str();
+        },
+        [&stream_targets](std::string_view application, std::string_view stream,
+                          std::string_view name,
+                          const std::unordered_map<std::string, std::string>& fields)
+            -> rtmp_server::core::Result<std::string> {
+            const auto field = [&fields](const char* key) -> std::string {
+                const auto it = fields.find(key);
+                return it == fields.end() ? std::string{} : it->second;
+            };
+            rtmp_server::relay::StreamTargetConfig config;
+            config.application = std::string(application);
+            config.stream = std::string(stream);
+            config.name = std::string(name);
+            config.url = field("url");
+            config.relay = field("relay") == "true" || field("relay") == "1";
+            // Absent means enabled: a target is created to be used, and the
+            // PATCH route exists for turning one off.
+            config.enabled = field("enabled") != "false" && field("enabled") != "0";
+            auto status = stream_targets.upsert(config);
+            if (!status) return status.error();
+            return stream_target_json(status.value());
+        },
+        [&stream_targets](std::string_view application, std::string_view stream,
+                          std::string_view name) -> rtmp_server::core::Result<void> {
+            return stream_targets.remove(application, stream, name);
+        },
+        [&stream_targets](std::string_view application, std::string_view stream,
+                          std::string_view name, bool enabled) -> rtmp_server::core::Result<std::string> {
+            auto status = stream_targets.set_enabled(application, stream, name, enabled);
+            if (!status) return status.error();
+            return stream_target_json(status.value());
+        });
+
+    const auto backup_publisher_json = [](const rtmp_server::relay::BackupPublisherStatus& target) {
+        const auto state = [&] {
+            switch (target.state) {
+                case rtmp_server::relay::BackupPublisherState::Standby: return "standby";
+                case rtmp_server::relay::BackupPublisherState::Connecting: return "connecting";
+                case rtmp_server::relay::BackupPublisherState::Active: return "active";
+                case rtmp_server::relay::BackupPublisherState::Error: return "error";
+                case rtmp_server::relay::BackupPublisherState::Disabled: return "disabled";
+            }
+            return "standby";
+        }();
+        std::ostringstream os;
+        os << R"({"id":")" << json_escape(target.application + ":" + target.stream)
+           << R"(","application":")" << json_escape(target.application) << R"(","stream":")"
+           << json_escape(target.stream) << R"(","url":")" << json_escape(target.url_redacted)
+           << R"(","enabled":)" << (target.enabled ? "true" : "false") << R"(,"state":")" << state
+           << R"(","detail":")" << json_escape(target.detail) << R"(","activations":)"
+           << target.activations << R"(,"bytes_in":)" << target.bytes_in << '}';
+        return os.str();
+    };
+    management_api.set_backup_publisher_handlers(
+        [&backup_publishers, backup_publisher_json](std::string_view application)
+            -> rtmp_server::core::Result<std::string> {
+            std::ostringstream os;
+            os << R"({"items":[)";
+            const auto items = backup_publishers.list(application);
+            for (std::size_t i = 0; i < items.size(); ++i) {
+                if (i) os << ',';
+                os << backup_publisher_json(items[i]);
+            }
+            os << "]}";
+            return os.str();
+        },
+        [&backup_publishers, backup_publisher_json](
+            std::string_view application, std::string_view stream,
+            const std::unordered_map<std::string, std::string>& fields)
+            -> rtmp_server::core::Result<std::string> {
+            const auto field = [&fields](const char* key) -> std::string {
+                const auto it = fields.find(key);
+                return it == fields.end() ? std::string{} : it->second;
+            };
+            rtmp_server::relay::BackupPublisherConfig config;
+            config.application = std::string(application);
+            config.stream = std::string(stream);
+            config.backup_url = field("backup_url");
+            config.enabled = field("enabled") != "false" && field("enabled") != "0";
+            const auto failover_after = field("failover_after_seconds");
+            if (!failover_after.empty()) {
+                errno = 0;
+                const auto value = std::strtoull(failover_after.c_str(), nullptr, 10);
+                if (errno == 0 && value > 0 &&
+                    value <= std::numeric_limits<std::uint32_t>::max()) {
+                    config.failover_after_seconds = static_cast<std::uint32_t>(value);
+                }
+            }
+            auto status = backup_publishers.upsert(config);
+            if (!status) return status.error();
+            return backup_publisher_json(status.value());
+        },
+        [&backup_publishers](std::string_view application,
+                             std::string_view stream) -> rtmp_server::core::Result<void> {
+            return backup_publishers.remove(application, stream);
+        });
 
 #ifdef RTMP_NATIVE_TRANSCODE
     // Source-transcode jobs: pull an external URL (rtmp:// or an http(s)
@@ -632,6 +1044,52 @@ int main(int argc, char** argv) {
             os << "]}";
             return os.str();
         };
+
+    // Transcoding assignments: which published streams get a re-encoded
+    // rendition ladder. Persisted in the same table the panel already posts
+    // to; every route answered 503 before this wiring existed.
+    management_api.set_transcoding_assignment_handlers(
+        [&ingest_transcoder](std::string_view application) -> rtmp_server::core::Result<std::string> {
+            std::ostringstream os;
+            os << R"({"items":[)";
+            const auto assignments = ingest_transcoder.list(application);
+            for (std::size_t i = 0; i < assignments.size(); ++i) {
+                const auto& assignment = assignments[i];
+                if (i) os << ',';
+                os << R"({"id":")" << json_escape(assignment.application + ":" + assignment.source_stream)
+                   << R"(","application":")" << json_escape(assignment.application)
+                   << R"(","source_stream":")" << json_escape(assignment.source_stream)
+                   << R"(","template_name":")" << json_escape(assignment.template_name)
+                   << R"(","master_hls_path":")" << json_escape(assignment.master_hls_path)
+                   << R"(","active":)" << (assignment.active ? "true" : "false")
+                   << R"(,"frames_in":)" << assignment.status.frames_in
+                   << R"(,"frames_dropped":)" << assignment.status.queue.dropped
+                   << R"(,"resyncs":)" << assignment.status.queue.resyncs
+                   << R"(,"detail":")" << json_escape(assignment.status.detail)
+                   << R"(","outputs":[)";
+                for (std::size_t j = 0; j < assignment.renditions.size(); ++j) {
+                    const auto& rendition = assignment.renditions[j];
+                    if (j) os << ',';
+                    os << R"({"name":")" << json_escape(rendition.name) << R"(","stream":")"
+                       << json_escape(rendition.output_stream)
+                       << R"(","video_codec":"h264","video_bitrate":)" << rendition.video_bitrate
+                       << R"(,"audio_bitrate":)" << rendition.audio_bitrate << R"(,"width":)"
+                       << rendition.width << R"(,"height":)" << rendition.height << '}';
+                }
+                os << "]}";
+            }
+            os << "]}";
+            return os.str();
+        },
+        [&ingest_transcoder](std::string_view application, std::string_view source_stream,
+                             std::string_view template_name,
+                             std::string_view rules) -> rtmp_server::core::Result<std::string> {
+            return ingest_transcoder.upsert(application, source_stream, template_name, rules);
+        },
+        [&ingest_transcoder](std::string_view application,
+                             std::string_view source_stream) -> rtmp_server::core::Result<void> {
+            return ingest_transcoder.remove(application, source_stream);
+        });
 
     management_api.set_source_job_handlers(
         [&source_job_manager, source_job_json](std::string_view application)
@@ -769,6 +1227,45 @@ int main(int argc, char** argv) {
     // handshake automatically (IoUringEventLoop::start_handshake, wired from
     // handle_accept_completion in src/io/io_uring/event_loop.cpp) before any
     // higher-level RTMP processing begins — see docs/rtmp-handshake.md.
+    // This origin's own heartbeat. It is a cluster member like any other: a
+    // deployment with no edges still needs /v1/cluster/locate to answer, and
+    // the panel needs to see the origin's own publisher count next to its
+    // edges'. Identity comes from the environment (see environment_or) so one
+    // server.yaml can be copied across machines.
+    const std::string node_id =
+        environment_or("STREAMFORGE_NODE_ID", "origin-" + local_hostname());
+    const std::string node_region = environment_or("STREAMFORGE_NODE_REGION", "");
+    const std::string node_address =
+        environment_or("STREAMFORGE_NODE_ADDRESS", config.public_rtmp_hostname);
+    std::jthread origin_heartbeat([&](const std::stop_token& stop) {
+        while (!stop.stop_requested()) {
+            rtmp_server::cluster::NodeHeartbeat beat;
+            beat.id = node_id;
+            beat.role = rtmp_server::cluster::NodeRole::Origin;
+            beat.address = node_address;
+            beat.region = node_region;
+            beat.active_publishers = static_cast<std::uint32_t>(stream_registry.snapshot().size());
+            const auto edge = edge_viewers.snapshot();
+            // Only the cache tier can count HLS viewers (the origin sees ~1
+            // request per second per link however large the audience), so an
+            // origin with no edge accounting reports zero rather than a number
+            // that means something else.
+            if (edge.fresh) beat.active_viewers = static_cast<std::uint32_t>(edge.total_viewers);
+            const auto now = static_cast<std::int64_t>(std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count());
+            if (auto beaten = node_registry.heartbeat(beat, now); !beaten) {
+                RTMP_LOG(rtmp_server::observability::LogLevel::Warn, "cluster",
+                         "origin heartbeat failed", {{"error", beaten.error().message()}});
+            }
+            // Well inside NodeRegistryOptions::heartbeat_timeout (30 s), so a
+            // single slow tick never marks this origin unhealthy. Slept in
+            // short slices so shutdown does not wait out an interval.
+            for (int i = 0; i < 20 && !stop.stop_requested(); ++i) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            }
+        }
+    });
+
     g_pool = &pool;
     install_signal_handlers();
 

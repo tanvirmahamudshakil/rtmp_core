@@ -38,6 +38,34 @@ CREATE TABLE IF NOT EXISTS transcoding_assignments (
     rules TEXT NOT NULL,
     PRIMARY KEY (application, source_stream)
 );
+CREATE TABLE IF NOT EXISTS stream_targets (
+    application TEXT NOT NULL,
+    stream TEXT NOT NULL,
+    name TEXT NOT NULL,
+    url TEXT NOT NULL,
+    enabled INTEGER NOT NULL,
+    relay INTEGER NOT NULL,
+    PRIMARY KEY (application, stream, name)
+);
+CREATE TABLE IF NOT EXISTS backup_publishers (
+    application TEXT NOT NULL,
+    stream TEXT NOT NULL,
+    backup_url TEXT NOT NULL,
+    enabled INTEGER NOT NULL,
+    failover_after_seconds INTEGER NOT NULL,
+    PRIMARY KEY (application, stream)
+);
+CREATE TABLE IF NOT EXISTS cluster_nodes (
+    id TEXT PRIMARY KEY,
+    role TEXT NOT NULL,
+    address TEXT NOT NULL,
+    region TEXT NOT NULL,
+    last_seen_unix INTEGER NOT NULL,
+    capacity_viewers INTEGER NOT NULL,
+    active_viewers INTEGER NOT NULL,
+    active_publishers INTEGER NOT NULL,
+    draining INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS templates (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
@@ -196,6 +224,166 @@ Result<std::vector<StreamRow>> SqliteStore::load_streams() {
     }
     if (rc != SQLITE_DONE) return sqlite_error(db_, "step load_streams");
     return out;
+}
+
+Result<void> SqliteStore::upsert_stream_target(const StreamTargetRow& row) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    Statement stmt(db_, "INSERT INTO stream_targets "
+                        "(application, stream, name, url, enabled, relay) VALUES (?, ?, ?, ?, ?, ?) "
+                        "ON CONFLICT(application, stream, name) DO UPDATE SET "
+                        "url = excluded.url, enabled = excluded.enabled, relay = excluded.relay");
+    if (!stmt.valid()) return sqlite_error(db_, "prepare upsert_stream_target");
+    sqlite3_bind_text(stmt.get(), 1, row.application.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 2, row.stream.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 3, row.name.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 4, row.url.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(stmt.get(), 5, row.enabled ? 1 : 0);
+    sqlite3_bind_int(stmt.get(), 6, row.relay ? 1 : 0);
+    if (sqlite3_step(stmt.get()) != SQLITE_DONE) return sqlite_error(db_, "step upsert_stream_target");
+    return {};
+}
+
+Result<void> SqliteStore::delete_stream_target(std::string_view application,
+                                                std::string_view stream, std::string_view name) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    Statement stmt(db_, "DELETE FROM stream_targets "
+                        "WHERE application = ? AND stream = ? AND name = ?");
+    if (!stmt.valid()) return sqlite_error(db_, "prepare delete_stream_target");
+    sqlite3_bind_text(stmt.get(), 1, application.data(), static_cast<int>(application.size()), SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 2, stream.data(), static_cast<int>(stream.size()), SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 3, name.data(), static_cast<int>(name.size()), SQLITE_TRANSIENT);
+    if (sqlite3_step(stmt.get()) != SQLITE_DONE) return sqlite_error(db_, "step delete_stream_target");
+    return {};
+}
+
+Result<std::vector<StreamTargetRow>> SqliteStore::load_stream_targets() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    Statement stmt(db_, "SELECT application, stream, name, url, enabled, relay "
+                        "FROM stream_targets ORDER BY application, stream, name");
+    if (!stmt.valid()) return sqlite_error(db_, "prepare load_stream_targets");
+    std::vector<StreamTargetRow> rows;
+    int rc = SQLITE_OK;
+    while ((rc = sqlite3_step(stmt.get())) == SQLITE_ROW) {
+        StreamTargetRow row;
+        row.application = reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 0));
+        row.stream = reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 1));
+        row.name = reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 2));
+        row.url = reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 3));
+        row.enabled = sqlite3_column_int(stmt.get(), 4) != 0;
+        row.relay = sqlite3_column_int(stmt.get(), 5) != 0;
+        rows.push_back(std::move(row));
+    }
+    if (rc != SQLITE_DONE) return sqlite_error(db_, "step load_stream_targets");
+    return rows;
+}
+
+Result<void> SqliteStore::upsert_backup_publisher(const BackupPublisherRow& row) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    Statement stmt(db_, "INSERT INTO backup_publishers "
+                        "(application, stream, backup_url, enabled, failover_after_seconds) "
+                        "VALUES (?, ?, ?, ?, ?) "
+                        "ON CONFLICT(application, stream) DO UPDATE SET "
+                        "backup_url = excluded.backup_url, enabled = excluded.enabled, "
+                        "failover_after_seconds = excluded.failover_after_seconds");
+    if (!stmt.valid()) return sqlite_error(db_, "prepare upsert_backup_publisher");
+    sqlite3_bind_text(stmt.get(), 1, row.application.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 2, row.stream.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 3, row.backup_url.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(stmt.get(), 4, row.enabled ? 1 : 0);
+    sqlite3_bind_int64(stmt.get(), 5, static_cast<sqlite3_int64>(row.failover_after_seconds));
+    if (sqlite3_step(stmt.get()) != SQLITE_DONE) return sqlite_error(db_, "step upsert_backup_publisher");
+    return {};
+}
+
+Result<void> SqliteStore::delete_backup_publisher(std::string_view application,
+                                                   std::string_view stream) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    Statement stmt(db_, "DELETE FROM backup_publishers WHERE application = ? AND stream = ?");
+    if (!stmt.valid()) return sqlite_error(db_, "prepare delete_backup_publisher");
+    sqlite3_bind_text(stmt.get(), 1, application.data(), static_cast<int>(application.size()), SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 2, stream.data(), static_cast<int>(stream.size()), SQLITE_TRANSIENT);
+    if (sqlite3_step(stmt.get()) != SQLITE_DONE) return sqlite_error(db_, "step delete_backup_publisher");
+    return {};
+}
+
+Result<std::vector<BackupPublisherRow>> SqliteStore::load_backup_publishers() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    Statement stmt(db_, "SELECT application, stream, backup_url, enabled, failover_after_seconds "
+                        "FROM backup_publishers ORDER BY application, stream");
+    if (!stmt.valid()) return sqlite_error(db_, "prepare load_backup_publishers");
+    std::vector<BackupPublisherRow> rows;
+    int rc = SQLITE_OK;
+    while ((rc = sqlite3_step(stmt.get())) == SQLITE_ROW) {
+        BackupPublisherRow row;
+        row.application = reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 0));
+        row.stream = reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 1));
+        row.backup_url = reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 2));
+        row.enabled = sqlite3_column_int(stmt.get(), 3) != 0;
+        row.failover_after_seconds = static_cast<std::uint32_t>(sqlite3_column_int64(stmt.get(), 4));
+        rows.push_back(std::move(row));
+    }
+    if (rc != SQLITE_DONE) return sqlite_error(db_, "step load_backup_publishers");
+    return rows;
+}
+
+Result<void> SqliteStore::upsert_cluster_node(const ClusterNodeRow& row) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    Statement stmt(db_, "INSERT INTO cluster_nodes "
+                        "(id, role, address, region, last_seen_unix, capacity_viewers, "
+                        "active_viewers, active_publishers, draining) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                        "ON CONFLICT(id) DO UPDATE SET role = excluded.role, "
+                        "address = excluded.address, region = excluded.region, "
+                        "last_seen_unix = excluded.last_seen_unix, "
+                        "capacity_viewers = excluded.capacity_viewers, "
+                        "active_viewers = excluded.active_viewers, "
+                        "active_publishers = excluded.active_publishers, "
+                        "draining = excluded.draining");
+    if (!stmt.valid()) return sqlite_error(db_, "prepare upsert_cluster_node");
+    sqlite3_bind_text(stmt.get(), 1, row.id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 2, row.role.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 3, row.address.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 4, row.region.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(stmt.get(), 5, row.last_seen_unix);
+    sqlite3_bind_int64(stmt.get(), 6, static_cast<sqlite3_int64>(row.capacity_viewers));
+    sqlite3_bind_int64(stmt.get(), 7, static_cast<sqlite3_int64>(row.active_viewers));
+    sqlite3_bind_int64(stmt.get(), 8, static_cast<sqlite3_int64>(row.active_publishers));
+    sqlite3_bind_int(stmt.get(), 9, row.draining ? 1 : 0);
+    if (sqlite3_step(stmt.get()) != SQLITE_DONE) return sqlite_error(db_, "step upsert_cluster_node");
+    return {};
+}
+
+Result<void> SqliteStore::delete_cluster_node(std::string_view id) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    Statement stmt(db_, "DELETE FROM cluster_nodes WHERE id = ?");
+    if (!stmt.valid()) return sqlite_error(db_, "prepare delete_cluster_node");
+    sqlite3_bind_text(stmt.get(), 1, id.data(), static_cast<int>(id.size()), SQLITE_TRANSIENT);
+    if (sqlite3_step(stmt.get()) != SQLITE_DONE) return sqlite_error(db_, "step delete_cluster_node");
+    return {};
+}
+
+Result<std::vector<ClusterNodeRow>> SqliteStore::load_cluster_nodes() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    Statement stmt(db_, "SELECT id, role, address, region, last_seen_unix, capacity_viewers, "
+                        "active_viewers, active_publishers, draining FROM cluster_nodes ORDER BY id");
+    if (!stmt.valid()) return sqlite_error(db_, "prepare load_cluster_nodes");
+    std::vector<ClusterNodeRow> rows;
+    int rc = SQLITE_OK;
+    while ((rc = sqlite3_step(stmt.get())) == SQLITE_ROW) {
+        ClusterNodeRow row;
+        row.id = reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 0));
+        row.role = reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 1));
+        row.address = reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 2));
+        row.region = reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 3));
+        row.last_seen_unix = sqlite3_column_int64(stmt.get(), 4);
+        row.capacity_viewers = static_cast<std::uint32_t>(sqlite3_column_int64(stmt.get(), 5));
+        row.active_viewers = static_cast<std::uint32_t>(sqlite3_column_int64(stmt.get(), 6));
+        row.active_publishers = static_cast<std::uint32_t>(sqlite3_column_int64(stmt.get(), 7));
+        row.draining = sqlite3_column_int(stmt.get(), 8) != 0;
+        rows.push_back(std::move(row));
+    }
+    if (rc != SQLITE_DONE) return sqlite_error(db_, "step load_cluster_nodes");
+    return rows;
 }
 
 Result<void> SqliteStore::upsert_transcoding_assignment(const TranscodingAssignmentRow& row) {

@@ -11,22 +11,19 @@
 
 #include "rtmp_server/core/result.hpp"
 #include "rtmp_server/protocol/chunk/chunk_decoder.hpp"
+#include "rtmp_server/protocol/rtmp_url.hpp"
 #include "rtmp_server/protocol/chunk/chunk_encoder.hpp"
 
 namespace rtmp_server::transcoding::native {
 
-// A parsed, plain-RTMP playback URL. Query parameters belong to the stream
-// name (the convention used by token-authenticated RTMP origins), while tc_url
-// identifies the application connection endpoint.
-struct RtmpSourceUrl {
-    std::string host;
-    std::uint16_t port = 1935;
-    std::string application;
-    std::string stream;
-    std::string tc_url;
-};
+// The source client speaks the same URL form every RTMP client here does;
+// the parser itself lives in the protocol layer so the relay/stream-target
+// publisher shares it rather than carrying a second copy.
+using RtmpSourceUrl = protocol::RtmpUrl;
 
-[[nodiscard]] core::Result<RtmpSourceUrl> parse_rtmp_source_url(std::string_view url);
+[[nodiscard]] inline core::Result<RtmpSourceUrl> parse_rtmp_source_url(std::string_view url) {
+    return protocol::parse_rtmp_url(url);
+}
 
 // Blocking, cancellation-aware RTMP playback client used only by a source-job
 // worker thread. It owns the complete client side of RTMP: DNS/TCP, simple

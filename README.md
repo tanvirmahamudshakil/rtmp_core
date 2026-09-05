@@ -233,15 +233,36 @@ fan-out, GOP cache, slow-viewer backpressure, multi-worker routing, SQLite
 control state, open management HTTP API, metrics, audit records, and the
 Linux deployment stack.
 
-Also implemented: FFmpeg-free source-transcode jobs — pull an external
+Also implemented: FFmpeg-free transcoding, in two shapes
+(`docs/native-transcoding.md`). Source-transcode jobs pull an external
 `rtmp://`/HLS/HTTP-TS URL, transcode it in-process into an H.264/AAC rendition
-ladder, and serve it as one adaptive master `.m3u8`
-(`docs/native-transcoding.md`).
+ladder, and serve it as one adaptive master `.m3u8`. Ingest transcoding does
+the same for a stream published *to* this origin: a per-stream transcoding
+assignment (`/v1/transcoding/assignments`) turns one publish into a rendition
+ladder served from `/hls/<app>/<stream>/master.m3u8`, while the untranscoded
+passthrough playlist and RTMP playback stay exactly as they were. There is no
+admin-panel page for assignments yet; the API is the interface.
 
-Not included: transcoding of streams published *to* this origin (the
-`/v1/transcoding/assignments` endpoints exist but are not wired into the
-server and answer `503`), WebRTC, SRT, clustering, multi-node state
-replication, or a CDN. HLS and recording components exist in the library but
+Also implemented: scale-out beyond one box (`docs/clustering.md`). A publish
+can be relayed over RTMP to a second origin, which then serves its own edge
+tier, and the same mechanism pushes a stream to an external ingest (YouTube,
+Facebook, a CDN) as a stream target. A stream can also name a backup RTMP
+source that takes over packaging — reusing the exact same HLS/DASH/transcode
+sink a real publish gets — when its primary publisher has been absent past a
+configured grace period, and stands down automatically once the primary
+returns. A cluster node registry tracks origins, edges, shields and
+transcoders by heartbeat; `/v1/cluster/locate` answers which node a new viewer
+should be sent to (region, then edge-over-origin, then least loaded), and
+`/v1/cluster/redirect` acts on that answer directly with an HTTP 302, turning
+placement into one-hop routing with no separate load balancer required for a
+small deployment. `/v1/cluster/capacity` reports aggregate edge utilisation
+and a scale-out recommendation for an external autoscaler to poll — this
+process only reports the signal, it does not provision anything itself.
+
+Not included: WebRTC, SRT, multi-node state replication, leader election or
+origin failover (lose the origin process and you lose the control plane —
+backup publisher failover covers a dead *source*, not a dead origin),
+automated provisioning, or a CDN. HLS and recording components exist in the library but
 their full production service composition is still separate from the main
 direct-RTMP deployment; the panel persists recording policy but the installer
 leaves global recording disabled.

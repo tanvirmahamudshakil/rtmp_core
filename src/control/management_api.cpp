@@ -2,6 +2,7 @@
 
 #include <charconv>
 #include <sstream>
+#include <tuple>
 
 #include "rtmp_server/core/hmac.hpp"
 #include "rtmp_server/observability/logger.hpp"
@@ -156,6 +157,18 @@ std::pair<std::string, std::string> split_stream_id(std::string_view id_raw) {
     return {id.substr(0, colon), id.substr(colon + 1)};
 }
 
+// A stream target is addressed by three names, so its id carries two
+// separators: "application:stream:target". Missing pieces come back empty and
+// are rejected by the handler, rather than silently addressing something else.
+std::tuple<std::string, std::string, std::string> split_target_id(std::string_view id_raw) {
+    std::string id = percent_decode(id_raw);
+    const auto first = id.find(':');
+    if (first == std::string::npos) return {id, "", ""};
+    const auto second = id.find(':', first + 1);
+    if (second == std::string::npos) return {id.substr(0, first), id.substr(first + 1), ""};
+    return {id.substr(0, first), id.substr(first + 1, second - first - 1), id.substr(second + 1)};
+}
+
 std::vector<std::string> split_path(std::string_view path) {
     std::vector<std::string> parts;
     std::size_t start = 0;
@@ -267,6 +280,50 @@ HttpResponse ManagementApi::route(const HttpRequest& request, const std::string&
     }
 
     auto parts = split_path(request.path);
+    if (parts.size() >= 2 && parts[0] == "v1" && parts[1] == "cluster") {
+        if (parts.size() == 3 && parts[2] == "nodes") {
+            if (request.method == "GET") return handle_list_cluster_nodes();
+            // A heartbeat is an upsert of the reporting node, so one route
+            // serves registration and every refresh after it.
+            if (request.method == "POST") return handle_cluster_heartbeat(request);
+        }
+        if (parts.size() == 4 && parts[2] == "nodes" && request.method == "DELETE") {
+            return handle_delete_cluster_node(percent_decode(parts[3]));
+        }
+        if (parts.size() == 3 && parts[2] == "locate" && request.method == "GET") {
+            return handle_cluster_locate(request);
+        }
+        if (parts.size() == 4 && parts[2] == "redirect" && request.method == "GET") {
+            auto [application, stream] = split_stream_id(parts[3]);
+            return handle_cluster_redirect(application, stream, request);
+        }
+        if (parts.size() == 3 && parts[2] == "capacity" && request.method == "GET") {
+            return handle_cluster_capacity();
+        }
+    }
+    if (parts.size() >= 2 && parts[0] == "v1" && parts[1] == "backup-publishers") {
+        if (parts.size() == 2 && request.method == "GET") return handle_list_backup_publishers(request);
+        if (parts.size() == 3) {
+            auto [application, stream] = split_stream_id(parts[2]);
+            if (request.method == "PUT") return handle_put_backup_publisher(application, stream, request);
+            if (request.method == "DELETE") return handle_delete_backup_publisher(application, stream);
+        }
+    }
+    if (parts.size() >= 2 && parts[0] == "v1" && parts[1] == "stream-targets") {
+        if (parts.size() == 2 && request.method == "GET") return handle_list_stream_targets(request);
+        if (parts.size() == 3) {
+            auto [application, stream, name] = split_target_id(parts[2]);
+            if (request.method == "PUT") {
+                return handle_put_stream_target(application, stream, name, request);
+            }
+            if (request.method == "PATCH") {
+                return handle_patch_stream_target(application, stream, name, request);
+            }
+            if (request.method == "DELETE") {
+                return handle_delete_stream_target(application, stream, name);
+            }
+        }
+    }
     if (parts.size() >= 3 && parts[0] == "v1" && parts[1] == "transcoding" &&
         parts[2] == "assignments") {
         if (parts.size() == 3 && request.method == "GET") {
@@ -368,6 +425,235 @@ HttpResponse ManagementApi::handle_update_settings(const HttpRequest& request) {
                                   error_body("validation_error", result.error().message(), ""));
     }
     return HttpResponse::json(200, std::move(result).value());
+}
+
+HttpResponse ManagementApi::handle_list_cluster_nodes() {
+    if (!cluster_nodes_provider_) {
+        return HttpResponse::json(503, R"({"error":"cluster_unavailable"})");
+    }
+    auto result = cluster_nodes_provider_();
+    if (!result) {
+        return HttpResponse::json(500, error_body("request_failed", result.error().message(), ""));
+    }
+    return HttpResponse::json(200, std::move(result).value());
+}
+
+HttpResponse ManagementApi::handle_cluster_heartbeat(const HttpRequest& request) {
+    if (!cluster_heartbeat_handler_) {
+        return HttpResponse::json(503, R"({"error":"cluster_unavailable"})");
+    }
+    auto fields = parse_flat_json(request.body);
+    if (fields.empty()) {
+        return HttpResponse::json(400, error_body("validation_error", "no recognized fields in body", ""));
+    }
+    auto result = cluster_heartbeat_handler_(fields);
+    if (!result) {
+        return HttpResponse::json(http_status_for(result.error().code()),
+                                  error_body("validation_error", result.error().message(), ""));
+    }
+    return HttpResponse::json(200, std::move(result).value());
+}
+
+HttpResponse ManagementApi::handle_delete_cluster_node(std::string_view id) {
+    if (!cluster_node_remover_) return HttpResponse::json(503, R"({"error":"cluster_unavailable"})");
+    auto result = cluster_node_remover_(id);
+    if (!result) {
+        return HttpResponse::json(http_status_for(result.error().code()),
+                                  error_body("request_failed", result.error().message(), ""));
+    }
+    audit("delete_cluster_node", std::string(id), "", true);
+    return HttpResponse::json(200, R"({"deleted":true})");
+}
+
+HttpResponse ManagementApi::handle_cluster_locate(const HttpRequest& request) {
+    if (!cluster_locate_provider_) {
+        return HttpResponse::json(503, R"({"error":"cluster_unavailable"})");
+    }
+    const auto params = parse_query_params(request.query);
+    const auto region = params.find("region");
+    auto result = cluster_locate_provider_(region == params.end() ? std::string_view{}
+                                                                 : percent_decode(region->second));
+    if (!result) {
+        // No healthy node is a real answer to "where should this viewer go",
+        // not a server fault: 503 is what a load balancer needs to see.
+        return HttpResponse::json(503, error_body("no_node_available", result.error().message(), ""));
+    }
+    return HttpResponse::json(200, std::move(result).value());
+}
+
+HttpResponse ManagementApi::handle_cluster_redirect(std::string_view application,
+                                                    std::string_view stream,
+                                                    const HttpRequest& request) {
+    if (!cluster_redirect_provider_) {
+        return HttpResponse::json(503, R"({"error":"cluster_unavailable"})");
+    }
+    if (application.empty() || stream.empty()) {
+        return HttpResponse::json(400, error_body("validation_error",
+                                                  "id must be application:stream", ""));
+    }
+    const auto params = parse_query_params(request.query);
+    const auto region = params.find("region");
+    const auto format = params.find("format");
+    auto result = cluster_redirect_provider_(
+        application, stream, region == params.end() ? std::string_view{} : percent_decode(region->second),
+        format == params.end() ? std::string_view{"hls"} : percent_decode(format->second));
+    if (!result) {
+        // No node can take this viewer -- a real 503, not a redirect to
+        // nowhere. A player or a fronting redirector should treat this like
+        // any other origin failure (retry, or fall back to a direct origin
+        // URL if one is configured).
+        return HttpResponse::json(503, error_body("no_node_available", result.error().message(), ""));
+    }
+    HttpResponse response;
+    response.status = 302;
+    response.headers["Location"] = std::move(result).value();
+    response.body.clear();
+    return response;
+}
+
+HttpResponse ManagementApi::handle_cluster_capacity() {
+    if (!cluster_capacity_provider_) {
+        return HttpResponse::json(503, R"({"error":"cluster_unavailable"})");
+    }
+    auto result = cluster_capacity_provider_();
+    if (!result) {
+        return HttpResponse::json(500, error_body("request_failed", result.error().message(), ""));
+    }
+    return HttpResponse::json(200, std::move(result).value());
+}
+
+HttpResponse ManagementApi::handle_list_backup_publishers(const HttpRequest& request) {
+    if (!backup_publishers_provider_) {
+        return HttpResponse::json(503, R"({"error":"backup_publishers_unavailable"})");
+    }
+    const auto params = parse_query_params(request.query);
+    const auto application = params.find("application");
+    auto result = backup_publishers_provider_(
+        application == params.end() ? std::string_view{} : percent_decode(application->second));
+    if (!result) {
+        return HttpResponse::json(500, error_body("request_failed", result.error().message(), ""));
+    }
+    return HttpResponse::json(200, std::move(result).value());
+}
+
+HttpResponse ManagementApi::handle_put_backup_publisher(std::string_view application,
+                                                        std::string_view stream,
+                                                        const HttpRequest& request) {
+    if (!backup_publisher_upserter_) {
+        return HttpResponse::json(503, R"({"error":"backup_publishers_unavailable"})");
+    }
+    if (application.empty() || stream.empty()) {
+        return HttpResponse::json(400, error_body("validation_error",
+                                                  "id must be application:stream", ""));
+    }
+    auto fields = parse_flat_json(request.body);
+    if (fields.empty()) {
+        return HttpResponse::json(400, error_body("validation_error", "no recognized fields in body", ""));
+    }
+    auto result = backup_publisher_upserter_(application, stream, fields);
+    // The backup URL is a source location, not necessarily secret, but it is
+    // still an address this server connects out to -- kept out of the audit
+    // record on the same principle as a stream target's URL.
+    audit("upsert_backup_publisher", std::string(application), std::string(stream), result.ok());
+    if (!result) {
+        return HttpResponse::json(http_status_for(result.error().code()),
+                                  error_body("validation_error", result.error().message(), ""));
+    }
+    return HttpResponse::json(200, std::move(result).value());
+}
+
+HttpResponse ManagementApi::handle_delete_backup_publisher(std::string_view application,
+                                                           std::string_view stream) {
+    if (!backup_publisher_remover_) {
+        return HttpResponse::json(503, R"({"error":"backup_publishers_unavailable"})");
+    }
+    auto result = backup_publisher_remover_(application, stream);
+    audit("delete_backup_publisher", std::string(application), std::string(stream), result.ok());
+    if (!result) {
+        return HttpResponse::json(http_status_for(result.error().code()),
+                                  error_body("request_failed", result.error().message(), ""));
+    }
+    return HttpResponse::json(200, R"({"deleted":true})");
+}
+
+HttpResponse ManagementApi::handle_list_stream_targets(const HttpRequest& request) {
+    if (!stream_targets_provider_) {
+        return HttpResponse::json(503, R"({"error":"stream_targets_unavailable"})");
+    }
+    const auto params = parse_query_params(request.query);
+    const auto application = params.find("application");
+    auto result = stream_targets_provider_(
+        application == params.end() ? std::string_view{} : percent_decode(application->second));
+    if (!result) {
+        return HttpResponse::json(500, error_body("request_failed", result.error().message(), ""));
+    }
+    return HttpResponse::json(200, std::move(result).value());
+}
+
+HttpResponse ManagementApi::handle_put_stream_target(std::string_view application,
+                                                      std::string_view stream,
+                                                      std::string_view name,
+                                                      const HttpRequest& request) {
+    if (!stream_target_upserter_) {
+        return HttpResponse::json(503, R"({"error":"stream_targets_unavailable"})");
+    }
+    if (application.empty() || stream.empty() || name.empty()) {
+        return HttpResponse::json(400, error_body("validation_error",
+                                                  "id must be application:stream:target", ""));
+    }
+    auto fields = parse_flat_json(request.body);
+    if (fields.empty()) {
+        return HttpResponse::json(400, error_body("validation_error", "no recognized fields in body", ""));
+    }
+    auto result = stream_target_upserter_(application, stream, name, fields);
+    // The target URL carries the destination's stream key, so it is never
+    // echoed into the audit record -- only which target was written.
+    audit("upsert_stream_target", std::string(application) + ":" + std::string(stream),
+          std::string(name), result.ok());
+    if (!result) {
+        return HttpResponse::json(http_status_for(result.error().code()),
+                                  error_body("validation_error", result.error().message(), ""));
+    }
+    return HttpResponse::json(200, std::move(result).value());
+}
+
+HttpResponse ManagementApi::handle_patch_stream_target(std::string_view application,
+                                                        std::string_view stream,
+                                                        std::string_view name,
+                                                        const HttpRequest& request) {
+    if (!stream_target_enabled_setter_) {
+        return HttpResponse::json(503, R"({"error":"stream_targets_unavailable"})");
+    }
+    auto fields = parse_flat_json(request.body);
+    const auto enabled = fields.find("enabled");
+    if (enabled == fields.end()) {
+        return HttpResponse::json(400, error_body("validation_error", "enabled is required", ""));
+    }
+    auto result = stream_target_enabled_setter_(application, stream, name,
+                                                enabled->second == "true" || enabled->second == "1");
+    audit("set_stream_target_enabled", std::string(application) + ":" + std::string(stream),
+          std::string(name), result.ok());
+    if (!result) {
+        return HttpResponse::json(http_status_for(result.error().code()),
+                                  error_body("request_failed", result.error().message(), ""));
+    }
+    return HttpResponse::json(200, std::move(result).value());
+}
+
+HttpResponse ManagementApi::handle_delete_stream_target(std::string_view application,
+                                                         std::string_view stream,
+                                                         std::string_view name) {
+    if (!stream_target_remover_) {
+        return HttpResponse::json(503, R"({"error":"stream_targets_unavailable"})");
+    }
+    auto result = stream_target_remover_(application, stream, name);
+    audit("delete_stream_target", std::string(application) + ":" + std::string(stream),
+          std::string(name), result.ok());
+    if (!result) {
+        return HttpResponse::json(http_status_for(result.error().code()),
+                                  error_body("request_failed", result.error().message(), ""));
+    }
+    return HttpResponse::json(200, R"({"deleted":true})");
 }
 
 HttpResponse ManagementApi::handle_list_transcoding_assignments(const HttpRequest& request) {
