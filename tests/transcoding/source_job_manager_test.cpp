@@ -3,6 +3,7 @@
 #ifdef RTMP_NATIVE_TRANSCODE
 
 #include <chrono>
+#include <string>
 
 #include "rtmp_server/transcoding/native/source_job_manager.hpp"
 
@@ -56,6 +57,42 @@ TEST(SourceJobBackoffTest, ConfiguredDelayAboveTheCapIsNotShortened) {
     options.restart_backoff_cap_seconds = 60;
     EXPECT_EQ(SourceJobManager::restart_delay_for(config_with_delay(300), options, 0), 300s);
     EXPECT_EQ(SourceJobManager::restart_delay_for(config_with_delay(300), options, 4), 300s);
+}
+
+using rtmp_server::transcoding::native::parse_source_job_renditions;
+
+// "app/src | preset | output | default | <vcodec> | <vbitrate> | high | source
+//  | <w> | <h> | match-source | <acodec> | <abitrate> | first | desc"
+constexpr const char* kCopyRule =
+    "live/cam|copy|restream_src|default|passthrough|0|high|source|||match-source|passthrough|0|first|copy";
+constexpr const char* kEncodedRule =
+    "live/cam|480p|restream_480p|default|h264|900000|main|60|854|480|letterbox|aac|96000|first|Mobile";
+
+TEST(SourceJobPassthroughTest, CopyRuleYieldsOnePassthroughRendition) {
+    auto parsed = parse_source_job_renditions(kCopyRule);
+    ASSERT_TRUE(parsed) << parsed.error().message();
+    ASSERT_EQ(parsed.value().size(), 1u);
+    EXPECT_TRUE(parsed.value().front().passthrough);
+}
+
+TEST(SourceJobPassthroughTest, EncodedRuleIsNotMarkedPassthrough) {
+    auto parsed = parse_source_job_renditions(kEncodedRule);
+    ASSERT_TRUE(parsed) << parsed.error().message();
+    ASSERT_EQ(parsed.value().size(), 1u);
+    EXPECT_FALSE(parsed.value().front().passthrough);
+}
+
+TEST(SourceJobPassthroughTest, PassthroughVideoWithReencodedAudioIsRejected) {
+    const std::string rule =
+        "live/cam|copy|restream_src|default|passthrough|0|high|source|||match-source|aac|96000|first|copy";
+    auto parsed = parse_source_job_renditions(rule);
+    EXPECT_FALSE(parsed);
+}
+
+TEST(SourceJobPassthroughTest, PassthroughCannotCoexistWithAnEncodedRung) {
+    const std::string rules = std::string(kCopyRule) + "\n" + kEncodedRule;
+    auto parsed = parse_source_job_renditions(rules);
+    EXPECT_FALSE(parsed);
 }
 
 } // namespace

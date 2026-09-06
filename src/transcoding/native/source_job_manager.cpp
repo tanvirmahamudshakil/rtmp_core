@@ -62,6 +62,13 @@ core::Result<std::vector<RenditionSpec>> parse_source_job_renditions(std::string
             if (!video_ok || !audio_ok || preset.backend != BackendKind::Software) {
                 return job_error("source transcode supports H.264 + AAC on the software backend only");
             }
+            const bool passthrough = preset.video_codec == VideoCodec::Passthrough;
+            // A copy rendition has no encoder to reframe audio through, so its
+            // audio must be copied too (or dropped) -- not re-encoded to AAC.
+            if (passthrough && preset.audio_codec == AudioCodec::Aac) {
+                return job_error(
+                    "copy / passthrough requires audio set to passthrough (or disabled) too");
+            }
             RenditionSpec spec;
             spec.name = preset.name;
             spec.output_stream = preset.outgoing_stream_name;
@@ -71,8 +78,18 @@ core::Result<std::vector<RenditionSpec>> parse_source_job_renditions(std::string
             spec.gop = preset.keyframe_interval.value_or(60);
             spec.audio_bitrate = static_cast<std::uint32_t>(preset.audio_bitrate);
             spec.fit_mode = preset.fit_mode;
+            spec.passthrough = passthrough;
             renditions.push_back(std::move(spec));
         }
+    }
+    // Copy / passthrough is whole-job: the puller feeds one demuxed timeline
+    // straight into one segmenter and never builds the decode-once/
+    // encode-per-rendition core, so it cannot also drive encoded rungs.
+    const bool any_passthrough =
+        std::any_of(renditions.begin(), renditions.end(),
+                    [](const RenditionSpec& spec) { return spec.passthrough; });
+    if (any_passthrough && renditions.size() != 1) {
+        return job_error("a copy / passthrough source job must have exactly one rendition");
     }
     return renditions;
 }

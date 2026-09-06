@@ -341,6 +341,13 @@ void HlsSourcePuller::run() {
     specs.reserve(renditions_.size());
     for (const auto& r : renditions_) specs.push_back(r.spec);
 
+    // Copy / passthrough: parse_source_job_renditions guarantees this is the
+    // job's only rendition. No SourceTranscoder is ever built; demuxed Annex B
+    // H.264 + ADTS AAC access units are fed straight into feeds[0]. An HEVC
+    // source cannot take this path (RenditionFeed reframes H.264 only) and is
+    // rejected at the first access unit below.
+    const bool passthrough_mode = !specs.empty() && specs.front().passthrough;
+
     // Construction is deferred until the source's actual video codec is
     // known (TsDemuxer::video_codec() once the PMT is parsed for TS/HLS
     // sources, or the first RTMP video tag's codec id/FourCC for an RTMP
@@ -437,8 +444,19 @@ void HlsSourcePuller::run() {
         // before any PES payload is reassembled off the video/audio PIDs it
         // names, so by the time this handler fires for the first access
         // unit the real codec is already known.
-        const auto codec = demux.video_codec() == media::ts::TsVideoCodec::Hevc ? SourceVideoCodec::Hevc
-                                                                                : SourceVideoCodec::H264;
+        const bool hevc_source = demux.video_codec() == media::ts::TsVideoCodec::Hevc;
+        if (passthrough_mode) {
+            if (hevc_source) {
+                pipeline_error = core::Error(core::ErrorCode::InvalidConfiguration,
+                                             core::ErrorCategory::Configuration,
+                                             "copy / passthrough requires an H.264 source");
+                return;
+            }
+            feeds[0]->push_video(annexb, static_cast<std::int64_t>(pts),
+                                 static_cast<std::int64_t>(dts), keyframe);
+            return;
+        }
+        const auto codec = hevc_source ? SourceVideoCodec::Hevc : SourceVideoCodec::H264;
         if (auto r = ensure_transcoder(codec); !r) {
             pipeline_error = r.error();
             return;
@@ -449,6 +467,10 @@ void HlsSourcePuller::run() {
     });
     demux.set_audio_handler([&](std::span<const std::byte> adts, std::uint64_t pts) {
         if (pipeline_error) return;
+        if (passthrough_mode) {
+            feeds[0]->push_audio(adts, static_cast<std::int64_t>(pts));
+            return;
+        }
         // Audio can in principle arrive before the first video access unit
         // within the same feed() call; the PMT (and so the real codec) is
         // still already known by then, same reasoning as the video handler.
@@ -562,7 +584,15 @@ void HlsSourcePuller::run() {
             const auto source_codec = info->codec == protocol_media::VideoCodec::Hevc
                                           ? SourceVideoCodec::Hevc
                                           : SourceVideoCodec::H264;
-            if (auto r = ensure_transcoder(source_codec); !r) return r.error();
+            if (passthrough_mode) {
+                if (info->codec == protocol_media::VideoCodec::Hevc) {
+                    return core::Error(core::ErrorCode::InvalidConfiguration,
+                                       core::ErrorCategory::Configuration,
+                                       "copy / passthrough requires an H.264 source");
+                }
+            } else if (auto r = ensure_transcoder(source_codec); !r) {
+                return r.error();
+            }
 
             if (info->codec != protocol_media::VideoCodec::Hevc) {
                 // Plain classic-AVC tag -- byte-for-byte the same parse/convert
@@ -595,6 +625,11 @@ void HlsSourcePuller::run() {
                 const std::int64_t dts_90k = static_cast<std::int64_t>(dts_ms * 90);
                 const std::int64_t pts_90k =
                     dts_90k + static_cast<std::int64_t>(tag.value().composition_time_ms) * 90;
+                if (passthrough_mode) {
+                    feeds[0]->push_video(annexb, pts_90k, dts_90k, tag.value().is_keyframe);
+                    note_input_progress();
+                    return {};
+                }
                 auto transcoded =
                     transcoder->on_video(annexb, pts_90k, dts_90k, tag.value().is_keyframe);
                 if (!transcoded) return transcoded.error();
@@ -730,7 +765,9 @@ void HlsSourcePuller::run() {
                     // pre-existing default for this path, so falling back to
                     // it here preserves prior behavior when audio precedes
                     // video far enough that no video codec is known yet.
-                    if (auto r = ensure_transcoder(SourceVideoCodec::H264); !r) return r.error();
+                    if (!passthrough_mode) {
+                        if (auto r = ensure_transcoder(SourceVideoCodec::H264); !r) return r.error();
+                    }
                     auto tag = media::aac::parse_audio_tag(message.payload);
                     if (!tag) return tag.error();
                     if (tag.value().aac_packet_type == media::aac::kAacPacketTypeSequenceHeader) {
@@ -754,9 +791,14 @@ void HlsSourcePuller::run() {
                     media::aac::append_adts_header(adts, *audio_config, tag.value().body.size());
                     adts.insert(adts.end(), tag.value().body.begin(), tag.value().body.end());
                     const auto pts_90k = static_cast<std::int64_t>(audio_clock.unwrap(message.timestamp) * 90);
-                    auto transcoded = transcoder->on_audio(adts, pts_90k);
-                    if (!transcoded) return transcoded.error();
-                    note_input_progress();
+                    if (passthrough_mode) {
+                        feeds[0]->push_audio(adts, pts_90k);
+                        note_input_progress();
+                    } else {
+                        auto transcoded = transcoder->on_audio(adts, pts_90k);
+                        if (!transcoded) return transcoded.error();
+                        note_input_progress();
+                    }
                 }
                 if (detect_stall()) {
                     return core::Error(core::ErrorCode::ConnectionTimedOut,

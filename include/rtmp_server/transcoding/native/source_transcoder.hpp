@@ -42,6 +42,13 @@ struct RenditionSpec {
     std::uint32_t gop = 60;
     std::uint32_t audio_bitrate = 128'000;
     FitMode fit_mode = FitMode::Stretch;
+    // Straight copy of the source elementary streams -- no decode, no encode.
+    // Only valid as a job's single rendition and only for an H.264 source
+    // (RenditionFeed reframes Annex B H.264 + ADTS AAC). When set, every
+    // geometry/bitrate field above is unused: the puller feeds demuxed
+    // access units directly into this rendition's segmenter and never
+    // constructs a SourceTranscoder.
+    bool passthrough = false;
 };
 
 // Splits one job's hard CPU budget across its rendition encoders. The sum is

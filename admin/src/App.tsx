@@ -144,6 +144,32 @@ const fullAdaptiveLadderPresets = (): EncodingPreset[] => [
   gpuId: null,
   enabled: true
 }));
+// Copy / passthrough: no encode at all. Whatever the source publishes (codec,
+// resolution, bitrate, GOP) is muxed straight into the HLS/TS output. The
+// resolution/bitrate/profile/keyframe fields below are irrelevant to a copy
+// and are ignored by the native pipeline (video_codec=passthrough,
+// audio_codec=passthrough in the rule) -- they are only set here so the
+// EncodingPreset shape stays valid.
+const passthroughPreset = (): EncodingPreset => ({
+  id: newLocalId(),
+  name: "passthrough",
+  outgoingStreamName: "passthrough",
+  description: "Copy source — no transcode",
+  videoCodec: "Passthrough",
+  videoBitrate: 0,
+  implementation: "Default",
+  profile: "high",
+  keyFrameMode: "source",
+  keyFrameInterval: null,
+  frameWidth: null,
+  frameHeight: null,
+  fitMode: "match-source",
+  audioCodec: "Passthrough",
+  audioBitrate: 0,
+  gpuMode: "first",
+  gpuId: null,
+  enabled: true
+});
 const validFrameDimension = (value: unknown): value is number =>
   typeof value === "number" && Number.isInteger(value) && value >= 16 && value <= 8192 && value % 2 === 0;
 // Normalizes a preset coming back from the server (or an older admin build)
@@ -1754,6 +1780,34 @@ function TranscodePage({
       setBusy(false);
     }
   };
+  const addPassthrough = async () => {
+    if (!selectedTemplate) return;
+    if (selectedTemplate.presets.some((preset) => preset.videoCodec === "Passthrough")) {
+      onNotify("success", "A copy / passthrough preset is already configured.");
+      return;
+    }
+    // Copy / passthrough is whole-job on the origin: it cannot coexist with
+    // encoded rungs (the source-job pipeline feeds one demuxed timeline
+    // straight to one segmenter). Replace the ladder rather than produce a
+    // rule set the origin will reject.
+    if (selectedTemplate.presets.length > 0) {
+      onNotify(
+        "error",
+        "Remove the other presets first — copy / passthrough must be a template's only preset."
+      );
+      return;
+    }
+    setBusy(true);
+    try {
+      await client.putTemplate(selectedTemplate.id, selectedTemplate.name, [passthroughPreset()]);
+      await refreshTemplates();
+      onNotify("success", "Copy / passthrough preset added — the source is delivered as-is, no transcode.");
+    } catch (error) {
+      onNotify("error", errorMessage(error, "Could not add the copy / passthrough preset."));
+    } finally {
+      setBusy(false);
+    }
+  };
   const togglePreset = async (preset: EncodingPreset) => {
     if (!selectedTemplate) return;
     const nextPresets = selectedTemplate.presets.map((item) =>
@@ -1804,6 +1858,7 @@ function TranscodePage({
           <div className="preset-workspace-heading">
             <div><span className="eyebrow">OUTPUT PROFILES</span><h2>Encoding Presets</h2></div>
             <div className="row-actions">
+              <button className="secondary-button" disabled={busy} onClick={addPassthrough}><Workflow size={17} /> Copy / Passthrough</button>
               <button className="secondary-button" disabled={busy} onClick={addFullLadder}><Workflow size={17} /> Add Full Ladder</button>
               <button className="primary-button" disabled={busy} onClick={() => setShowPresetModal(true)}><Plus size={17} /> Add Preset</button>
             </div>
