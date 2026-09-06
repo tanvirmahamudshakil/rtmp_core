@@ -59,7 +59,12 @@ maximum_rtmp_message_size: 10485760
 
 # Fast join: a fresh open of any stream's master.m3u8 redirects straight to
 # its lowest-bitrate rendition instead of serving the master playlist.
-enable_hls_fast_join: false
+# ON for a far / mobile / lossy audience: a fresh viewer starts on the
+# smallest rendition (fastest first segment, no startup stall) and the
+# player's ABR then climbs to a higher rung once its bandwidth is proven.
+# Only helps if the transcode ladder actually has a low bottom rung -- pair
+# it with a 144p/240p output in transcoding.conf (see config/transcoding.example.conf).
+enable_hls_fast_join: true
 
 # Multi-node HLS: leave empty on a single-box install. Set it (>= 16 chars,
 # same value on every edge) when this origin sits behind its own edge/shield
@@ -71,8 +76,15 @@ hls_edge_fetch_secret: ""
 # blocking playlist reloads, cutting live latency from roughly three segment
 # durations to roughly one part. Costs one extra cached object per part and
 # holds one socket per blocked player. See docs/hls.md "Low-Latency HLS".
-hls_low_latency: false
-hls_part_target_duration: 333ms
+#
+# ON for a far / lossy audience -- this is the "first data fast" lever: a
+# fresh viewer begins playback after fetching ONE ~250 ms part (tens of KB
+# at a low rung) instead of waiting for a whole ~2 s segment. Non-LL players
+# fall back to normal segment playback automatically. Watch the origin's
+# held-socket count after enabling (one per player blocked on a reload);
+# keep hls_blocking_reload_timeout below the Varnish backend timeout.
+hls_low_latency: true
+hls_part_target_duration: 250ms
 # Must stay below the cache tier's backend timeout, or the edge gives up on a
 # held request before this origin answers it.
 hls_blocking_reload_timeout: 9s
@@ -85,8 +97,10 @@ hls_encryption_enabled: false
 hls_key_rotation_interval: 0s
 
 # Serve each stream's EXT-X-I-FRAMES-ONLY playlist (iframe.m3u8) so a player
-# can scrub without fetching whole segments.
-hls_iframe_playlists: true
+# can scrub without fetching whole segments. OFF for a live-only mobile
+# audience: nobody scrubs a live stream, and it is extra playlist objects
+# and packaging work per rendition for no gain here.
+hls_iframe_playlists: false
 
 # MPEG-DASH delivery, off the same RTMP publish as HLS, served at /dash
 # alongside /hls. Off by default: it doubles per-publisher packaging and
