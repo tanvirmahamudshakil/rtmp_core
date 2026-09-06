@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "rtmp_server/core/cpu_partition.hpp"
+#include "rtmp_server/hls/rendition_feed.hpp"
 #include "rtmp_server/media/aac/adts.hpp"
 #include "rtmp_server/media/h264/avc.hpp"
 #include "rtmp_server/media/hevc/hevc.hpp"
@@ -204,6 +205,39 @@ private:
     std::optional<std::uint32_t> last_;
     std::uint64_t epoch_ = 0;
 };
+
+// Copy / passthrough audio path. A TsDemuxer audio callback delivers one PES
+// payload that may hold SEVERAL concatenated ADTS frames; RenditionFeed::
+// push_audio consumes exactly one frame, so the payload has to be split or
+// every frame after the first is fed as garbage (which silences the decoder).
+// Each AAC frame is 1024 samples, so successive frames in one PES advance the
+// PTS by 1024 * 90000 / sample_rate ticks. An RTMP source already arrives one
+// frame per call and simply falls through the loop once.
+inline void feed_passthrough_audio(hls::RenditionFeed& feed, std::span<const std::byte> pes,
+                                   std::int64_t base_pts_90k) {
+    std::size_t offset = 0;
+    int frame_index = 0;
+    while (offset + 7 <= pes.size()) {
+        const auto* p = reinterpret_cast<const std::uint8_t*>(pes.data()) + offset;
+        if (p[0] != 0xFF || (p[1] & 0xF0) != 0xF0) break; // lost ADTS sync
+        const std::size_t frame_length =
+            (static_cast<std::size_t>(p[3] & 0x03) << 11) |
+            (static_cast<std::size_t>(p[4]) << 3) | (static_cast<std::size_t>(p[5]) >> 5);
+        if (frame_length < 7 || offset + frame_length > pes.size()) break;
+        const std::uint8_t freq_index = (p[2] >> 2) & 0x0F;
+        const std::uint32_t sample_rate =
+            freq_index < media::aac::kSamplingFrequencies.size()
+                ? media::aac::kSamplingFrequencies[freq_index]
+                : 0;
+        const std::int64_t pts = sample_rate != 0
+                                     ? base_pts_90k + static_cast<std::int64_t>(frame_index) * 1024 *
+                                                          90000 / static_cast<std::int64_t>(sample_rate)
+                                     : base_pts_90k;
+        feed.push_audio(pes.subspan(offset, frame_length), pts);
+        offset += frame_length;
+        ++frame_index;
+    }
+}
 } // namespace
 
 HlsSourcePuller::HlsSourcePuller(std::string source_url, std::vector<PullerRendition> renditions,
@@ -468,7 +502,7 @@ void HlsSourcePuller::run() {
     demux.set_audio_handler([&](std::span<const std::byte> adts, std::uint64_t pts) {
         if (pipeline_error) return;
         if (passthrough_mode) {
-            feeds[0]->push_audio(adts, static_cast<std::int64_t>(pts));
+            feed_passthrough_audio(*feeds[0], adts, static_cast<std::int64_t>(pts));
             return;
         }
         // Audio can in principle arrive before the first video access unit
@@ -792,7 +826,7 @@ void HlsSourcePuller::run() {
                     adts.insert(adts.end(), tag.value().body.begin(), tag.value().body.end());
                     const auto pts_90k = static_cast<std::int64_t>(audio_clock.unwrap(message.timestamp) * 90);
                     if (passthrough_mode) {
-                        feeds[0]->push_audio(adts, pts_90k);
+                        feed_passthrough_audio(*feeds[0], adts, pts_90k);
                         note_input_progress();
                     } else {
                         auto transcoded = transcoder->on_audio(adts, pts_90k);
