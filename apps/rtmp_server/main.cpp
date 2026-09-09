@@ -423,16 +423,36 @@ int main(int argc, char** argv) {
     // different window than the others.
     const std::uint32_t hls_target_seconds = config.hls_target_duration_seconds;
     const std::uint32_t hls_window_segments = config.hls_live_window_segments;
-    // Retention beyond the live window: enough for a player that is a little
-    // behind, scaled with the window rather than fixed.
+    // Retention beyond the live window: how far a player that has fallen
+    // behind can still fetch a segment that has scrolled out of the playlist.
+    // Scaled with the window rather than fixed, at the same 6-of-10 ratio the
+    // previous literals used -- so the default configuration produces exactly
+    // the values this file carried before the shape became configurable.
+    // Floored at 4 so a short window still tolerates a stalled player.
     const std::uint32_t hls_retention_segments =
-        std::max<std::uint32_t>(4, hls_window_segments / 2);
+        std::max<std::uint32_t>(4, (hls_window_segments * 3 + 4) / 5);
     // Headroom above target so a stream whose keyframe cadence is not a clean
     // divisor of the target is still cut on a keyframe rather than
     // force-split mid-GOP. Passthrough cannot insert keyframes, so this
     // headroom is what keeps segments valid for any publisher GOP.
     const auto hls_target = std::chrono::seconds(hls_target_seconds);
     const auto hls_max_segment = std::chrono::seconds(hls_target_seconds * 2);
+    // Byte ceiling per stream, derived from the media the window actually
+    // holds rather than fixed. A store evicts on whichever limit it hits
+    // first, so a fixed 256 MiB against a deeper or longer window would be
+    // reached before the window filled -- the playlist would quietly carry
+    // fewer segments than configured, which is the failure mode a operator
+    // raising the window is least likely to look for. The rate below is the
+    // one the previous fixed value implied at the default shape (16 segments
+    // x 6 s = 96 s in 256 MiB, about 21 Mbps), so the default configuration
+    // still resolves to exactly 256 MiB. Capped at 2 GiB per stream so an
+    // extreme window cannot become an unbounded memory commitment.
+    const std::uint64_t hls_media_seconds =
+        static_cast<std::uint64_t>(hls_window_segments + hls_retention_segments) * hls_target_seconds;
+    // 256 MiB per 96 s, written as the ratio so the default shape resolves to
+    // exactly the 256 MiB this file used to hard-code.
+    const std::uint64_t hls_store_max_bytes = std::min<std::uint64_t>(
+        2ull * 1024 * 1024 * 1024, hls_media_seconds * (256ull * 1024 * 1024) / 96);
 
     rtmp_server::transcoding::native::IngestTranscodeOptions ingest_options;
     // Same segment shape as the passthrough sink below, so both surfaces of
@@ -440,7 +460,7 @@ int main(int argc, char** argv) {
     ingest_options.target_duration_seconds = hls_target_seconds;
     ingest_options.live_window_segments = hls_window_segments;
     ingest_options.retention_grace_segments = hls_retention_segments;
-    ingest_options.max_total_bytes_per_rendition = 256u * 1024u * 1024u;
+    ingest_options.max_total_bytes_per_rendition = hls_store_max_bytes;
     ingest_options.segment_target_duration = hls_target;
     ingest_options.max_segment_duration = hls_max_segment;
     if (config.hls_low_latency) {
@@ -457,7 +477,7 @@ int main(int argc, char** argv) {
          // The segment shape is decided once above; copied in by value so
          // every stream registered later builds the same window.
          hls_target_seconds, hls_window_segments, hls_retention_segments, hls_target,
-         hls_max_segment
+         hls_max_segment, hls_store_max_bytes
 #ifdef RTMP_NATIVE_TRANSCODE
          , &ingest_transcoder
 #endif
@@ -469,7 +489,7 @@ int main(int argc, char** argv) {
             // backend hop does not stall playback.
             store_config.live_window_segments = hls_window_segments;
             store_config.retention_grace_segments = hls_retention_segments;
-            store_config.max_total_bytes = 256u * 1024u * 1024u;
+            store_config.max_total_bytes = hls_store_max_bytes;
             // Segment duration sets each viewer's playlist+segment request
             // rate: 6 s produces a third of the requests 2 s does (fewer
             // packets, connections and conntrack churn) and keeps every fetch
@@ -535,7 +555,7 @@ int main(int argc, char** argv) {
             rtmp_server::dash::SegmentStoreConfig dash_store_config;
             dash_store_config.live_window_segments = hls_window_segments;
             dash_store_config.retention_grace_segments = hls_retention_segments;
-            dash_store_config.max_total_bytes = 256u * 1024u * 1024u;
+            dash_store_config.max_total_bytes = hls_store_max_bytes;
             dash_store_config.target_duration_seconds = hls_target_seconds;
             auto dash_store = std::make_shared<rtmp_server::dash::SegmentStore>(dash_store_config);
 
@@ -1141,7 +1161,7 @@ int main(int argc, char** argv) {
     // across that.
     source_job_options.live_window_segments = hls_window_segments;
     source_job_options.retention_grace_segments = hls_retention_segments;
-    source_job_options.max_total_bytes_per_rendition = 256u * 1024u * 1024u;
+    source_job_options.max_total_bytes_per_rendition = hls_store_max_bytes;
     rtmp_server::transcoding::native::SourceJobManager source_job_manager(std::move(source_hooks), store.get(),
                                                                           source_job_options);
     source_job_manager.load_from_store();

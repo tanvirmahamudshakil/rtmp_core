@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include <chrono>
 #include <cstdio>
 #include <fstream>
 
@@ -279,6 +280,33 @@ TEST(ServerConfigValidate, BoundsTheLiveWindowShape) {
 
     cfg.hls_live_window_segments = 3;
     EXPECT_TRUE(cfg.validate().ok());
+}
+
+TEST(ServerConfigValidate, KeyRotationMustOutlastTheLiveWindow) {
+    auto cfg = valid_config();
+    cfg.hls_target_duration_seconds = 6;
+    cfg.hls_live_window_segments = 10;  // a 60 s live window
+
+    // Rotation is off by default, and the pair is only checked when
+    // encryption is actually on.
+    cfg.hls_encryption_enabled = false;
+    cfg.hls_key_rotation_interval = std::chrono::seconds(10);
+    EXPECT_TRUE(cfg.validate().ok());
+
+    cfg.hls_encryption_enabled = true;
+    EXPECT_FALSE(cfg.validate().ok());
+
+    cfg.hls_key_rotation_interval = std::chrono::seconds(60);  // exactly the window
+    EXPECT_TRUE(cfg.validate().ok());
+
+    // Never rotating is always valid: one key covers every segment.
+    cfg.hls_key_rotation_interval = std::chrono::seconds(0);
+    EXPECT_TRUE(cfg.validate().ok());
+
+    // A longer window moves the bound with it.
+    cfg.hls_key_rotation_interval = std::chrono::seconds(60);
+    cfg.hls_target_duration_seconds = 10;  // now a 100 s window
+    EXPECT_FALSE(cfg.validate().ok());
 }
 
 TEST(ServerConfigValidate, RejectsNonPositiveTimeouts) {

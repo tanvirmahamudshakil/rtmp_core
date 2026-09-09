@@ -234,6 +234,25 @@ Result<void> ServerConfig::validate() const {
         return Error(ErrorCode::InvalidConfiguration, ErrorCategory::Configuration,
                       "hls_live_window_segments must be between 3 and 60");
     }
+    // Key rotation has to outlast the media it encrypted. Segments in the live
+    // window keep naming the key that decrypts them, so a rotation interval
+    // shorter than the window retires a key while playlists still reference
+    // it and those segments become undecryptable. The window is configurable
+    // above, which makes this pair easy to get wrong in either direction --
+    // so the one unambiguous case is rejected rather than left to surface as
+    // sporadic playback failure. Only the live window is required here, not
+    // the retention grace on top of it: a deployment that deliberately runs a
+    // tight rotation should not be blocked from starting.
+    if (hls_encryption_enabled && hls_key_rotation_interval.count() > 0) {
+        const auto window_seconds =
+            static_cast<std::int64_t>(hls_target_duration_seconds) * hls_live_window_segments;
+        if (hls_key_rotation_interval.count() < window_seconds) {
+            return Error(ErrorCode::InvalidConfiguration, ErrorCategory::Configuration,
+                          "hls_key_rotation_interval must be at least the live window "
+                          "(hls_target_duration_seconds x hls_live_window_segments) so segments "
+                          "still in the playlist keep a key that decrypts them");
+        }
+    }
     if (!hls_edge_fetch_secret.empty() && hls_edge_fetch_secret.size() < 16) {
         return Error(ErrorCode::InvalidConfiguration, ErrorCategory::Configuration,
                       "hls_edge_fetch_secret must be at least 16 characters when set "
