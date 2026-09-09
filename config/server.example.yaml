@@ -66,6 +66,24 @@ maximum_rtmp_message_size: 10485760
 # it with a 144p/240p output in transcoding.conf (see config/transcoding.example.conf).
 enable_hls_fast_join: true
 
+# Segment length, and with it the request rate every viewer generates: a
+# player fetches one media playlist and one segment per segment duration, so
+# the load on the cache, the TLS terminator and the origin scales as
+# 1/duration. 6 s is the default; 10 s removes 40% of the requests at every
+# hop for the same audience, at the cost of the same increase in latency.
+# Raise it for a large passthrough audience where latency is not critical
+# (rebroadcast, IPTV); lower it only alongside Low-Latency HLS below.
+#
+# The publisher's keyframe interval must divide this: segment boundaries are
+# keyframe boundaries, and passthrough cannot insert keyframes, so a value
+# below the encoder's GOP is advisory -- the segmenter cuts on the next
+# keyframe regardless.
+hls_target_duration_seconds: 6
+# Segments in the live playlist. Multiplied by the duration above this is the
+# DVR depth a joining player can seek back through, the rebuffer cushion it
+# has against a hiccup, and the media held in memory per stream.
+hls_live_window_segments: 10
+
 # Multi-node HLS: leave empty on a single-box install. Set it (>= 16 chars,
 # same value on every edge) when this origin sits behind its own edge/shield
 # Varnish tier so /hls is served only to requests carrying X-Edge-Token.

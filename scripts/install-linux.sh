@@ -32,9 +32,23 @@
 #                                random 32-byte token is generated automatically
 #                                if left unset. Set it only to pin a known token
 #                                (e.g. restoring a prior deployment's value).
+#   RTMP_HLS_TARGET_DURATION     Segment length in seconds (default 6, range
+#                                2-30). Divides the request rate every viewer
+#                                puts on the cache, TLS terminator and origin;
+#                                raise it for a large passthrough audience
+#                                that can absorb the matching latency.
+#   RTMP_HLS_LIVE_WINDOW_SEGMENTS Segments in the live playlist (default 10).
 #   RTMP_ENABLE_FAIR_QUEUE       1 (default) shapes at the configured link
 #                                utilization target and fairly schedules viewer
 #                                flows, reserving capacity for new joins.
+#                                Shaping is applied ONLY when the link rate is
+#                                known (RTMP_BANDWIDTH_MBIT, or a NIC that
+#                                reports its speed); against the virtual-NIC
+#                                planning fallback the qdisc is left unshaped,
+#                                because a rate limiter built on a guess can
+#                                only cap throughput. 0 disables the qdisc
+#                                entirely; the NIC, IRQ and packet-steering
+#                                tuning is applied either way.
 #   RTMP_CONFIGURE_FIREWALL      1 (default) adds rules only if UFW is active.
 #   RTMP_CONFIGURE_DNS            1 (default) adds public resolvers (Cloudflare,
 #                                Google, Quad9) as systemd-resolved fallback DNS
@@ -134,6 +148,12 @@ ADMISSION_MODE="${RTMP_ADMISSION_MODE:-unlimited}"
 WORKER_CPU_PINNING="${RTMP_WORKER_CPU_PINNING:-auto}"
 ENABLE_SQPOLL="${RTMP_ENABLE_SQPOLL:-auto}"
 ENABLE_FAIR_QUEUE="${RTMP_ENABLE_FAIR_QUEUE:-1}"
+# Segment length in seconds. Every viewer fetches one playlist and one segment
+# per segment duration, so this divides the request rate the whole delivery
+# chain sees. 6 s is the default; 10 s serves the same audience with 40% fewer
+# requests at 4 s more latency.
+HLS_TARGET_DURATION="${RTMP_HLS_TARGET_DURATION:-6}"
+HLS_LIVE_WINDOW_SEGMENTS="${RTMP_HLS_LIVE_WINDOW_SEGMENTS:-10}"
 CONFIGURE_FIREWALL="${RTMP_CONFIGURE_FIREWALL:-1}"
 CONFIGURE_DNS="${RTMP_CONFIGURE_DNS:-1}"
 FORCE_ROTATE="${RTMP_FORCE_ROTATE_SECRETS:-0}"
@@ -181,6 +201,14 @@ fi
 [[ "${ENABLE_SQPOLL}" == "auto" || "${ENABLE_SQPOLL}" =~ ^[01]$ ]] ||
   die "RTMP_ENABLE_SQPOLL must be 'auto', 0 or 1."
 [[ "${ENABLE_FAIR_QUEUE}" =~ ^[01]$ ]] || die "RTMP_ENABLE_FAIR_QUEUE must be 0 or 1."
+# Same bounds ServerConfig::validate() enforces, checked here so a bad value
+# fails before a full build rather than at first start.
+[[ "${HLS_TARGET_DURATION}" =~ ^[0-9]+$ ]] &&
+  (( HLS_TARGET_DURATION >= 2 && HLS_TARGET_DURATION <= 30 )) ||
+  die "RTMP_HLS_TARGET_DURATION must be between 2 and 30 seconds."
+[[ "${HLS_LIVE_WINDOW_SEGMENTS}" =~ ^[0-9]+$ ]] &&
+  (( HLS_LIVE_WINDOW_SEGMENTS >= 3 && HLS_LIVE_WINDOW_SEGMENTS <= 60 )) ||
+  die "RTMP_HLS_LIVE_WINDOW_SEGMENTS must be between 3 and 60."
 [[ "${CONFIGURE_FIREWALL}" =~ ^[01]$ ]] || die "RTMP_CONFIGURE_FIREWALL must be 0 or 1."
 [[ "${CONFIGURE_DNS}" =~ ^[01]$ ]] || die "RTMP_CONFIGURE_DNS must be 0 or 1."
 [[ "${FORCE_ROTATE}" =~ ^[01]$ ]] || die "RTMP_FORCE_ROTATE_SECRETS must be 0 or 1."
@@ -615,6 +643,25 @@ if [[ "${BANDWIDTH_MBIT}" == "auto" ]]; then
   fi
 fi
 
+# Shaping only ever helps when the rate it shapes to is a real number. With
+# the 20 Gbps virtual-NIC fallback the rate is a planning placeholder, and
+# shaping to a placeholder cannot protect anything -- it can only install a
+# rate limiter in front of a link whose true speed is unknown. Worse, the
+# placeholder is high enough to select the single-class HTB path below, whose
+# one qdisc lock serialises all egress through a single core and caps the box
+# at a few Gbps (~4-5k HLS viewers) no matter how fast the NIC or how many
+# cores are present. That is a shaper-induced ceiling on exactly the large
+# deployments shaping was supposed to help. So: shape only against a rate an
+# operator supplied or the NIC actually reported, and otherwise leave the
+# kernel's own fair queueing in place, which has no global lock.
+SHAPE_MODE="shaped"
+if [[ "${ENABLE_FAIR_QUEUE}" != "1" ]]; then
+  SHAPE_MODE="none"
+elif [[ "${BANDWIDTH_SOURCE_KIND}" == "fallback" ]]; then
+  SHAPE_MODE="none"
+  log "Link speed is a planning fallback, not a measured rate: installing unshaped per-queue fair queueing (set RTMP_BANDWIDTH_MBIT to the provider rate to enable shaping)"
+fi
+
 MAX_VIEWERS="$(awk -v bw="${BANDWIDTH_MBIT}" -v rate="${CAPACITY_STREAM_MBIT}" \
   -v utilization="${LINK_UTILIZATION_PERCENT}" -v overhead="${PROTOCOL_OVERHEAD_PERCENT}" \
   'BEGIN {
@@ -802,6 +849,15 @@ else
   MALLOC_ARENA_MAX_VALUE=2
 fi
 
+# Transcoding is the one CPU-bound workload here: a job decodes once and
+# encodes a ladder, and SourceJobManager already refuses to start more jobs
+# than the transcode-side core partition can carry. A fixed 16 was therefore
+# either an over-promise on a 4-core VPS or an artificial cap on a 32-core
+# box. Derive it from the machine like every other thread budget.
+TRANSCODING_MAX_ACTIVE_JOBS="${CPU_COUNT}"
+if (( TRANSCODING_MAX_ACTIVE_JOBS < 2 )); then TRANSCODING_MAX_ACTIVE_JOBS=2; fi
+if (( TRANSCODING_MAX_ACTIVE_JOBS > 64 )); then TRANSCODING_MAX_ACTIVE_JOBS=64; fi
+
 cat > "${EXISTING_ENV}" <<EOF
 RTMP_SERVER_TOKEN_SIGNING_SECRET=${TOKEN_SECRET}
 RTMP_SERVER_API_AUTHENTICATION_SECRET=${ADMIN_TOKEN}
@@ -824,6 +880,8 @@ RTMP_SERVER_RING_QUEUE_DEPTH=4096
 RTMP_SERVER_WORKER_CPU_PINNING_ENABLED=$([[ "${WORKER_CPU_PINNING}" == "1" ]] && echo true || echo false)
 RTMP_SERVER_ENABLE_SQPOLL=$([[ "${ENABLE_SQPOLL}" == "1" ]] && echo true || echo false)
 RTMP_SERVER_ENABLE_HLS_FAST_JOIN=$([[ "${ENABLE_FAST_JOIN}" == "1" ]] && echo true || echo false)
+RTMP_SERVER_HLS_TARGET_DURATION_SECONDS=${HLS_TARGET_DURATION}
+RTMP_SERVER_HLS_LIVE_WINDOW_SEGMENTS=${HLS_LIVE_WINDOW_SEGMENTS}
 RTMP_SERVER_PROVIDED_BUFFER_COUNT=${PROVIDED_BUFFER_COUNT}
 RTMP_SERVER_PROVIDED_BUFFER_SIZE=${PROVIDED_BUFFER_SIZE}
 # Per-connection transport tuning. A pinned 256 KiB send buffer bounds
@@ -842,7 +900,7 @@ RTMP_SERVER_DATABASE_TYPE=sqlite
 RTMP_SERVER_DATABASE_CONNECTION=/var/lib/rtmp-server/rtmp.db
 RTMP_SERVER_TRANSCODING_ENABLED=false
 RTMP_SERVER_TRANSCODING_PRESET_FILE=/etc/rtmp-server/transcoding.conf
-RTMP_SERVER_TRANSCODING_MAX_ACTIVE_JOBS=16
+RTMP_SERVER_TRANSCODING_MAX_ACTIVE_JOBS=${TRANSCODING_MAX_ACTIVE_JOBS}
 RTMP_SERVER_TRANSCODING_MAX_OUTPUTS_PER_JOB=16
 RTMP_SERVER_TRANSCODING_MAX_RESTART_ATTEMPTS=5
 RTMP_SERVER_RECORDING_ENABLED=false
@@ -1121,6 +1179,36 @@ fi
 if modprobe tcp_bbr 2>/dev/null && sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -qw bbr; then
   printf '%s\n' 'net.ipv4.tcp_congestion_control = bbr' >> /etc/sysctl.d/60-streamforge.conf
 fi
+# Connection tracking, when a firewall has loaded it, is a per-flow table with
+# its own hard ceiling -- and the kernel sizes that ceiling from RAM, not from
+# how many viewers the box is expected to serve. A full table drops new
+# connections outright while every existing viewer keeps streaming, so it
+# presents exactly as "nobody new can join past N". Sized to the connection
+# budget with room for closing flows, and only written when the module is
+# actually loaded: these keys do not exist otherwise, and sysctl --system
+# would fail the install on them.
+if [[ -d /proc/sys/net/netfilter ]] || modprobe nf_conntrack 2>/dev/null; then
+  CONNTRACK_MAX=$(( MAX_CONNECTIONS * 4 ))
+  if (( CONNTRACK_MAX < 262144 )); then CONNTRACK_MAX=262144; fi
+  if (( CONNTRACK_MAX > 4194304 )); then CONNTRACK_MAX=4194304; fi
+  cat > /etc/sysctl.d/61-streamforge-conntrack.conf <<EOF
+net.netfilter.nf_conntrack_max = ${CONNTRACK_MAX}
+# A closed viewer connection otherwise holds its table slot for 120s, so at a
+# high join/leave rate the dead entries outnumber the live ones.
+net.netfilter.nf_conntrack_tcp_timeout_time_wait = 30
+net.netfilter.nf_conntrack_tcp_timeout_close_wait = 15
+net.netfilter.nf_conntrack_tcp_timeout_fin_wait = 30
+EOF
+  # Bucket count is a module parameter, not a sysctl; keeping it at a quarter
+  # of max holds the average hash chain short instead of turning a large
+  # table into a long-list lookup on every packet.
+  if [[ -w /sys/module/nf_conntrack/parameters/hashsize ]]; then
+    printf '%s' "$(( CONNTRACK_MAX / 4 ))" > /sys/module/nf_conntrack/parameters/hashsize 2>/dev/null || true
+  fi
+  log "Connection tracking table sized to ${CONNTRACK_MAX} flows"
+else
+  rm -f /etc/sysctl.d/61-streamforge-conntrack.conf
+fi
 sysctl --system >/dev/null
 
 if [[ "${CONFIGURE_DNS}" == "1" ]] && command -v systemctl >/dev/null 2>&1 &&
@@ -1145,17 +1233,26 @@ fi
 
 log "Configuring NIC ${PRIMARY_INTERFACE}"
 ethtool -K "${PRIMARY_INTERFACE}" gro on gso on tso on >/dev/null 2>&1 || true
-if [[ "${ENABLE_FAIR_QUEUE}" == "1" ]]; then
-  # Keeping the queue on this VPS instead of the provider's opaque policer is
-  # what lets a new viewer's playlist/first segment compete fairly with the
-  # already-active segment flows. The unused percentage is join/burst reserve.
-  SHAPE_MBIT=$((BANDWIDTH_MBIT * LINK_UTILIZATION_PERCENT / 100))
-  cat > /etc/default/rtmp-network <<EOF
+# The tune service runs unconditionally now. Everything it does apart from
+# the qdisc -- CPU governor, NIC queue count, ring sizes, interrupt
+# coalescing, RPS/RFS/XPS steering -- is what keeps softirq work off a single
+# core, and that work is *more* important when shaping is off, not less.
+# Previously RTMP_ENABLE_FAIR_QUEUE=0 (or an unknown link speed) silently
+# threw all of it away along with the shaper. RTMP_SHAPE_MODE now scopes the
+# opt-out to the qdisc alone.
+#
+# Keeping the queue on this VPS instead of the provider's opaque policer is
+# what lets a new viewer's playlist/first segment compete fairly with the
+# already-active segment flows. The unused percentage is join/burst reserve.
+SHAPE_MBIT=$((BANDWIDTH_MBIT * LINK_UTILIZATION_PERCENT / 100))
+if (( SHAPE_MBIT < 1 )); then SHAPE_MBIT=1; fi
+cat > /etc/default/rtmp-network <<EOF
 RTMP_INTERFACE=${PRIMARY_INTERFACE}
 RTMP_SHAPE_MBIT=${SHAPE_MBIT}
+RTMP_SHAPE_MODE=${SHAPE_MODE}
 RTMP_QUEUE_COUNT=${WORKERS}
 EOF
-  cat > /usr/local/sbin/rtmp-network-tune <<'EOF'
+cat > /usr/local/sbin/rtmp-network-tune <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 . /etc/default/rtmp-network
@@ -1204,27 +1301,42 @@ ethtool -C "${RTMP_INTERFACE}" adaptive-rx on adaptive-tx on >/dev/null 2>&1 ||
 # running its socket so cache stays warm. Only engaged when the hardware
 # cannot already spread the load itself (few real queues).
 HW_QUEUES="$( { ls -d /sys/class/net/"${RTMP_INTERFACE}"/queues/rx-* 2>/dev/null || true; } | wc -l | tr -cd '0-9')"
+[[ "${HW_QUEUES}" =~ ^[0-9]+$ ]] || HW_QUEUES=0
 NCPU="$(nproc)"
-if [[ "${HW_QUEUES}" =~ ^[0-9]+$ ]] && (( HW_QUEUES > 0 && HW_QUEUES < NCPU )); then
-  # rps_cpus wants a (possibly comma-separated) hex bitmask, 32 bits/word,
-  # so an all-ones mask for NCPU cores works for any core count.
-  CPU_MASK=""; _rem=${NCPU}
-  while (( _rem > 0 )); do
-    _bits=$(( _rem >= 32 ? 32 : _rem ))
-    CPU_MASK="$(printf '%x' $(( (1 << _bits) - 1 )))${CPU_MASK:+,${CPU_MASK}}"
-    _rem=$(( _rem - _bits ))
-  done
-  GLOBAL_FLOWS=$(( NCPU * 4096 ))
-  sysctl -qw "net.core.rps_sock_flow_entries=${GLOBAL_FLOWS}" 2>/dev/null || true
+# rps_cpus/xps_cpus want a (possibly comma-separated) hex bitmask, 32 bits per
+# word, so an all-ones mask for NCPU cores works for any core count.
+CPU_MASK=""; _rem=${NCPU}
+while (( _rem > 0 )); do
+  _bits=$(( _rem >= 32 ? 32 : _rem ))
+  CPU_MASK="$(printf '%x' $(( (1 << _bits) - 1 )))${CPU_MASK:+,${CPU_MASK}}"
+  _rem=$(( _rem - _bits ))
+done
+GLOBAL_FLOWS=$(( NCPU * 4096 ))
+sysctl -qw "net.core.rps_sock_flow_entries=${GLOBAL_FLOWS}" 2>/dev/null || true
+
+# RPS (fan the per-packet receive work out across cores) is only worth its
+# cross-CPU cost when the hardware cannot already spread the load itself.
+if (( HW_QUEUES > 0 && HW_QUEUES < NCPU )); then
   for rxq in /sys/class/net/"${RTMP_INTERFACE}"/queues/rx-*; do
     [[ -w "${rxq}/rps_cpus" ]] && printf '%s' "${CPU_MASK}" > "${rxq}/rps_cpus" 2>/dev/null || true
+  done
+fi
+# RFS, by contrast, is worth setting whatever the queue count: it steers a
+# flow's softirq to the core already running that flow's socket, which is a
+# cache win on a multi-queue NIC too. Sized per rx queue so the per-queue
+# slices sum to the global table.
+if (( HW_QUEUES > 0 )); then
+  for rxq in /sys/class/net/"${RTMP_INTERFACE}"/queues/rx-*; do
     [[ -w "${rxq}/rps_flow_cnt" ]] &&
       printf '%s' "$(( GLOBAL_FLOWS / HW_QUEUES ))" > "${rxq}/rps_flow_cnt" 2>/dev/null || true
   done
-  for txq in /sys/class/net/"${RTMP_INTERFACE}"/queues/tx-*; do
-    [[ -w "${txq}/xps_cpus" ]] && printf '%s' "${CPU_MASK}" > "${txq}/xps_cpus" 2>/dev/null || true
-  done
 fi
+# XPS is transmit-side and was previously trapped inside the RPS condition,
+# so a NIC with one queue per core -- the case with the most egress to
+# spread -- got none of it. This path is pure egress: it must always be set.
+for txq in /sys/class/net/"${RTMP_INTERFACE}"/queues/tx-*; do
+  [[ -w "${txq}/xps_cpus" ]] && printf '%s' "${CPU_MASK}" > "${txq}/xps_cpus" 2>/dev/null || true
+done
 
 # A multi-queue NIC (after ethtool -L above) carries an "mq" root qdisc that
 # `tc qdisc replace root ...` cannot convert in place ("Change operation not
@@ -1255,7 +1367,31 @@ tc qdisc del dev "${RTMP_INTERFACE}" root >/dev/null 2>&1 || true
 TX_QUEUES="$(ls -d /sys/class/net/"${RTMP_INTERFACE}"/queues/tx-* 2>/dev/null | wc -l | tr -cd '0-9')"
 [[ "${TX_QUEUES}" =~ ^[0-9]+$ ]] || TX_QUEUES=1
 
-if (( TX_QUEUES > 1 )) && tc qdisc add dev "${RTMP_INTERFACE}" root handle 1: mq 2>/dev/null; then
+# Hard rule from the paragraph above: never install a single-lock shaper on a
+# link fast enough for the lock itself to become the ceiling. Above this rate
+# the shaper would cost more capacity than the join reserve it buys, so the
+# unshaped multi-queue path is chosen instead. Below it, one core can still
+# push the whole link and a single-queue CAKE is worth its per-flow fairness.
+SINGLE_LOCK_SHAPER_MAX_MBIT=10000
+if [[ "${RTMP_SHAPE_MODE:-shaped}" != "shaped" ]] ||
+   { (( TX_QUEUES <= 1 )) && (( RTMP_SHAPE_MBIT > SINGLE_LOCK_SHAPER_MAX_MBIT )); }; then
+  # Unshaped, but still fair and still parallel. On a multi-queue NIC "mq"
+  # gives every TX queue its own fq (one lock each); on a single-queue NIC a
+  # plain root fq is the same thing with one queue. Neither has a global
+  # rate limiter, so egress is bounded by the NIC and the cores, which is
+  # exactly the intent when the configured rate is a guess or when the only
+  # alternative is a one-core bottleneck.
+  if (( TX_QUEUES > 1 )) && tc qdisc add dev "${RTMP_INTERFACE}" root handle 1: mq 2>/dev/null; then
+    for (( _q = 1; _q <= TX_QUEUES; ++_q )); do
+      _fq_handle="$(printf '%x' $(( 0x200 + _q )))"
+      tc qdisc add dev "${RTMP_INTERFACE}" parent "1:${_q}" handle "${_fq_handle}:" \
+        fq limit 25000 flow_limit 1000 buckets 16384 >/dev/null 2>&1 || true
+    done
+  else
+    tc qdisc replace dev "${RTMP_INTERFACE}" root fq \
+      limit 100000 flow_limit 1000 buckets 65536 >/dev/null 2>&1 || true
+  fi
+elif (( TX_QUEUES > 1 )) && tc qdisc add dev "${RTMP_INTERFACE}" root handle 1: mq 2>/dev/null; then
   # Round the per-queue share up so the sum of caps is never below the
   # requested total (a floor division would under-shape by up to N-1 Mbit).
   PER_QUEUE_MBIT=$(( (RTMP_SHAPE_MBIT + TX_QUEUES - 1) / TX_QUEUES ))
@@ -1285,18 +1421,17 @@ elif (( RTMP_SHAPE_MBIT <= 10000 )) && modprobe sch_cake 2>/dev/null; then
   tc qdisc replace dev "${RTMP_INTERFACE}" root cake bandwidth "${RTMP_SHAPE_MBIT}Mbit" \
     besteffort dual-dsthost nat nowash || true
 else
-  # CAKE becomes CPU-expensive at 10G+ line rates and there is still only one
-  # queue to shape. HTB provides the required join headroom while fq fairly
-  # schedules the individual HTTP flows.
-  tc qdisc add dev "${RTMP_INTERFACE}" root handle 1: htb default 10 || true
-  tc class add dev "${RTMP_INTERFACE}" parent 1: classid 1:10 htb \
-    rate "${RTMP_SHAPE_MBIT}Mbit" ceil "${RTMP_SHAPE_MBIT}Mbit" burst 16m cburst 16m || true
-  tc qdisc add dev "${RTMP_INTERFACE}" parent 1:10 handle 10: \
-    fq limit 100000 flow_limit 1000 buckets 65536 || true
+  # Single queue at or below the single-lock threshold, and CAKE is
+  # unavailable (module missing). The old code shaped here with one HTB class
+  # anyway; that is the construct that produced the multi-Gbps ceiling, so it
+  # is not installed any more. Plain fq keeps per-flow fairness with no
+  # global rate lock -- the join reserve is lost, capacity is not.
+  tc qdisc replace dev "${RTMP_INTERFACE}" root fq \
+    limit 100000 flow_limit 1000 buckets 65536 >/dev/null 2>&1 || true
 fi
 EOF
-  chmod 0755 /usr/local/sbin/rtmp-network-tune
-  cat > /etc/systemd/system/rtmp-network-tune.service <<'EOF'
+chmod 0755 /usr/local/sbin/rtmp-network-tune
+cat > /etc/systemd/system/rtmp-network-tune.service <<'EOF'
 [Unit]
 Description=StreamForge fair egress queue
 After=network-online.target
@@ -1311,14 +1446,13 @@ RemainAfterExit=yes
 [Install]
 WantedBy=multi-user.target
 EOF
-  systemctl enable rtmp-network-tune.service >/dev/null
-else
-  systemctl disable --now rtmp-network-tune.service >/dev/null 2>&1 || true
-  # An idempotent rerun with fair queueing disabled must not leave the
-  # previous installer-managed CAKE qdisc active at an outdated link rate.
-  if [[ -f /etc/default/rtmp-network ]]; then
-    tc qdisc replace dev "${PRIMARY_INTERFACE}" root fq >/dev/null 2>&1 || true
-  fi
+systemctl enable rtmp-network-tune.service >/dev/null
+# An idempotent rerun that turns shaping off must not leave the previous
+# installer-managed CAKE/HTB qdisc active at an outdated rate. The tune script
+# replaces the root qdisc itself on every run, so clearing it here only covers
+# the window before that run.
+if [[ "${SHAPE_MODE}" != "shaped" ]]; then
+  tc qdisc replace dev "${PRIMARY_INTERFACE}" root fq >/dev/null 2>&1 || true
 fi
 
 log "Bounding system logs and configuring cache-edge delivery accounting"
@@ -1379,7 +1513,13 @@ if (( VARNISH_CACHE_MB > 262144 )); then VARNISH_CACHE_MB=262144; fi
 VARNISH_TRANSIENT_MB=$(( VARNISH_CACHE_MB / 8 ))
 if (( VARNISH_TRANSIENT_MB < 64 )); then VARNISH_TRANSIENT_MB=64; fi
 if (( VARNISH_TRANSIENT_MB > 8192 )); then VARNISH_TRANSIENT_MB=8192; fi
-VARNISH_THREAD_POOLS=$(( (WORKERS + 3) / 4 ))
+# One pool per core, not one per four. A pool is a scheduling domain, and a
+# thread is held for the whole of a segment delivery (.ts responses are
+# assembled with do_stream=false, so the thread stays with a slow client until
+# the last byte). Fewer pools than cores concentrates those held threads on
+# fewer queues and makes the per-pool spawn rate, not the CPU, the limit on
+# how fast a join wave is absorbed.
+VARNISH_THREAD_POOLS="${CPU_COUNT}"
 if (( VARNISH_THREAD_POOLS < 2 )); then VARNISH_THREAD_POOLS=2; fi
 if (( VARNISH_THREAD_POOLS > 16 )); then VARNISH_THREAD_POOLS=16; fi
 # thread_pool_max is capped at 5000 per pool by varnishd itself, so the real
@@ -1391,10 +1531,21 @@ VARNISH_THREAD_POOL_MAX=5000
 # Pre-warm a modest number per pool so a flash crowd is served without
 # waiting on thread spawn, but nowhere near the ceiling (pre-warmed threads
 # are actually allocated at startup). Scale gently with RAM, hard-capped so
-# min can never approach thread_pool_max and startup stays fast.
+# min stays below thread_pool_max and startup stays fast.
 VARNISH_THREAD_POOL_MIN=$(( MEM_TOTAL_KB / 40 / 80 / VARNISH_THREAD_POOLS ))
 if (( VARNISH_THREAD_POOL_MIN < 100 )); then VARNISH_THREAD_POOL_MIN=100; fi
-if (( VARNISH_THREAD_POOL_MIN > 1000 )); then VARNISH_THREAD_POOL_MIN=1000; fi
+# Ceiling raised from 1000 to 2500 per pool. A held segment-delivery thread
+# means concurrent viewers, not request rate, sets the thread requirement:
+# ~4-5k simultaneous deliveries need that many threads, and varnishd only
+# spawns beyond thread_pool_min at a throttled rate, so the pre-warmed floor
+# is what a join wave actually runs against. A thread's stack is lazily
+# committed, so the cost of a warm-but-idle thread is address space, not RSS.
+# Still comfortably below thread_pool_max so the pair stays valid.
+if (( VARNISH_THREAD_POOL_MIN > 2500 )); then VARNISH_THREAD_POOL_MIN=2500; fi
+# Never pre-warm more than the pool may ever hold.
+if (( VARNISH_THREAD_POOL_MIN > VARNISH_THREAD_POOL_MAX )); then
+  VARNISH_THREAD_POOL_MIN="${VARNISH_THREAD_POOL_MAX}"
+fi
 # Requests allowed to wait for a free thread before Varnish sheds load. Kept
 # large but within a value varnishd accepts across versions.
 VARNISH_THREAD_QUEUE_LIMIT=100000
@@ -1404,6 +1555,21 @@ VARNISH_THREAD_QUEUE_LIMIT=100000
 # cap left by an earlier install is stripped so re-runs converge to uncapped.
 install -m 0644 "${SOURCE_DIR}/deploy/varnish/streamforge.vcl" /etc/varnish/streamforge.vcl
 sed -i "/^[[:space:]]*\.max_connections = [0-9]\+;[[:space:]]*$/d" /etc/varnish/streamforge.vcl
+
+# The media-playlist TTL must track the segment duration: a playlist changes
+# once per segment, so caching it for half a segment is always within one
+# segment of fresh while halving origin playlist fetches. Shipped for the 6 s
+# default; rewritten here when the operator picked another duration, so the
+# cache keeps that ratio instead of over-fetching at 10 s or serving stale at
+# 3 s. Grace stays at three times the TTL, as in the shipped file.
+PLAYLIST_TTL=$(( HLS_TARGET_DURATION / 2 ))
+if (( PLAYLIST_TTL < 1 )); then PLAYLIST_TTL=1; fi
+if (( PLAYLIST_TTL != 3 )); then
+  sed -i "s/^\([[:space:]]*\)set beresp.ttl = 3s;$/\1set beresp.ttl = ${PLAYLIST_TTL}s;/" \
+    /etc/varnish/streamforge.vcl
+  sed -i "s/^\([[:space:]]*\)set beresp.grace = 9s;$/\1set beresp.grace = $(( PLAYLIST_TTL * 3 ))s;/" \
+    /etc/varnish/streamforge.vcl
+fi
 
 # When the edge-fetch gate is enabled on the origin, its own co-located
 # Varnish must present the token on every backend fetch or it locks itself
@@ -1440,7 +1606,7 @@ ExecStart=
 # -p as it parses, and thread_pool_min is rejected if it exceeds the
 # thread_pool_max currently in effect (the default 5000). Setting max first
 # keeps the pair consistent regardless of the numbers.
-ExecStart=/usr/sbin/varnishd -j unix,user=vcache -F -a 127.0.0.1:6081 -T localhost:6082 -f /etc/varnish/streamforge.vcl -S /etc/varnish/secret -s malloc,${VARNISH_CACHE_MB}m -s Transient=malloc,${VARNISH_TRANSIENT_MB}m -p thread_pools=${VARNISH_THREAD_POOLS} -p thread_pool_max=${VARNISH_THREAD_POOL_MAX} -p thread_pool_min=${VARNISH_THREAD_POOL_MIN} -p thread_queue_limit=${VARNISH_THREAD_QUEUE_LIMIT} -p nuke_limit=1000 -p listen_depth=65535
+ExecStart=/usr/sbin/varnishd -j unix,user=vcache -F -a 127.0.0.1:6081 -T localhost:6082 -f /etc/varnish/streamforge.vcl -S /etc/varnish/secret -s malloc,${VARNISH_CACHE_MB}m -s Transient=malloc,${VARNISH_TRANSIENT_MB}m -p thread_pools=${VARNISH_THREAD_POOLS} -p thread_pool_max=${VARNISH_THREAD_POOL_MAX} -p thread_pool_min=${VARNISH_THREAD_POOL_MIN} -p thread_queue_limit=${VARNISH_THREAD_QUEUE_LIMIT} -p thread_pool_add_delay=1 -p nuke_limit=1000 -p listen_depth=65535
 LimitNOFILE=${NOFILE}
 TasksMax=infinity
 LimitNPROC=infinity
@@ -1526,9 +1692,7 @@ if command -v ufw >/dev/null 2>&1 && [[ "${CONFIGURE_FIREWALL}" == "1" ]] &&
 fi
 
 systemctl daemon-reload
-if [[ "${ENABLE_FAIR_QUEUE}" == "1" ]]; then
-  systemctl restart rtmp-network-tune.service
-fi
+systemctl restart rtmp-network-tune.service
 systemctl enable rtmp-server.service >/dev/null
 systemctl restart rtmp-server.service
 
@@ -1645,14 +1809,17 @@ else
   printf '  Capacity estimate: %s viewers at %s Mbps (%s%% link, %s%% overhead)\n' \
     "${MAX_VIEWERS}" "${CAPACITY_STREAM_MBIT}" "${LINK_UTILIZATION_PERCENT}" "${PROTOCOL_OVERHEAD_PERCENT}"
 fi
-if [[ "${ENABLE_FAIR_QUEUE}" == "1" ]]; then
-  if (( SHAPE_MBIT <= 10000 )); then
-    printf '  Join reserve:     CAKE fair queue at %s Mbps (%s%% of link)\n' "${SHAPE_MBIT}" "${LINK_UTILIZATION_PERCENT}"
-  else
-    printf '  Join reserve:     HTB + fq at %s Mbps (%s%% of link)\n' "${SHAPE_MBIT}" "${LINK_UTILIZATION_PERCENT}"
-  fi
+if [[ "${SHAPE_MODE}" == "shaped" ]]; then
+  printf '  Join reserve:     per-queue shaping at %s Mbps (%s%% of link, %s)\n' \
+    "${SHAPE_MBIT}" "${LINK_UTILIZATION_PERCENT}" "${BANDWIDTH_SOURCE}"
+  printf '  Egress qdisc:     mq+HTB+fq per TX queue, or CAKE on a single queue at <=10 Gbps\n'
+elif [[ "${ENABLE_FAIR_QUEUE}" == "1" ]]; then
+  printf '  Join reserve:     off -- link speed is a planning fallback, not a measured rate\n'
+  printf '                    set RTMP_BANDWIDTH_MBIT=<provider Mbps> to enable shaping\n'
+  printf '  Egress qdisc:     unshaped fq per TX queue (no global rate lock)\n'
 else
   printf '  Join reserve:     disabled by RTMP_ENABLE_FAIR_QUEUE=0\n'
+  printf '  Egress qdisc:     unshaped fq per TX queue (NIC/IRQ tuning still applied)\n'
 fi
 if [[ "${CONFIGURE_DNS}" == "1" ]]; then
   printf '  Fallback DNS:     1.1.1.1, 8.8.8.8, 9.9.9.9 (via systemd-resolved)\n'

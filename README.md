@@ -100,11 +100,28 @@ viewer budget = bandwidth × utilization ÷ (per-viewer bitrate × protocol over
 The default high-density target uses 90% link utilization and 8% overhead;
 both are configurable. Fair egress shaping is enabled by default so the queue
 stays on the VPS, existing viewers cannot consume the last part of the uplink,
-and a new viewer's playlist/first segment receives a fair turn. It uses CAKE
-through 10 Gbps and HTB plus `fq` above it. Set the provider's real committed
-rate with `RTMP_BANDWIDTH_MBIT`; a virtual NIC's displayed speed may be higher.
-`RTMP_ENABLE_FAIR_QUEUE=0` is available only when external shaping already
-provides equivalent headroom and per-flow fairness.
+and a new viewer's playlist/first segment receives a fair turn.
+
+Shaping is applied **only against a link rate that is actually known** — one
+supplied through `RTMP_BANDWIDTH_MBIT`, or reported by a NIC that exposes its
+speed. Most virtual NICs hide it, and the installer's 20 Gbps planning
+fallback is a sizing placeholder, not a measurement; building a rate limiter
+on it can only cap throughput. On such a host the installer says so and leaves
+per-queue `fq` in place unshaped.
+
+Where a rate is known, every shaper is per-TX-queue: a multi-queue NIC gets
+`mq` with one HTB+`fq` per queue, and a single-queue NIC at or below 10 Gbps
+gets CAKE. A single root HTB class is never installed. One root shaper means
+one qdisc lock, which serialises all egress through a single core and caps the
+box a few Gbps below its link no matter how many cores it has — the shaper
+becoming the bottleneck it was meant to prevent.
+
+`RTMP_ENABLE_FAIR_QUEUE=0` disables the qdisc entirely, for hosts where
+external shaping already provides equivalent headroom and per-flow fairness.
+The rest of the network tuning — CPU governor, NIC queue count, ring sizes,
+interrupt coalescing, RPS/RFS/XPS steering — is applied on every install
+regardless, since keeping softirq work off a single core matters more, not
+less, when nothing is shaping.
 
 The detected/declared bandwidth and auto-bitrate mode are written to the
 installer-owned `runtime-config.json`, so the admin dashboard loads the server

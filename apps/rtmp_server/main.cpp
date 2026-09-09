@@ -414,15 +414,35 @@ int main(int argc, char** argv) {
                                                     const std::string& stream) {
         hls_handler.unregister_stream(application, stream);
     };
+    // One place decides the segment shape for every delivery surface: HLS
+    // ingest-transcode renditions, the HLS passthrough store, the segmenter,
+    // DASH and source jobs. These used to be the same literals repeated in
+    // five blocks, so the request rate a viewer generates -- the dominant
+    // cost at a large passthrough audience -- could not be tuned without a
+    // rebuild, and any change risked leaving one surface advertising a
+    // different window than the others.
+    const std::uint32_t hls_target_seconds = config.hls_target_duration_seconds;
+    const std::uint32_t hls_window_segments = config.hls_live_window_segments;
+    // Retention beyond the live window: enough for a player that is a little
+    // behind, scaled with the window rather than fixed.
+    const std::uint32_t hls_retention_segments =
+        std::max<std::uint32_t>(4, hls_window_segments / 2);
+    // Headroom above target so a stream whose keyframe cadence is not a clean
+    // divisor of the target is still cut on a keyframe rather than
+    // force-split mid-GOP. Passthrough cannot insert keyframes, so this
+    // headroom is what keeps segments valid for any publisher GOP.
+    const auto hls_target = std::chrono::seconds(hls_target_seconds);
+    const auto hls_max_segment = std::chrono::seconds(hls_target_seconds * 2);
+
     rtmp_server::transcoding::native::IngestTranscodeOptions ingest_options;
     // Same segment shape as the passthrough sink below, so both surfaces of
     // one publish advertise the same window depth and target duration.
-    ingest_options.target_duration_seconds = 6;
-    ingest_options.live_window_segments = 10;
-    ingest_options.retention_grace_segments = 6;
+    ingest_options.target_duration_seconds = hls_target_seconds;
+    ingest_options.live_window_segments = hls_window_segments;
+    ingest_options.retention_grace_segments = hls_retention_segments;
     ingest_options.max_total_bytes_per_rendition = 256u * 1024u * 1024u;
-    ingest_options.segment_target_duration = std::chrono::seconds(6);
-    ingest_options.max_segment_duration = std::chrono::seconds(12);
+    ingest_options.segment_target_duration = hls_target;
+    ingest_options.max_segment_duration = hls_max_segment;
     if (config.hls_low_latency) {
         ingest_options.part_target_duration = config.hls_part_target_duration;
     }
@@ -433,27 +453,31 @@ int main(int argc, char** argv) {
 #endif
 
     services.recorder_factory =
-        [&hls_handler, &dash_handler, &config, &stream_targets
+        [&hls_handler, &dash_handler, &config, &stream_targets,
+         // The segment shape is decided once above; copied in by value so
+         // every stream registered later builds the same window.
+         hls_target_seconds, hls_window_segments, hls_retention_segments, hls_target,
+         hls_max_segment
 #ifdef RTMP_NATIVE_TRANSCODE
          , &ingest_transcoder
 #endif
         ](std::string_view application,
                        std::string_view stream) -> std::shared_ptr<rtmp_server::protocol::commands::RecorderSink> {
             rtmp_server::hls::SegmentStoreConfig store_config;
-            // A deeper live window (10 x 6 s = 60 s) gives players a large
-            // rebuffer cushion, so an occasional upstream hiccup or backend
-            // hop does not stall playback.
-            store_config.live_window_segments = 10;
-            store_config.retention_grace_segments = 6;
+            // A deep live window (by default 10 x 6 s = 60 s) gives players a
+            // large rebuffer cushion, so an occasional upstream hiccup or
+            // backend hop does not stall playback.
+            store_config.live_window_segments = hls_window_segments;
+            store_config.retention_grace_segments = hls_retention_segments;
             store_config.max_total_bytes = 256u * 1024u * 1024u;
-            // 6 s segments: at a large single-box audience this cuts each
-            // viewer's playlist+segment request rate to a third of what 2 s
-            // segments produce (fewer packets, connections and conntrack
-            // churn) and keeps every fetch in bulk TCP transfer rather than
-            // slow-start. Trade-off is ~12-18 s more glass-to-glass latency,
+            // Segment duration sets each viewer's playlist+segment request
+            // rate: 6 s produces a third of the requests 2 s does (fewer
+            // packets, connections and conntrack churn) and keeps every fetch
+            // in bulk TCP transfer rather than slow-start. Trade-off is
+            // roughly three segment durations of glass-to-glass latency,
             // which a rebroadcast/IPTV audience does not notice. The encoder
-            // keyframe interval must divide this (2 s or 3 s GOP).
-            store_config.target_duration_seconds = 6;
+            // keyframe interval must divide this.
+            store_config.target_duration_seconds = hls_target_seconds;
             store_config.low_latency = config.hls_low_latency;
             store_config.part_target_duration = config.hls_part_target_duration;
             auto store = std::make_shared<rtmp_server::hls::SegmentStore>(store_config);
@@ -474,14 +498,11 @@ int main(int argc, char** argv) {
             }
 
             rtmp_server::hls::SegmenterConfig segmenter_config;
-            segmenter_config.target_duration = std::chrono::seconds(6);
+            segmenter_config.target_duration = hls_target;
             if (config.hls_low_latency) {
                 segmenter_config.part_target_duration = config.hls_part_target_duration;
             }
-            // Headroom above target so a stream whose keyframe cadence is not
-            // a clean divisor of 6 s is still cut on a keyframe rather than
-            // force-split mid-GOP.
-            segmenter_config.max_segment_duration = std::chrono::seconds(12);
+            segmenter_config.max_segment_duration = hls_max_segment;
             segmenter_config.max_segment_bytes = 24u * 1024u * 1024u;
 
             hls_handler.register_stream(std::string(application), std::string(stream), store);
@@ -509,18 +530,18 @@ int main(int argc, char** argv) {
                 return std::make_shared<FanOutSink>(std::move(extra));
             }
 
-            // Same 6 s cadence as the HLS store, so both delivery surfaces
+            // Same cadence as the HLS store, so both delivery surfaces
             // advertise the same live window depth for one publisher.
             rtmp_server::dash::SegmentStoreConfig dash_store_config;
-            dash_store_config.live_window_segments = 10;
-            dash_store_config.retention_grace_segments = 6;
+            dash_store_config.live_window_segments = hls_window_segments;
+            dash_store_config.retention_grace_segments = hls_retention_segments;
             dash_store_config.max_total_bytes = 256u * 1024u * 1024u;
-            dash_store_config.target_duration_seconds = 6;
+            dash_store_config.target_duration_seconds = hls_target_seconds;
             auto dash_store = std::make_shared<rtmp_server::dash::SegmentStore>(dash_store_config);
 
             rtmp_server::dash::SegmenterConfig dash_segmenter_config;
-            dash_segmenter_config.target_duration = std::chrono::seconds(6);
-            dash_segmenter_config.max_segment_duration = std::chrono::seconds(12);
+            dash_segmenter_config.target_duration = hls_target;
+            dash_segmenter_config.max_segment_duration = hls_max_segment;
             dash_segmenter_config.max_segment_bytes = 24u * 1024u * 1024u;
             auto dash_sink = std::make_shared<rtmp_server::dash::StreamSink>(
                 dash_store, std::move(dash_segmenter_config));
@@ -1110,17 +1131,16 @@ int main(int argc, char** argv) {
     // HTTP/admin traffic can never starve an in-flight transcode, and vice
     // versa. 0 (default) keeps today's behaviour of sizing from every core.
     source_job_options.transcode_cpu_reservation_percent = config.transcode_cpu_reservation_percent;
-    // 6 s output segments for pulled/transcoded sources, matching the RTMP
-    // ingest path above. On a large single-box audience this thirds each
-    // viewer's playlist+segment request rate versus 2 s segments; the
-    // per-rendition byte budget grows in step so a high-bitrate rendition
-    // still evicts on segment count, not on the cap.
-    source_job_options.target_duration_seconds = 6;
-    // Deeper live window (10 x 6 s): a pulled source is not under this
-    // server's control and can stall or hop CDN backends at any moment; a
-    // 60 s player cushion keeps playback smooth across that.
-    source_job_options.live_window_segments = 10;
-    source_job_options.retention_grace_segments = 6;
+    // Output segments for pulled/transcoded sources take the same shape as
+    // the RTMP ingest path above, so one publisher's surfaces never advertise
+    // different windows. The per-rendition byte budget stays fixed so a
+    // high-bitrate rendition still evicts on segment count, not on the cap.
+    source_job_options.target_duration_seconds = hls_target_seconds;
+    // A pulled source is not under this server's control and can stall or hop
+    // CDN backends at any moment; the window depth is the player's cushion
+    // across that.
+    source_job_options.live_window_segments = hls_window_segments;
+    source_job_options.retention_grace_segments = hls_retention_segments;
     source_job_options.max_total_bytes_per_rendition = 256u * 1024u * 1024u;
     rtmp_server::transcoding::native::SourceJobManager source_job_manager(std::move(source_hooks), store.get(),
                                                                           source_job_options);

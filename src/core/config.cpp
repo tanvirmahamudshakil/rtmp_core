@@ -218,6 +218,22 @@ Result<void> ServerConfig::validate() const {
     // accidental one- or two-character value almost certainly means a
     // templating mistake rather than an intentional token. Empty stays valid
     // (the gate is simply off).
+    // Below 2 s a player spends more time fetching than playing and the
+    // playlist churns faster than a cache TTL can usefully absorb; above 30 s
+    // the live window is minutes deep and a join waits for a segment that is
+    // still being written. Both ends are well outside anything a live
+    // deployment wants, so they are rejected rather than clamped.
+    if (hls_target_duration_seconds < 2 || hls_target_duration_seconds > 30) {
+        return Error(ErrorCode::InvalidConfiguration, ErrorCategory::Configuration,
+                      "hls_target_duration_seconds must be between 2 and 30");
+    }
+    // HLS requires at least three segments in a live window for a player to
+    // buffer without stalling; more than 60 turns every playlist fetch into a
+    // large response that every viewer re-downloads on every poll.
+    if (hls_live_window_segments < 3 || hls_live_window_segments > 60) {
+        return Error(ErrorCode::InvalidConfiguration, ErrorCategory::Configuration,
+                      "hls_live_window_segments must be between 3 and 60");
+    }
     if (!hls_edge_fetch_secret.empty() && hls_edge_fetch_secret.size() < 16) {
         return Error(ErrorCode::InvalidConfiguration, ErrorCategory::Configuration,
                       "hls_edge_fetch_secret must be at least 16 characters when set "
@@ -359,6 +375,8 @@ Result<ServerConfig> load_config(const std::string& path) {
     u32("output_chunk_size", cfg.output_chunk_size);
     u32("maximum_rtmp_message_size", cfg.maximum_rtmp_message_size);
     boolean("enable_hls_fast_join", cfg.enable_hls_fast_join);
+    u32("hls_target_duration_seconds", cfg.hls_target_duration_seconds);
+    u32("hls_live_window_segments", cfg.hls_live_window_segments);
     str("hls_edge_fetch_secret", cfg.hls_edge_fetch_secret);
     boolean("hls_low_latency", cfg.hls_low_latency);
     duration("hls_part_target_duration", cfg.hls_part_target_duration);

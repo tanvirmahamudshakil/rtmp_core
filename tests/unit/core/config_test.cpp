@@ -249,6 +249,38 @@ TEST(ServerConfigValidate, EdgeFetchSecretEmptyOrLongEnough) {
     EXPECT_TRUE(cfg.validate().ok());
 }
 
+TEST(ServerConfigValidate, BoundsTheLiveWindowShape) {
+    auto cfg = valid_config();
+    // The segment duration divides every viewer's request rate, so it is the
+    // knob an operator reaches for under load -- and the one most likely to be
+    // set to something a player cannot use. Both ends are rejected, not
+    // clamped, so a bad value fails at startup rather than degrading playback.
+    cfg.hls_target_duration_seconds = 1;
+    EXPECT_FALSE(cfg.validate().ok());
+
+    cfg.hls_target_duration_seconds = 31;
+    EXPECT_FALSE(cfg.validate().ok());
+
+    cfg.hls_target_duration_seconds = 2;
+    EXPECT_TRUE(cfg.validate().ok());
+
+    cfg.hls_target_duration_seconds = 30;
+    EXPECT_TRUE(cfg.validate().ok());
+
+    cfg.hls_target_duration_seconds = 10;  // the large-audience setting
+    EXPECT_TRUE(cfg.validate().ok());
+
+    // A window shorter than three segments cannot keep a player buffered.
+    cfg.hls_live_window_segments = 2;
+    EXPECT_FALSE(cfg.validate().ok());
+
+    cfg.hls_live_window_segments = 61;
+    EXPECT_FALSE(cfg.validate().ok());
+
+    cfg.hls_live_window_segments = 3;
+    EXPECT_TRUE(cfg.validate().ok());
+}
+
 TEST(ServerConfigValidate, RejectsNonPositiveTimeouts) {
     auto cfg = valid_config();
     cfg.idle_timeout = std::chrono::milliseconds{0};

@@ -105,6 +105,30 @@ else
   CACHE_SIZE="${STREAMFORGE_CACHE_SIZE}"
 fi
 
+# An edge node is pure delivery: its whole job is holding many simultaneous
+# viewer connections, and a .ts response holds a Varnish thread until the last
+# byte reaches a possibly slow client. Sizing the pools and the pre-warmed
+# floor by the machine (rather than the previous fixed one-pool/100-thread
+# default) is what keeps a join wave from queueing behind thread spawn -- the
+# same ceiling that showed up on the origin. See scripts/install-linux.sh for
+# the matching origin-side values.
+CPU_COUNT="$(nproc)"
+EDGE_THREAD_POOLS="${CPU_COUNT}"
+if (( EDGE_THREAD_POOLS < 2 )); then EDGE_THREAD_POOLS=2; fi
+if (( EDGE_THREAD_POOLS > 16 )); then EDGE_THREAD_POOLS=16; fi
+EDGE_THREAD_POOL_MAX=5000
+EDGE_THREAD_POOL_MIN=$(( MEM_KB / 40 / 80 / EDGE_THREAD_POOLS ))
+if (( EDGE_THREAD_POOL_MIN < 100 )); then EDGE_THREAD_POOL_MIN=100; fi
+if (( EDGE_THREAD_POOL_MIN > 2500 )); then EDGE_THREAD_POOL_MIN=2500; fi
+if (( EDGE_THREAD_POOL_MIN > EDGE_THREAD_POOL_MAX )); then
+  EDGE_THREAD_POOL_MIN="${EDGE_THREAD_POOL_MAX}"
+fi
+# A viewer costs one fd at Caddy, one at Varnish, plus the loopback pair
+# between them. The distro default (often 1024/65536) caps an edge far below
+# its bandwidth; the kernel's own nr_open is the honest ceiling.
+EDGE_NOFILE="$(cat /proc/sys/fs/nr_open 2>/dev/null || true)"
+[[ "${EDGE_NOFILE}" =~ ^[1-9][0-9]*$ ]] || EDGE_NOFILE=1048576
+
 log "role=${ROLE} node=${EDGE_NODE} upstream=${UPSTREAM_BARE} varnish=:${VARNISH_PORT} cache=${CACHE_SIZE}"
 
 log "Installing packages"
@@ -123,6 +147,12 @@ fi
 
 log "Configuring Varnish service"
 install -d -m 0755 /etc/systemd/system/varnish.service.d
+# workspace_client/backend are per-session, not per-request: at an edge's whole
+# job -- tens of thousands of simultaneous viewer sessions -- the 256k these
+# were set to reserves gigabytes to hold HLS request headers that measure
+# about a kilobyte. 64k is Varnish's own default and still ~60x headroom, and
+# the memory it gives back is memory the cache can hold segments in, which is
+# what actually raises the viewer ceiling.
 cat > /etc/systemd/system/varnish.service.d/streamforge-edge.conf <<EOF
 [Service]
 Environment=STREAMFORGE_EDGE_TOKEN=${TOKEN}
@@ -134,14 +164,27 @@ ExecStart=/usr/sbin/varnishd \\
   -f /etc/varnish/streamforge-edge.vcl \\
   -s malloc,${CACHE_SIZE} \\
   -p feature=+http2 \\
-  -p thread_pool_min=100 \\
-  -p thread_pool_max=5000 \\
-  -p workspace_client=256k \\
-  -p workspace_backend=256k \\
+  -p thread_pools=${EDGE_THREAD_POOLS} \\
+  -p thread_pool_max=${EDGE_THREAD_POOL_MAX} \\
+  -p thread_pool_min=${EDGE_THREAD_POOL_MIN} \\
+  -p thread_pool_add_delay=1 \\
+  -p thread_queue_limit=100000 \\
+  -p listen_depth=65535 \\
+  -p workspace_client=64k \\
+  -p workspace_backend=64k \\
   -p http_resp_hdr_len=8k \\
   -p http_resp_size=64k \\
   -p pipe_timeout=10s \\
   -F
+LimitNOFILE=${EDGE_NOFILE}
+TasksMax=infinity
+LimitNPROC=infinity
+EOF
+
+install -d -m 0755 /etc/systemd/system/caddy.service.d
+cat > /etc/systemd/system/caddy.service.d/streamforge-edge.conf <<EOF
+[Service]
+LimitNOFILE=${EDGE_NOFILE}
 EOF
 
 log "Configuring Caddy (outbound origin proxy${DOMAIN:+ + viewer TLS for ${DOMAIN}})"
@@ -166,8 +209,19 @@ http://127.0.0.1:${CADDY_ORIGIN_PORT} {
 
 # Viewer-facing entry. ${DOMAIN:+Automatic HTTPS for ${DOMAIN}.}${DOMAIN:+}
 ${VIEWER_SITE} {
-	encode zstd gzip
-	reverse_proxy 127.0.0.1:${VARNISH_PORT}
+	# Media is already compressed; compressing it again only burns CPU on the
+	# highest-volume path.
+	@compressible not path /hls/*
+	encode @compressible zstd gzip
+	reverse_proxy 127.0.0.1:${VARNISH_PORT} {
+		# Without a keepalive pool Caddy opens and closes a fresh loopback
+		# socket per burst of viewer requests, churning ephemeral ports and
+		# TIME_WAIT slots at exactly the audience size where it hurts.
+		transport http {
+			keepalive 5m
+			keepalive_idle_conns_per_host 4096
+		}
+	}
 }
 EOF
 

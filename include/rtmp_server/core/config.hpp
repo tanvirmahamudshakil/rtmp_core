@@ -140,6 +140,28 @@ struct ServerConfig {
     // `openssl rand -hex 32`).
     std::string hls_edge_fetch_secret;
 
+    // --- Live window sizing ----------------------------------------------
+    // Segment length, and with it the request rate every viewer generates:
+    // a player fetches one media playlist and one segment per segment
+    // duration, so the load on the cache, the TLS terminator and the origin
+    // scales as 1/duration. Going from 6 s to 10 s removes 40% of the
+    // requests at every hop for the same audience, at the cost of the same
+    // increase in end-to-end latency (a live window is about three segments).
+    // This was previously a literal repeated across the ingest, store,
+    // segmenter, DASH and source-job paths, which meant the single most
+    // effective scale knob in a passthrough deployment could only be changed
+    // by editing and rebuilding the server.
+    //
+    // Passthrough note: segment boundaries are keyframe boundaries. A value
+    // below the publisher's GOP length cannot be honoured -- the segmenter
+    // cuts on the next keyframe -- so raising it is reliable and lowering it
+    // is only advisory.
+    std::uint32_t hls_target_duration_seconds = 6;
+    // Segments kept in the live playlist. Multiplied by the duration above,
+    // this is the DVR depth a joining player can seek back through and the
+    // amount of media held in memory per stream.
+    std::uint32_t hls_live_window_segments = 10;
+
     // --- Low-Latency HLS -------------------------------------------------
     // Publish partial segments (EXT-X-PART) and answer blocking playlist
     // reloads, cutting live latency from roughly three segment durations to

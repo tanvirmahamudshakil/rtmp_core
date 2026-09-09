@@ -92,6 +92,125 @@ connection storm or many concurrent transcode threads and does not recede.
 The installer writes `4 × cores` on a transcoding host (Wowza's
 high-concurrency starting point) and `2` on a pure ingest/HLS origin.
 
+## What one passthrough viewer costs
+
+Passthrough is the cheap case on purpose: the publisher's H.264/AAC is
+segmented once per stream and every viewer is served the same bytes. Nothing
+in the delivery path is per-viewer work except the socket itself.
+
+Per stream, once, regardless of audience:
+
+* one segmenter, cutting on the publisher's own keyframes (no encode, no
+  decode, no frame ever touched);
+* one live window in memory, `hls_live_window_segments x
+  hls_target_duration_seconds` of media;
+* one cached object per segment and one per playlist generation in Varnish.
+
+Per viewer:
+
+* one socket at the TLS terminator, one at the cache;
+* `2 / hls_target_duration_seconds` requests per second -- one media playlist
+  poll and one segment fetch per segment;
+* its share of the uplink, which is the publisher's bitrate.
+
+Everything else is shared. The origin serves cache misses only, so its request
+rate is set by the number of distinct objects (segments per second per stream),
+not by the audience, and its bodies leave the process without a per-connection
+copy -- the segment buffer is refcounted and written straight to the socket
+(`AsyncHttpServer::Connection::out_body`).
+
+### The one knob that changes the slope
+
+Request rate is `2 / segment duration` per viewer, so segment length divides
+the load on every hop at once -- TLS handshakes and request parsing at Caddy,
+lookups at Varnish, packets and conntrack entries in the kernel:
+
+| `hls_target_duration_seconds` | requests/s per viewer | at 50,000 viewers |
+|---|---|---|
+| 2 | 1.0 | 50,000 rps |
+| 6 (default) | 0.33 | 16,700 rps |
+| 10 | 0.2 | 10,000 rps |
+
+The cost is latency: a live window is about three segments, so 10 s segments
+put a viewer roughly 30 s behind the publisher. For rebroadcast and IPTV that
+is invisible and the 40% request reduction is not. Set it with
+`RTMP_HLS_TARGET_DURATION` at install time, or `hls_target_duration_seconds`
+in `server.yaml`. The installer rewrites the cache's playlist TTL to half the
+segment duration to match, so the cache keeps absorbing polls at the same
+ratio.
+
+Segment boundaries are keyframe boundaries and passthrough cannot insert
+keyframes, so the publisher's GOP must divide the target. Raising the target
+is always safe; lowering it below the encoder's keyframe interval is advisory
+-- the segmenter still cuts on the next keyframe.
+
+### Memory per viewer, at the cache
+
+Varnish's `workspace_client` is allocated per session. At a large audience it
+is multiplied by the concurrent viewer count, so a generous-looking value is
+a direct subtraction from the memory available to cache segments -- and cache
+memory is what keeps hit rate high, which is what keeps the origin idle. HLS
+request headers are about a kilobyte; the 64k default is already ~60x
+headroom.
+
+## Host-level ceilings
+
+Every limit below sits outside the server process. Each one presents the same
+way from the outside -- throughput plateaus and new viewers stop joining while
+existing ones keep streaming -- so they are easy to mistake for an application
+limit. The installer now handles all four; they are documented here because a
+hand-built or pre-existing host will not have them.
+
+### Egress qdisc: never one root shaper
+
+A single root HTB class (or a single CAKE instance) shapes through one qdisc
+lock. Every outgoing packet on the NIC serialises through it, so total egress
+is bounded by what one core can push through that lock -- measured at a few
+Gbps on a link many times faster. At HLS bitrates that lands around four to
+five thousand viewers, and it does not move when cores, RAM or link speed are
+added, which is what makes it read as an application ceiling.
+
+`rtmp-network-tune` therefore installs shaping per TX queue (`mq` root, one
+HTB+`fq` per queue) so the work spreads across as many locks as there are
+queues. CAKE remains for a single-queue NIC at or below 10 Gbps, where one
+core can still drive the whole link. Above that, on a single queue, nothing is
+shaped: plain `fq` keeps per-flow fairness with no global rate lock.
+
+Shaping is also skipped whenever the configured rate is the installer's
+virtual-NIC fallback rather than a measured or operator-supplied one. Shaping
+to a guessed rate cannot protect a link whose real speed is unknown, and the
+guess is high enough to select the worst branch.
+
+### Softirq steering
+
+A virtio NIC commonly exposes one hardware queue, so every packet's softirq
+lands on one core and that core caps throughput while the rest idle. RPS fans
+receive work across CPUs when the hardware cannot; RFS returns each flow to
+the core running its socket. XPS is the transmit-side equivalent and is set
+unconditionally -- a NIC with one queue per core has the most egress to
+spread, and is exactly the case a receive-side condition would skip.
+
+### Varnish threads
+
+A `.ts` response is assembled whole (`do_stream=false`) and its thread is held
+until the last byte reaches the client, so the thread requirement tracks
+*concurrent viewers*, not request rate. Threads above `thread_pool_min` are
+spawned at a throttled rate, which makes the pre-warmed floor -- not the
+maximum -- what a join wave actually runs against. The installer sizes one
+pool per core and a RAM-scaled floor up to 2500 threads per pool.
+
+`varnishstat -1 | grep -E 'threads|sess_queued|sess_dropped'` shows this
+directly: a rising `threads_limited` or `sess_queued` means the ramp, not the
+cache, is the limit.
+
+### Connection tracking
+
+When a firewall loads `nf_conntrack`, its table is a hard per-flow ceiling
+that the kernel sizes from RAM. A full table refuses new connections while
+established ones continue undisturbed -- "nobody new can join past N" in its
+purest form. The installer sizes the table from the connection budget and
+shortens the timeouts that keep dead viewer flows occupying slots.
+
 ## Required production acceptance test
 
 Build and start the production server on the target Linux host. From a
