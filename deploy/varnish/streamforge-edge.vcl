@@ -83,6 +83,14 @@ sub vcl_recv {
         set req.url = regsub(req.url, "\?.*$", "");
     }
 
+    # Blocking LL-HLS reloads identify an exact media sequence/part and cannot
+    # share a cached response. Standard high-density HLS does not send this
+    # query and remains fully cache-collapsed.
+    if (req.url ~ "\.m3u8(?:\?.*)?$" &&
+        req.url ~ "[?&]_HLS_msn=[0-9]+(?:&|$)") {
+        return (pass);
+    }
+
     # Never forward a client-supplied edge token; this layer sets its own.
     unset req.http.X-Edge-Token;
 

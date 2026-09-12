@@ -241,6 +241,19 @@ Monitor:
 - `provided_buffer_exhaustion`; and
 - `partial_send_count`.
 
+That command validates direct RTMP fan-out. Validate the separate public HLS
+path through TLS, Caddy, and Varnish with the real copy/passthrough link:
+
+```bash
+URL=https://stream.example.com/hls/live/concert/master.m3u8 \
+VIEWERS=30000 RAMP=10m HOLD=30m \
+bash scripts/load-test-hls.sh
+```
+
+At this scale the generator side must be distributed unless one generator can
+supply the full audience bitrate; otherwise it is the generator, not the VPS,
+that the test measures.
+
 Do not advertise a viewer capacity higher than the largest run that passes on
 the actual server, NIC, kernel and network path. Direct RTMP capacity is
 bounded first by:

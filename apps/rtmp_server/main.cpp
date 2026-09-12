@@ -391,6 +391,22 @@ int main(int argc, char** argv) {
     rtmp_server::relay::StreamTargetManager stream_targets(store.get(), {});
     stream_targets.load_from_store();
 
+    // One place decides the segment shape for every delivery surface: HLS
+    // passthrough, ingest-transcode renditions, DASH, and pulled source jobs.
+    // These values are needed even when the optional native-transcode
+    // dependencies are unavailable, because ordinary RTMP -> HLS passthrough
+    // is always built.
+    const std::uint32_t hls_target_seconds = config.hls_target_duration_seconds;
+    const std::uint32_t hls_window_segments = config.hls_live_window_segments;
+    const std::uint32_t hls_retention_segments =
+        std::max<std::uint32_t>(4, (hls_window_segments * 3 + 4) / 5);
+    const auto hls_target = std::chrono::seconds(hls_target_seconds);
+    const auto hls_max_segment = std::chrono::seconds(hls_target_seconds * 2);
+    const std::uint64_t hls_media_seconds =
+        static_cast<std::uint64_t>(hls_window_segments + hls_retention_segments) * hls_target_seconds;
+    const std::uint64_t hls_store_max_bytes = std::min<std::uint64_t>(
+        2ull * 1024 * 1024 * 1024, hls_media_seconds * (256ull * 1024 * 1024) / 96);
+
 #ifdef RTMP_NATIVE_TRANSCODE
     // Transcoding of streams published *to* this origin. A stream with a
     // transcoding assignment keeps its untranscoded /hls/<app>/<stream>/
@@ -414,46 +430,6 @@ int main(int argc, char** argv) {
                                                     const std::string& stream) {
         hls_handler.unregister_stream(application, stream);
     };
-    // One place decides the segment shape for every delivery surface: HLS
-    // ingest-transcode renditions, the HLS passthrough store, the segmenter,
-    // DASH and source jobs. These used to be the same literals repeated in
-    // five blocks, so the request rate a viewer generates -- the dominant
-    // cost at a large passthrough audience -- could not be tuned without a
-    // rebuild, and any change risked leaving one surface advertising a
-    // different window than the others.
-    const std::uint32_t hls_target_seconds = config.hls_target_duration_seconds;
-    const std::uint32_t hls_window_segments = config.hls_live_window_segments;
-    // Retention beyond the live window: how far a player that has fallen
-    // behind can still fetch a segment that has scrolled out of the playlist.
-    // Scaled with the window rather than fixed, at the same 6-of-10 ratio the
-    // previous literals used -- so the default configuration produces exactly
-    // the values this file carried before the shape became configurable.
-    // Floored at 4 so a short window still tolerates a stalled player.
-    const std::uint32_t hls_retention_segments =
-        std::max<std::uint32_t>(4, (hls_window_segments * 3 + 4) / 5);
-    // Headroom above target so a stream whose keyframe cadence is not a clean
-    // divisor of the target is still cut on a keyframe rather than
-    // force-split mid-GOP. Passthrough cannot insert keyframes, so this
-    // headroom is what keeps segments valid for any publisher GOP.
-    const auto hls_target = std::chrono::seconds(hls_target_seconds);
-    const auto hls_max_segment = std::chrono::seconds(hls_target_seconds * 2);
-    // Byte ceiling per stream, derived from the media the window actually
-    // holds rather than fixed. A store evicts on whichever limit it hits
-    // first, so a fixed 256 MiB against a deeper or longer window would be
-    // reached before the window filled -- the playlist would quietly carry
-    // fewer segments than configured, which is the failure mode a operator
-    // raising the window is least likely to look for. The rate below is the
-    // one the previous fixed value implied at the default shape (16 segments
-    // x 6 s = 96 s in 256 MiB, about 21 Mbps), so the default configuration
-    // still resolves to exactly 256 MiB. Capped at 2 GiB per stream so an
-    // extreme window cannot become an unbounded memory commitment.
-    const std::uint64_t hls_media_seconds =
-        static_cast<std::uint64_t>(hls_window_segments + hls_retention_segments) * hls_target_seconds;
-    // 256 MiB per 96 s, written as the ratio so the default shape resolves to
-    // exactly the 256 MiB this file used to hard-code.
-    const std::uint64_t hls_store_max_bytes = std::min<std::uint64_t>(
-        2ull * 1024 * 1024 * 1024, hls_media_seconds * (256ull * 1024 * 1024) / 96);
-
     rtmp_server::transcoding::native::IngestTranscodeOptions ingest_options;
     // Same segment shape as the passthrough sink below, so both surfaces of
     // one publish advertise the same window depth and target duration.

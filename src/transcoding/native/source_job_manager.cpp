@@ -257,7 +257,9 @@ void SourceJobManager::start_locked(Job& job) {
     // for jobs started after it and a restart re-levels the rest.
     job.puller = std::make_unique<HlsSourcePuller>(
         job.config.source_url, job.renditions, job.config.fps, cpu_budget_locked(),
-        core::compute_cpu_partition(options_.transcode_cpu_reservation_percent).transcode_cores);
+        core::compute_cpu_partition(options_.transcode_cpu_reservation_percent).transcode_cores,
+        std::chrono::seconds(options_.target_duration_seconds),
+        std::chrono::seconds(options_.target_duration_seconds * 2));
     job.puller->start();
     job.enabled = true;
     job.detail_override.clear();

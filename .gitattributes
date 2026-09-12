@@ -1,0 +1,9 @@
+* text=auto eol=lf
+
+# These files execute on Linux hosts. A CRLF checkout makes the kernel/bash
+# treat the carriage return as part of the interpreter or shell token and can
+# stop the production installer before it applies any high-scale tuning.
+*.sh text eol=lf
+*.service text eol=lf
+*.timer text eol=lf
+*.vcl text eol=lf

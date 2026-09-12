@@ -92,11 +92,12 @@ timeout with the playlist as it stands, on stream end, and on unregistration —
 because a reset reads to a player as a media failure and costs a reconnect.
 
 **Interaction with the cache tier.** A blocking request carries `_HLS_msn` in
-its query, so it is a distinct cache key per live-edge position and several
-players asking for the same position collapse onto one origin request. Those
-parameters are stripped from the segment and part URIs inside the playlist
-body: a media URL carrying a live-edge position would be a distinct cache
-object per polling player for no benefit. Note that
+its query and bypasses the shared playlist cache so the event-driven origin
+can hold it until that exact position exists. Parts and complete segments are
+still immutable shared cache objects. This is why LL-HLS is opt-in rather than
+the maximum-density default: every player reaches the origin for blocking
+reloads instead of sharing one micro-cached standard playlist response. Note
+that
 `hls_blocking_reload_timeout` must stay below the cache tier's own backend
 timeout, or Varnish gives up on the held request before the origin answers it.
 
@@ -259,8 +260,9 @@ Routes (GET/HEAD only):
 
 The Linux production entry point creates one publisher-owned `hls::StreamSink`
 through `RecorderFactory` after publish authorization. Its default production
-target is 2 seconds with six advertised plus six grace segments and a 128 MiB
-per-stream hard cap. Publisher disconnect finalizes the trailing segment and
+target is 6 seconds with ten advertised plus six grace segments and a 256 MiB
+per-stream safety cap. That cap bounds one shared live window, not the viewer
+count. Publisher disconnect finalizes the trailing segment and
 marks the playlist ended; reconnect replaces the bounded store with a fresh
 media sequence.
 
@@ -274,9 +276,10 @@ media sequence.
 ### Maximum-scale public mode
 
 Production defaults `hls_high_scale_mode: true`. Caddy sends all `/hls/*`
-traffic through the same-VPS Varnish instance. A fresh playlist open passes to
-the origin once for a private opaque-session redirect. Redirected media
-playlists are shared for 1 second and masters for 30 seconds; their bodies omit
+traffic through the same-VPS Varnish instance. Varnish mints a private opaque
+session redirect for a fresh playlist open without involving the C++ origin.
+Redirected media playlists are shared for half the configured segment target
+(3 seconds at the 6-second default) and masters for 30 seconds; their bodies omit
 viewer-specific query values, so request collapse cannot leak one player's
 session to another. Varnish also request-collapses a hot segment's first fetch
 and caches the complete immutable segment for 1 hour. Segment sequence numbers
@@ -293,10 +296,10 @@ delivery-stats mutex remains disabled in this mode.
 
 ### Where a link's viewer count comes from
 
-The origin **cannot** count HLS viewers. A media playlist is cached for one
-second, so a thousand players polling one link produce roughly one origin
-request per second, and `HlsHttpHandler::link_stats` therefore reports about
-one viewer no matter how large the audience really is. Only the edge sees
+The origin **cannot** count HLS viewers. A media playlist is micro-cached, so
+thousands of players polling one link produce only one origin refresh per
+cache TTL, and `HlsHttpHandler::link_stats` therefore reports a tiny floor no
+matter how large the audience really is. Only the edge sees
 every request.
 
 The server reads the estimator's file itself (`control::EdgeViewerStats`,
@@ -430,8 +433,8 @@ entry.
   buffer manipulation — no syscalls, no disk, no locks — so it is safe there.
 - `SegmentStore` is the thread boundary: a short mutex, no I/O and no
   callbacks under the lock (3.7). Playlist rendering happens outside the lock.
-- `HlsHttpHandler` runs only on `HttpServer` worker threads and performs no
-  disk I/O at all.
+- `HlsHttpHandler` runs on `AsyncHttpServer` event-loop threads and performs
+  no disk I/O or blocking waits at all.
 
 ## Scaling past one box
 

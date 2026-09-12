@@ -191,18 +191,30 @@ Varnish; no external CDN is required. This removes per-viewer work inside the
 C++ origin, but it cannot reduce the VPS's bytes sent on its physical NIC; see
 `docs/high-density-rtmp.md` and `docs/hls.md`.
 
-Examples with the installer's default 90% utilization and 5% overhead:
+Examples with the installer's default 90% utilization and 8% overhead:
 
 | Committed bandwidth | Average per viewer | Calculated viewer budget |
 |---:|---:|---:|
-| 50,000 Mbps | 1.00 Mbps | 42,857 |
-| 50,000 Mbps | 0.85 Mbps | 50,420 |
-| 60,000 Mbps | 0.85 Mbps | 60,504 |
+| 50,000 Mbps | 1.00 Mbps | 41,666 |
+| 50,000 Mbps | 0.85 Mbps | 49,019 |
+| 60,000 Mbps | 0.85 Mbps | 58,823 |
 
 The installer also scales the process connection ceiling, per-worker receive
 buffer pool and systemd file-descriptor limit from the pre-live safety budget.
 The dashboard's live viewer estimate uses the current measured bitrate, not
 that sizing floor.
+
+Validate the actual HLS path (TLS -> Caddy -> Varnish -> origin) from external
+load-generator hosts before match day. For a 30,000-viewer run:
+
+```bash
+URL=https://stream.example.com/hls/live/match/master.m3u8 \
+VIEWERS=30000 RAMP=10m HOLD=30m \
+bash scripts/load-test-hls.sh
+```
+
+The generators must collectively have enough egress to download the real
+stream bitrate 30,000 times; otherwise the generator is the measured ceiling.
 
 ## Development build
 

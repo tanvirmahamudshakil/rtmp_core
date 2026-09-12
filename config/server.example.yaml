@@ -95,13 +95,18 @@ hls_edge_fetch_secret: ""
 # durations to roughly one part. Costs one extra cached object per part and
 # holds one socket per blocked player. See docs/hls.md "Low-Latency HLS".
 #
+# Enable only when sub-segment latency is more important than maximum viewer
+# density. A blocking LL-HLS playlist request bypasses the shared playlist
+# cache by design, and each player requests several parts per second. Standard
+# 6-second HLS is the production default for large sports/TV audiences.
+#
 # ON for a far / lossy audience -- this is the "first data fast" lever: a
 # fresh viewer begins playback after fetching ONE ~250 ms part (tens of KB
 # at a low rung) instead of waiting for a whole ~2 s segment. Non-LL players
 # fall back to normal segment playback automatically. Watch the origin's
 # held-socket count after enabling (one per player blocked on a reload);
 # keep hls_blocking_reload_timeout below the Varnish backend timeout.
-hls_low_latency: true
+hls_low_latency: false
 hls_part_target_duration: 250ms
 # Must stay below the cache tier's backend timeout, or the edge gives up on a
 # held request before this origin answers it.

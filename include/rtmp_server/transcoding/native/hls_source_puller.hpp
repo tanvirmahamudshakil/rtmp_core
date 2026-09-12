@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -43,7 +44,9 @@ public:
     // pool, is the thread that opens the encoder directly).
     HlsSourcePuller(std::string source_url, std::vector<PullerRendition> renditions,
                     std::uint32_t fps = 30, std::uint32_t cpu_budget = 0,
-                    std::vector<unsigned> pinned_cores = {});
+                    std::vector<unsigned> pinned_cores = {},
+                    std::chrono::milliseconds target_duration = std::chrono::seconds(6),
+                    std::chrono::milliseconds max_segment_duration = std::chrono::seconds(12));
     ~HlsSourcePuller();
     HlsSourcePuller(const HlsSourcePuller&) = delete;
     HlsSourcePuller& operator=(const HlsSourcePuller&) = delete;
@@ -73,6 +76,8 @@ private:
     std::uint32_t fps_;
     std::uint32_t cpu_budget_ = 0;
     std::vector<unsigned> pinned_cores_;
+    std::chrono::milliseconds target_duration_;
+    std::chrono::milliseconds max_segment_duration_;
 
     std::thread thread_;
     std::atomic<bool> running_{false};

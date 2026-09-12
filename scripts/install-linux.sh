@@ -38,6 +38,11 @@
 #                                raise it for a large passthrough audience
 #                                that can absorb the matching latency.
 #   RTMP_HLS_LIVE_WINDOW_SEGMENTS Segments in the live playlist (default 10).
+#   RTMP_ENABLE_LOW_LATENCY_HLS   0 (default) keeps the maximum-density,
+#                                cache-collapsed standard HLS path. 1 enables
+#                                blocking LL-HLS reloads and partial segments;
+#                                use it only when latency matters more than the
+#                                highest possible viewer count.
 #   RTMP_ENABLE_FAIR_QUEUE       1 (default) shapes at the configured link
 #                                utilization target and fairly schedules viewer
 #                                flows, reserving capacity for new joins.
@@ -154,6 +159,7 @@ ENABLE_FAIR_QUEUE="${RTMP_ENABLE_FAIR_QUEUE:-1}"
 # requests at 4 s more latency.
 HLS_TARGET_DURATION="${RTMP_HLS_TARGET_DURATION:-6}"
 HLS_LIVE_WINDOW_SEGMENTS="${RTMP_HLS_LIVE_WINDOW_SEGMENTS:-10}"
+ENABLE_LOW_LATENCY_HLS="${RTMP_ENABLE_LOW_LATENCY_HLS:-0}"
 CONFIGURE_FIREWALL="${RTMP_CONFIGURE_FIREWALL:-1}"
 CONFIGURE_DNS="${RTMP_CONFIGURE_DNS:-1}"
 FORCE_ROTATE="${RTMP_FORCE_ROTATE_SECRETS:-0}"
@@ -209,6 +215,8 @@ fi
 [[ "${HLS_LIVE_WINDOW_SEGMENTS}" =~ ^[0-9]+$ ]] &&
   (( HLS_LIVE_WINDOW_SEGMENTS >= 3 && HLS_LIVE_WINDOW_SEGMENTS <= 60 )) ||
   die "RTMP_HLS_LIVE_WINDOW_SEGMENTS must be between 3 and 60."
+[[ "${ENABLE_LOW_LATENCY_HLS}" =~ ^[01]$ ]] ||
+  die "RTMP_ENABLE_LOW_LATENCY_HLS must be 0 or 1."
 [[ "${CONFIGURE_FIREWALL}" =~ ^[01]$ ]] || die "RTMP_CONFIGURE_FIREWALL must be 0 or 1."
 [[ "${CONFIGURE_DNS}" =~ ^[01]$ ]] || die "RTMP_CONFIGURE_DNS must be 0 or 1."
 [[ "${FORCE_ROTATE}" =~ ^[01]$ ]] || die "RTMP_FORCE_ROTATE_SECRETS must be 0 or 1."
@@ -737,6 +745,11 @@ cmake --fresh --preset production "${NATIVE_TRANSCODE_CMAKE_ARGS[@]}"
 cmake --build --preset production --clean-first --parallel "${CPU_COUNT}"
 SERVER_BINARY="${SOURCE_DIR}/build/production/apps/rtmp_server/rtmp_server"
 [[ -x "${SERVER_BINARY}" ]] || die "Production server binary was not produced."
+if [[ "${NATIVE_TRANSCODE}" == "1" ]] &&
+   ! grep -q -- 'RTMP_NATIVE_TRANSCODE=1' \
+     "${SOURCE_DIR}/build/production/compile_commands.json"; then
+  die "Native source-copy/transcode support was requested but its dependencies were not linked."
+fi
 SERVER_BINARY_SHA256="$(sha256sum "${SERVER_BINARY}" | awk '{ print $1 }')"
 [[ "${SERVER_BINARY_SHA256}" =~ ^[0-9a-f]{64}$ ]] ||
   die "Could not calculate the production server binary SHA-256."
@@ -882,6 +895,7 @@ RTMP_SERVER_ENABLE_SQPOLL=$([[ "${ENABLE_SQPOLL}" == "1" ]] && echo true || echo
 RTMP_SERVER_ENABLE_HLS_FAST_JOIN=$([[ "${ENABLE_FAST_JOIN}" == "1" ]] && echo true || echo false)
 RTMP_SERVER_HLS_TARGET_DURATION_SECONDS=${HLS_TARGET_DURATION}
 RTMP_SERVER_HLS_LIVE_WINDOW_SEGMENTS=${HLS_LIVE_WINDOW_SEGMENTS}
+RTMP_SERVER_HLS_LOW_LATENCY=$([[ "${ENABLE_LOW_LATENCY_HLS}" == "1" ]] && echo true || echo false)
 RTMP_SERVER_PROVIDED_BUFFER_COUNT=${PROVIDED_BUFFER_COUNT}
 RTMP_SERVER_PROVIDED_BUFFER_SIZE=${PROVIDED_BUFFER_SIZE}
 # Per-connection transport tuning. A pinned 256 KiB send buffer bounds
@@ -1107,13 +1121,17 @@ EOF
 #  1. NOTRACK every loopback packet. Caddy->Varnish->origin is three
 #     127.0.0.1 connections per viewer that conntrack has no reason to
 #     track; skipping them removes the bulk of the table's growth.
-#  2. Size what remains (real public client flows) from RAM -- budget 12% of
-#     RAM at ~320 B/entry -- and widen the hash to match so lookups stay
-#     O(1). Short TCP timeouts recycle closed flows fast.
+#  2. Size what remains (real public client flows) from both RAM and the
+#     calculated physical connection budget, then widen the hash to match so
+#     lookups stay O(1). Short TCP timeouts recycle closed flows fast.
 # ~5% of RAM at ~400 B per tracked flow (entry + hash slot). Loopback is
 # already untracked below, so this only has to hold real public client
 # flows. Floor keeps a small box usable; ceiling keeps a huge box sane.
 CONNTRACK_MAX=$(( MEM_TOTAL_KB * 1024 * 5 / 100 / 400 ))
+CONNTRACK_CONNECTION_FLOOR=$(( MAX_CONNECTIONS * 4 ))
+if (( CONNTRACK_MAX < CONNTRACK_CONNECTION_FLOOR )); then
+  CONNTRACK_MAX="${CONNTRACK_CONNECTION_FLOOR}"
+fi
 if (( CONNTRACK_MAX < 262144 )); then CONNTRACK_MAX=262144; fi
 if (( CONNTRACK_MAX > 33554432 )); then CONNTRACK_MAX=33554432; fi
 CONNTRACK_HASHSIZE=$(( CONNTRACK_MAX / 2 ))
@@ -1179,36 +1197,10 @@ fi
 if modprobe tcp_bbr 2>/dev/null && sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -qw bbr; then
   printf '%s\n' 'net.ipv4.tcp_congestion_control = bbr' >> /etc/sysctl.d/60-streamforge.conf
 fi
-# Connection tracking, when a firewall has loaded it, is a per-flow table with
-# its own hard ceiling -- and the kernel sizes that ceiling from RAM, not from
-# how many viewers the box is expected to serve. A full table drops new
-# connections outright while every existing viewer keeps streaming, so it
-# presents exactly as "nobody new can join past N". Sized to the connection
-# budget with room for closing flows, and only written when the module is
-# actually loaded: these keys do not exist otherwise, and sysctl --system
-# would fail the install on them.
-if [[ -d /proc/sys/net/netfilter ]] || modprobe nf_conntrack 2>/dev/null; then
-  CONNTRACK_MAX=$(( MAX_CONNECTIONS * 4 ))
-  if (( CONNTRACK_MAX < 262144 )); then CONNTRACK_MAX=262144; fi
-  if (( CONNTRACK_MAX > 4194304 )); then CONNTRACK_MAX=4194304; fi
-  cat > /etc/sysctl.d/61-streamforge-conntrack.conf <<EOF
-net.netfilter.nf_conntrack_max = ${CONNTRACK_MAX}
-# A closed viewer connection otherwise holds its table slot for 120s, so at a
-# high join/leave rate the dead entries outnumber the live ones.
-net.netfilter.nf_conntrack_tcp_timeout_time_wait = 30
-net.netfilter.nf_conntrack_tcp_timeout_close_wait = 15
-net.netfilter.nf_conntrack_tcp_timeout_fin_wait = 30
-EOF
-  # Bucket count is a module parameter, not a sysctl; keeping it at a quarter
-  # of max holds the average hash chain short instead of turning a large
-  # table into a long-list lookup on every packet.
-  if [[ -w /sys/module/nf_conntrack/parameters/hashsize ]]; then
-    printf '%s' "$(( CONNTRACK_MAX / 4 ))" > /sys/module/nf_conntrack/parameters/hashsize 2>/dev/null || true
-  fi
-  log "Connection tracking table sized to ${CONNTRACK_MAX} flows"
-else
+if [[ ! -d /proc/sys/net/netfilter ]]; then
   rm -f /etc/sysctl.d/61-streamforge-conntrack.conf
 fi
+log "Connection tracking table sized to ${CONNTRACK_MAX} flows"
 sysctl --system >/dev/null
 
 if [[ "${CONFIGURE_DNS}" == "1" ]] && command -v systemctl >/dev/null 2>&1 &&
@@ -1800,6 +1792,11 @@ if [[ "${ENABLE_FAST_JOIN}" == "1" ]]; then
   printf '  Fast join:         every stream master.m3u8 -> its lowest-bitrate rendition\n'
 else
   printf '  Fast join:         disabled by RTMP_ENABLE_FAST_JOIN=0\n'
+fi
+if [[ "${ENABLE_LOW_LATENCY_HLS}" == "1" ]]; then
+  printf '  HLS latency mode:  LL-HLS enabled (lower latency, materially higher request/socket load)\n'
+else
+  printf '  HLS latency mode:  maximum-density standard HLS (shared playlist cache enabled)\n'
 fi
 if [[ "${BITRATE_MODE}" == "auto" ]]; then
   printf '  Bitrate source:   OBS/transcoder traffic, measured after publishing starts\n'

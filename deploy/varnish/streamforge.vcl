@@ -108,6 +108,13 @@ sub vcl_recv {
 
             return (synth(750, "streamforge-session"));
         }
+        # A blocking LL-HLS reload names an exact media sequence/part. It is
+        # not interchangeable with another viewer's request and must reach
+        # the event-driven origin. Normal high-scale playlists (the default)
+        # still take the shared hash path below.
+        if (req.url ~ "[?&]_HLS_msn=[0-9]+(?:&|$)") {
+            return (pass);
+        }
         unset req.http.Cookie;
         unset req.http.Authorization;
         return (hash);

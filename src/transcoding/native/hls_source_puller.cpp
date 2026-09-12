@@ -242,12 +242,16 @@ inline void feed_passthrough_audio(hls::RenditionFeed& feed, std::span<const std
 
 HlsSourcePuller::HlsSourcePuller(std::string source_url, std::vector<PullerRendition> renditions,
                                  std::uint32_t fps, std::uint32_t cpu_budget,
-                                 std::vector<unsigned> pinned_cores)
+                                 std::vector<unsigned> pinned_cores,
+                                 std::chrono::milliseconds target_duration,
+                                 std::chrono::milliseconds max_segment_duration)
     : source_url_(std::move(source_url)),
       renditions_(std::move(renditions)),
       fps_(std::max<std::uint32_t>(fps, 1)),
       cpu_budget_(cpu_budget),
-      pinned_cores_(std::move(pinned_cores)) {}
+      pinned_cores_(std::move(pinned_cores)),
+      target_duration_(target_duration),
+      max_segment_duration_(max_segment_duration) {}
 
 HlsSourcePuller::~HlsSourcePuller() { stop(); }
 
@@ -401,19 +405,14 @@ void HlsSourcePuller::run() {
     segmenters.reserve(renditions_.size());
     feeds.reserve(renditions_.size());
     publishers.reserve(renditions_.size());
-    // Output segment length for pulled/transcoded sources. This must match
-    // the SegmentStore's target_duration_seconds (SourceJobManager::Options,
-    // wired in apps/rtmp_server/main.cpp) so #EXT-X-TARGETDURATION and the
-    // live-window math agree with the pieces actually produced. 6s is chosen
-    // for single-box scale: it cuts each viewer's playlist+segment request
-    // rate to a third of what 1-2s segments produce (far fewer packets,
-    // connections and conntrack entries per viewer) and keeps every fetch in
-    // bulk TCP transfer. The cost is added latency, which a rebroadcast
-    // audience does not notice. The segmenter still only cuts on a keyframe,
-    // so a source with sparse keyframes rounds up toward max_segment_duration.
+    // Output segment length for pulled/transcoded sources. These values come
+    // from SourceJobManager::Options, which is wired to the same server-wide
+    // HLS duration as RTMP ingest. Keeping them aligned matters especially in
+    // copy/passthrough mode: the store must not advertise a target/window
+    // shape different from the segments the puller actually cuts.
     hls::SegmenterConfig base_segmenter_config;
-    base_segmenter_config.target_duration = std::chrono::milliseconds(6000);
-    base_segmenter_config.max_segment_duration = std::chrono::milliseconds(12000);
+    base_segmenter_config.target_duration = target_duration_;
+    base_segmenter_config.max_segment_duration = max_segment_duration_;
     // Segment URLs are immutable at the CDN. A whole server process restart
     // loses the in-memory store, so starting again at segment-0.ts would make
     // active sessions receive stale cached bytes. A wall-clock floor keeps

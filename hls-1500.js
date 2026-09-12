@@ -2,10 +2,23 @@ import http from "k6/http";
 import { check, sleep } from "k6";
 import { Counter, Rate } from "k6/metrics";
 
-const MASTER_URL =
-  __ENV.URL || "http://23.19.228.53/hls/test/probe/master.m3u8";
+const MASTER_URL = __ENV.URL;
+if (!MASTER_URL || !/^https?:\/\//.test(MASTER_URL)) {
+  throw new Error("URL must be a full http(s) HLS master/media-playlist URL");
+}
 
-const HOLD_TIME = __ENV.HOLD || "30m";
+function positiveInteger(value, fallback) {
+  const parsed = Number(value);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+// Keep the checked-in default laptop-safe. Production acceptance should set
+// VIEWERS=20000 or VIEWERS=30000 and run from enough external generators to
+// provide the stream's full aggregate bandwidth.
+const VIEWERS = positiveInteger(__ENV.VIEWERS, 1000);
+const RAMP_TIME = __ENV.RAMP || "5m";
+const HOLD_TIME = __ENV.HOLD || "10m";
+const RAMP_DOWN_TIME = __ENV.RAMP_DOWN || "2m";
 const QUALITY = (__ENV.QUALITY || "auto").toLowerCase();
 
 export const segmentDownloads = new Counter("hls_segments_downloaded");
@@ -23,20 +36,9 @@ export const options = {
       startVUs: 0,
 
       stages: [
-        // Gradually connect viewers
-        { duration: "1m", target: 100 },
-        { duration: "2m", target: 300 },
-        { duration: "2m", target: 500 },
-        { duration: "3m", target: 800 },
-        { duration: "3m", target: 1000 },
-        { duration: "3m", target: 1250 },
-        { duration: "3m", target: 1500 },
-
-        // All 1500 viewers continue watching
-        { duration: HOLD_TIME, target: 1500 },
-
-        // Graceful disconnect
-        { duration: "2m", target: 0 },
+        { duration: RAMP_TIME, target: VIEWERS },
+        { duration: HOLD_TIME, target: VIEWERS },
+        { duration: RAMP_DOWN_TIME, target: 0 },
       ],
 
       gracefulRampDown: "30s",
@@ -55,6 +57,7 @@ export const options = {
 
 let mediaPlaylistURL = null;
 let initialized = false;
+let firstMediaPlaylist = true;
 
 const downloadedResources = new Set();
 const resourceQueue = [];
@@ -69,12 +72,15 @@ const USER_AGENTS = [
   "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_6) AppleWebKit/605.1.15 Version/17.6 Safari/605.1.15",
 ];
 
-// Each VU keeps same UA during its session.
-const viewerUserAgent = USER_AGENTS[(__VU - 1) % USER_AGENTS.length];
+function viewerUserAgent() {
+  // Evaluate inside VU code. __VU is zero in k6's init context, so computing
+  // this at module load can select index -1 and silently omit the header.
+  return USER_AGENTS[(__VU - 1) % USER_AGENTS.length];
+}
 
 function playlistHeaders() {
   return {
-    "User-Agent": viewerUserAgent,
+    "User-Agent": viewerUserAgent(),
     Accept: "application/vnd.apple.mpegurl, application/x-mpegURL, */*",
     "Cache-Control": "no-cache",
     Pragma: "no-cache",
@@ -83,7 +89,7 @@ function playlistHeaders() {
 
 function segmentHeaders() {
   return {
-    "User-Agent": viewerUserAgent,
+    "User-Agent": viewerUserAgent(),
     Accept: "*/*",
   };
 }
@@ -150,14 +156,17 @@ function fetchMasterPlaylist() {
     return null;
   }
 
-  return response.body;
+  // k6 follows redirects. The final URL is essential when StreamForge fast
+  // join redirects master.m3u8 to a rendition: relative segment URIs belong
+  // beside that final media playlist, not beside the original master URL.
+  return { body: response.body, url: response.url || MASTER_URL };
 }
 
 // =====================================================
 // Variant selection
 // =====================================================
 
-function selectVariant(master) {
+function selectVariant(master, masterURL) {
   const lines = master
     .split(/\r?\n/)
     .map((x) => x.trim())
@@ -181,7 +190,7 @@ function selectVariant(master) {
     for (let next = i + 1; next < lines.length; next++) {
       if (!lines[next].startsWith("#")) {
         variants.push({
-          url: resolveURL(MASTER_URL, lines[next]),
+          url: resolveURL(masterURL, lines[next]),
 
           bandwidth,
         });
@@ -198,7 +207,7 @@ function selectVariant(master) {
       master.includes("#EXTINF") ||
       master.includes("#EXT-X-TARGETDURATION")
     ) {
-      return MASTER_URL;
+      return masterURL;
     }
 
     return null;
@@ -393,7 +402,7 @@ function initializeViewer() {
     return false;
   }
 
-  mediaPlaylistURL = selectVariant(master);
+  mediaPlaylistURL = selectVariant(master.body, master.url);
 
   if (!mediaPlaylistURL) {
     console.error(`VU ${__VU}: no media playlist found`);
@@ -436,6 +445,10 @@ function watchStream() {
     return;
   }
 
+  // Retain StreamForge's session-bearing final URL after the first redirect,
+  // just as a player does. Polling the undecorated rendition forever would
+  // add one synthetic 302 per cycle and overstate cache-tier work.
+  mediaPlaylistURL = response.url || mediaPlaylistURL;
   const playlist = parseMediaPlaylist(response.body, mediaPlaylistURL);
 
   // -----------------------------
@@ -461,9 +474,10 @@ function watchStream() {
    * near live edge rather than downloading
    * entire historical playlist.
    */
-  if (downloadedResources.size === 0 && segments.length > 3) {
+  if (firstMediaPlaylist && segments.length > 3) {
     segments = segments.slice(-3);
   }
+  firstMediaPlaylist = false;
 
   for (const segment of segments) {
     if (hasResource(segment)) {
