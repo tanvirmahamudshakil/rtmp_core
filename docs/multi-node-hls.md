@@ -10,6 +10,11 @@ CPU:
 concurrent viewers  ≈  usable uplink Mbps  ÷  stream Mbps
 ```
 
+Use the measured encoded bitrate, not the frame size. `480p` is a resolution,
+not a bitrate, and copy/passthrough preserves whatever bitrate the publisher
+sent. For example, 20 Gbit/s with 10% protocol/traffic headroom and a measured
+4.7 Mbit/s stream is only about 3,830 simultaneous deliveries from one NIC.
+
 To go past that ceiling — more total bandwidth, viewers on other continents,
 resilience to one machine failing — add **edge** nodes. Each edge is a pure
 cache (Varnish + Caddy, no `rtmp_server`, no database) that pulls from the
@@ -96,6 +101,10 @@ stale windows so a momentarily unreachable origin never stalls playback:
 
 - Segment URLs have their query string stripped in `vcl_recv` (a `.ts` is
   immutable and uniquely named) to maximise the hit ratio.
+- Playlist request queries remain visible to `varnishncsa` for per-viewer
+  accounting, but are excluded from `vcl_hash`. Thus `viewer_session` does
+  not create a private cached copy for every player; all viewers share one
+  playlist object, matching the origin's sessionless cache identity.
 - Request cookies are dropped — delivery objects are shared across viewers.
 - A non-200 always gets a short **positive** TTL, never `uncacheable`, so a
   404/5xx burst is coalesced into one origin round trip instead of a
@@ -108,9 +117,20 @@ Every response carries `X-Cache: HIT|MISS`, `X-Cache-Hits`, and
 
 ## Directing viewers across edges
 
-The origin returns HLS URLs built from its own hostname. For multi-node you
-publish the link under a name that resolves to the edges, not the origin.
-Options, cheapest first:
+The origin installer exposes one stable, health-aware entry URL:
+
+```text
+https://stream.example.com/play/<application>/<stream>
+```
+
+It returns HTTP 302 to the least-loaded healthy edge registered by heartbeat.
+Equal-load nodes are round-robined immediately between heartbeat intervals;
+nodes with no declared capacity are compared by their actual active-viewer
+count instead of all being treated as equally full. This is the closest small
+self-managed equivalent to Wowza's HTTP redirect/load-balancer flow.
+
+For a larger fleet, DNS or a load-balancer can direct viewers to edges without
+the redirect hop. Options, cheapest first:
 
 1. **Round-robin DNS** — multiple `A`/`AAAA` records for `cdn.example.com`,
    one per edge. Clients spread themselves; a dead edge still gets ~`1/N` of
@@ -162,6 +182,8 @@ sudo env \
   STREAMFORGE_ORIGIN=https://stream.example.com \
   STREAMFORGE_EDGE_TOKEN=<the token from step 1> \
   STREAMFORGE_DOMAIN=edge-eu-1.example.com \
+  STREAMFORGE_NODE_REGION=eu \
+  STREAMFORGE_NODE_CAPACITY=4000 \
   bash deploy/edge/install-edge.sh
 ```
 
@@ -182,14 +204,26 @@ sudo env \
 
 Then reinstall each edge with `STREAMFORGE_UPSTREAM=https://shield.example.com`.
 
-### 4. Point viewer DNS at the edges
+For `ROLE=edge`, the installer also starts `viewer-estimator.service`. The
+heartbeat sends its de-duplicated cache-hit viewer count to the origin every
+10 seconds; it does not mistake Caddy's small pooled connection count for the
+audience. A shield reports zero viewers because its traffic is cache fan-in.
 
-Per "Directing viewers across edges" above.
+### 4. Use dynamic redirect or point viewer DNS at the edges
+
+For the built-in dynamic path, give the player:
+
+```text
+https://stream.example.com/play/live/demo
+```
+
+Or use DNS/LB routing per "Directing viewers across edges" above.
 
 ## Verifying
 
 ```bash
 # From anywhere:
+curl -s -D - -o /dev/null https://stream.example.com/play/live/demo | grep -i '^location:'
 curl -sI https://edge-eu-1.example.com/hls/live/demo/index.m3u8 | grep -i 'x-cache\|x-edge'
 #   X-Cache: HIT            <- second request within the TTL
 #   X-Edge-Role: edge
@@ -198,6 +232,10 @@ curl -sI https://edge-eu-1.example.com/hls/live/demo/index.m3u8 | grep -i 'x-cac
 # On an edge:
 varnishstat            # MAIN.cache_hit / MAIN.cache_miss ratio
 varnishlog -g request  # per-request trace, backend fetches, grace hits
+cat /var/www/streamforge/internal/viewer_estimate.json
+
+# On the origin: confirm edge registration and reported load
+curl -s https://stream.example.com/api/v1/cluster/nodes
 ```
 
 A healthy edge under load shows a cache hit ratio well above 95% (every
@@ -215,11 +253,9 @@ segment after the first viewer, every playlist poll inside the 1s window).
 
 ## Observability across edges
 
-Each edge runs its own `varnishncsa`; there is no single aggregated HLS viewer
-count across the fleet yet (`edge_viewer_stats_path` on the origin reads one
-file from one co-located estimator). Until fleet aggregation lands, per-edge
-`varnishstat` / `varnishncsa` and the origin's own `/metrics`
-(`hls_active_viewers` from the local estimator, RTMP counters) are the
-sources. A simple approach that works today: run `viewer-estimator` on each
-edge writing to shared storage (or pushed to the origin) and sum the
-per-stream counts externally.
+Each edge runs `viewer-estimator`, and its heartbeat publishes the total to
+the origin's cluster registry. `/api/v1/cluster/capacity` therefore reports
+fleet-wide total viewers and declared capacity. Per-stream fleet aggregation
+is not yet centralized: use each edge's estimator JSON (or ship those small
+snapshots to shared monitoring) when per-stream rather than per-node totals
+are required.

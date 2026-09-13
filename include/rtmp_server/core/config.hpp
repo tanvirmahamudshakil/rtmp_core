@@ -92,11 +92,10 @@ struct ServerConfig {
     // throughput-optimal default Wowza recommends for a well-provisioned
     // link. A non-zero value pins SO_SNDBUF / SO_RCVBUF and disables
     // autotuning for that direction (the kernel still doubles the value and
-    // floors it at its own minimum). The send default is deliberately small:
-    // it bounds per-viewer kernel memory at high fan-out and surfaces a slow
-    // receiver to the application write queue early enough for the playback
-    // policy's keyframe-aware shedding to act.
-    std::uint32_t client_send_buffer_bytes = 256 * 1024;
+    // floors it at its own minimum). Both defaults follow Wowza's high-load
+    // guidance and leave sizing to the kernel; deployments that need a hard
+    // per-viewer memory bound can still opt into a non-zero value.
+    std::uint32_t client_send_buffer_bytes = 0;
     std::uint32_t client_receive_buffer_bytes = 0;
     // TCP_NOTSENT_LOWAT: the unsent byte count the kernel will hold before it
     // stops reporting the socket writable, so pacing runs against a small

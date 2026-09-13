@@ -290,6 +290,11 @@ process only reports the signal, it does not provision anything itself. See
 `docs/transcoder-dispatch.md` for running dedicated pull/transcode/push worker
 nodes behind that registry.
 
+The Linux installer publishes that redirect as the stable player URL
+`/play/<application>/<stream>` (for example
+`https://stream.example.com/play/live/main-stage`), while direct edge links
+remain `/hls/<application>/<stream>/index.m3u8`.
+
 Not included: WebRTC, SRT, multi-node state replication, leader election or
 origin failover (lose the origin process and you lose the control plane —
 backup publisher failover covers a dead *source*, not a dead origin),

@@ -898,11 +898,10 @@ RTMP_SERVER_HLS_LIVE_WINDOW_SEGMENTS=${HLS_LIVE_WINDOW_SEGMENTS}
 RTMP_SERVER_HLS_LOW_LATENCY=$([[ "${ENABLE_LOW_LATENCY_HLS}" == "1" ]] && echo true || echo false)
 RTMP_SERVER_PROVIDED_BUFFER_COUNT=${PROVIDED_BUFFER_COUNT}
 RTMP_SERVER_PROVIDED_BUFFER_SIZE=${PROVIDED_BUFFER_SIZE}
-# Per-connection transport tuning. A pinned 256 KiB send buffer bounds
-# per-viewer kernel memory at high fan-out and surfaces a slow receiver to
-# the write queue sooner; receive stays on kernel autosizing. notsent_lowat
-# keeps pacing running against a small unsent queue.
-RTMP_SERVER_CLIENT_SEND_BUFFER_BYTES=262144
+# Per-connection transport tuning. Leave send/receive sizing to the kernel,
+# matching Wowza's high-load recommendation; notsent_lowat still prevents an
+# excessive unsent write queue without pinning SO_SNDBUF itself.
+RTMP_SERVER_CLIENT_SEND_BUFFER_BYTES=0
 RTMP_SERVER_CLIENT_RECEIVE_BUFFER_BYTES=0
 RTMP_SERVER_CLIENT_TCP_NOTSENT_LOWAT_BYTES=131072
 MALLOC_ARENA_MAX=${MALLOC_ARENA_MAX_VALUE}${EDGE_TOKEN:+
@@ -1630,6 +1629,16 @@ ${CADDY_SITE} {
     @control path /api/*
     handle @control {
         uri strip_prefix /api
+        reverse_proxy 127.0.0.1:8080
+    }
+
+    # Wowza-style public redirect listener: the stable playback URL stays on
+    # the origin while the control plane issues a 302 to the least-loaded,
+    # healthy edge. This is intentionally narrower than exposing the whole
+    # management API without its /api prefix.
+    @play path_regexp play ^/play/([^/]+)/([^/]+)/?$
+    handle @play {
+        rewrite * /v1/cluster/redirect/{re.play.1}:{re.play.2}?format=hls
         reverse_proxy 127.0.0.1:8080
     }
 

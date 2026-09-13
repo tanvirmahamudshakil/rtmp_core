@@ -276,8 +276,11 @@ int main(int argc, char** argv) {
     // output behind real time. Shared mode also forces playlist bodies to stay
     // free of per-viewer query state (see the HlsHttpHandler constructor), which
     // is what makes one cached object correct for every player.
-    hls_options.enable_shared_playlist_cache = true;
-    hls_options.playlist_cache_control = "public, max-age=1, s-maxage=1, stale-while-revalidate=2";
+    hls_options.enable_shared_playlist_cache = config.hls_high_scale_mode;
+    if (config.hls_high_scale_mode) {
+        hls_options.playlist_cache_control =
+            "public, max-age=1, s-maxage=1, stale-while-revalidate=2";
+    }
     // Delivery accounting stays on. The admin panel prefers the edge's own
     // per-session numbers from /internal/viewer_estimate.json when they are
     // fresh and match a stream's key (admin/src/api.ts sourceEdgeValue /
@@ -851,10 +854,9 @@ int main(int argc, char** argv) {
                                                 rtmp_server::core::ErrorCategory::Configuration,
                                                 "no healthy node can take a new viewer");
             }
-            // The address a node heartbeats with is a bare host (see
-            // STREAMFORGE_NODE_ADDRESS); the scheme is always https, matching
-            // every deployment's viewer-facing entry (Caddy terminates TLS on
-            // both an origin and an edge).
+            // New installers heartbeat the exact viewer-facing URL, including
+            // its scheme. Preserve compatibility with older nodes that sent a
+            // bare host by treating those as HTTPS.
             std::string base = node->address;
             if (!base.starts_with("http://") && !base.starts_with("https://")) {
                 base = "https://" + base;

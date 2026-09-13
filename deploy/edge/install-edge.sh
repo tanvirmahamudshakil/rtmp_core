@@ -37,6 +37,9 @@
 #                             allowed to reach the internal Varnish port.
 #   STREAMFORGE_EDGE_NODE     Node label surfaced as the X-Edge-Node header.
 #                             Default: the hostname.
+#   STREAMFORGE_NODE_ADDRESS  Exact viewer-facing URL advertised by dynamic
+#                             placement. Defaults to https://DOMAIN, or
+#                             http://EDGE_NODE when no domain is configured.
 #   STREAMFORGE_CACHE_SIZE    Varnish malloc store. Default: 75% of RAM,
 #                             floor 1g.
 #   STREAMFORGE_VARNISH_PORT  Internal Varnish listen port. Default 6081.
@@ -85,11 +88,21 @@ NODE_REGION="${STREAMFORGE_NODE_REGION:-}"
 NODE_CAPACITY="${STREAMFORGE_NODE_CAPACITY:-0}"
 CONFIGURE_FIREWALL="${RTMP_CONFIGURE_FIREWALL:-1}"
 
+if [[ -n "${STREAMFORGE_NODE_ADDRESS:-}" ]]; then
+  NODE_ADDRESS="${STREAMFORGE_NODE_ADDRESS%/}"
+elif [[ -n "${DOMAIN}" ]]; then
+  NODE_ADDRESS="https://${DOMAIN}"
+else
+  NODE_ADDRESS="http://${EDGE_NODE}"
+fi
+
 [[ -n "${ORIGIN}" ]]  || die "STREAMFORGE_ORIGIN is required (e.g. https://stream.example.com)."
 [[ -n "${TOKEN}"  ]]  || die "STREAMFORGE_EDGE_TOKEN is required and must match the origin."
 (( ${#TOKEN} >= 16 )) || die "STREAMFORGE_EDGE_TOKEN must be at least 16 characters."
 [[ "${ROLE}" == "edge" || "${ROLE}" == "shield" ]] || die "STREAMFORGE_ROLE must be 'edge' or 'shield'."
 [[ "${UPSTREAM}" =~ ^https://[^/]+ ]] || die "upstream must be an https:// URL: ${UPSTREAM}"
+[[ "${NODE_ADDRESS}" =~ ^https?://[^[:space:]]+$ ]] || \
+  die "STREAMFORGE_NODE_ADDRESS must be an http:// or https:// viewer URL."
 [[ "${ROLE}" != "shield" || -n "${EDGE_CIDRS}" ]] || \
   warn "shield role with no STREAMFORGE_EDGE_CIDRS: the internal Varnish port will not be firewalled to edges."
 
@@ -134,7 +147,7 @@ log "role=${ROLE} node=${EDGE_NODE} upstream=${UPSTREAM_BARE} varnish=:${VARNISH
 log "Installing packages"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
-apt-get install -y --no-install-recommends varnish caddy curl ca-certificates >/dev/null
+apt-get install -y --no-install-recommends varnish caddy curl ca-certificates python3 >/dev/null
 
 log "Installing edge VCL"
 install -D -m 0644 "${EDGE_VCL_SRC}" /etc/varnish/streamforge-edge.vcl
@@ -144,6 +157,26 @@ if [[ "${EDGE_PROBE}" == "disabled" ]]; then
   sed -i '/\.probe = {/,/^    }/d' /etc/varnish/streamforge-edge.vcl
   log "  health probe disabled per STREAMFORGE_EDGE_PROBE"
 fi
+
+VCL_CHECK_OUTPUT="$(mktemp /tmp/streamforge-edge-vcl-check.XXXXXX)"
+if ! STREAMFORGE_EDGE_TOKEN="${TOKEN}" STREAMFORGE_EDGE_ROLE="${ROLE}" \
+     STREAMFORGE_EDGE_NODE="${EDGE_NODE}" \
+     varnishd -C -f /etc/varnish/streamforge-edge.vcl >"${VCL_CHECK_OUTPUT}" 2>&1; then
+  sed 's/^/[varnishd] /' "${VCL_CHECK_OUTPUT}" >&2
+  rm -f -- "${VCL_CHECK_OUTPUT}"
+  die "generated edge VCL failed to compile"
+fi
+rm -f -- "${VCL_CHECK_OUTPUT}"
+
+log "Installing cache-hit viewer estimator"
+install -d -m 0755 /var/www/streamforge/internal
+install -m 0755 "${REPO_ROOT}/deploy/viewer-estimator/viewer_estimator.py" \
+  /usr/local/bin/viewer_estimator.py
+install -m 0644 "${REPO_ROOT}/deploy/viewer-estimator/viewer-estimator.service" \
+  /etc/systemd/system/viewer-estimator.service
+# The estimator reads Varnish's shared-memory log directly. The distro access
+# logger would duplicate that traffic to disk at viewer-request rate.
+systemctl disable --now varnishncsa.service >/dev/null 2>&1 || true
 
 log "Configuring Varnish service"
 install -d -m 0755 /etc/systemd/system/varnish.service.d
@@ -259,10 +292,15 @@ if [[ -n "${MANAGEMENT_URL}" ]]; then
   log "Installing cluster heartbeat (node ${EDGE_NODE}, role ${ROLE})"
   install -m 0755 "$(dirname "$0")/streamforge-node-heartbeat.sh" \
     /usr/local/bin/streamforge-node-heartbeat
+  HEARTBEAT_ESTIMATOR_DEPS=""
+  if [[ "${ROLE}" == "edge" ]]; then
+    HEARTBEAT_ESTIMATOR_DEPS=$'After=viewer-estimator.service\nWants=viewer-estimator.service'
+  fi
   cat > /etc/systemd/system/streamforge-node-heartbeat.service <<EOF
 [Unit]
 Description=StreamForge cluster heartbeat
 After=network-online.target varnish.service
+${HEARTBEAT_ESTIMATOR_DEPS}
 
 [Service]
 Type=oneshot
@@ -270,8 +308,9 @@ Environment=STREAMFORGE_MANAGEMENT_URL=${MANAGEMENT_URL}
 Environment=STREAMFORGE_NODE_ID=${EDGE_NODE}
 Environment=STREAMFORGE_NODE_ROLE=${ROLE}
 Environment=STREAMFORGE_NODE_REGION=${NODE_REGION}
-Environment=STREAMFORGE_NODE_ADDRESS=$([[ -n "${DOMAIN}" ]] && echo "${DOMAIN}" || echo "${EDGE_NODE}")
+Environment=STREAMFORGE_NODE_ADDRESS=${NODE_ADDRESS}
 Environment=STREAMFORGE_NODE_CAPACITY=${NODE_CAPACITY}
+Environment=STREAMFORGE_VIEWER_STATS_PATH=/var/www/streamforge/internal/viewer_estimate.json
 ExecStart=/usr/local/bin/streamforge-node-heartbeat
 EOF
   # Every 10 s, comfortably inside the origin's 30 s heartbeat window, so one
@@ -296,6 +335,12 @@ log "Starting services"
 systemctl daemon-reload
 systemctl enable --now caddy >/dev/null
 systemctl restart varnish
+if [[ "${ROLE}" == "edge" ]]; then
+  systemctl enable --now viewer-estimator.service >/dev/null
+  systemctl restart viewer-estimator.service
+else
+  systemctl disable --now viewer-estimator.service >/dev/null 2>&1 || true
+fi
 if [[ -n "${MANAGEMENT_URL}" ]]; then
   systemctl enable --now streamforge-node-heartbeat.timer >/dev/null
 fi
@@ -319,6 +364,7 @@ $(printf '\033[1;32m[edge] %s node ready\033[0m' "${ROLE}")
   Node label     : ${EDGE_NODE}
   Fetches from   : ${UPSTREAM_BARE}
   Viewer entry   : $([[ -n "${DOMAIN}" ]] && echo "https://${DOMAIN}" || echo "http://<this-host-ip>  (no domain set)")
+  Advertised URL : ${NODE_ADDRESS}
   Cache store    : ${CACHE_SIZE} (malloc)
   Cluster        : $([[ -n "${MANAGEMENT_URL}" ]] && echo "heartbeating to ${MANAGEMENT_URL} as ${EDGE_NODE}" || echo "not registered (no STREAMFORGE_MANAGEMENT_URL)")
   HLS link shape : <viewer-entry>/hls/<app>/<stream>/index.m3u8

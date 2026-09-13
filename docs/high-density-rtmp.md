@@ -66,11 +66,10 @@ Configured limits are safety ceilings, not performance claims.
 Per accepted socket, `IoUringEventLoop::on_accept` applies (Wowza's "Tune
 Wowza Streaming Engine for optimal performance" maps onto these):
 
-- `client_send_buffer_bytes` — `SO_SNDBUF`. Default 256 KiB. A pinned value
-  bounds per-viewer kernel memory at high fan-out and makes a slow receiver
-  visible to the application write queue (and so to the keyframe-aware
-  slow-viewer policy) sooner. `0` restores kernel autosizing, which is the
-  throughput-optimal choice on a link with headroom to spare.
+- `client_send_buffer_bytes` — `SO_SNDBUF`. Default `0` (kernel autosizing),
+  matching Wowza's high-load guidance. A pinned value trades throughput
+  flexibility for a hard per-viewer kernel-memory bound and makes a slow
+  receiver visible to the application queue sooner.
 - `client_receive_buffer_bytes` — `SO_RCVBUF`. Default `0` (autosize); the
   playback path receives almost nothing, so pinning it only helps a
   publisher socket on a lossy path.

@@ -165,6 +165,33 @@ TEST(NodeRegistryTest, LocatePrefersTheLeastLoadedNode) {
     EXPECT_EQ(chosen->id, "edge-2");
 }
 
+TEST(NodeRegistryTest, LocateRoundRobinsEquallyLoadedEdgesBetweenHeartbeats) {
+    FakeStore store;
+    NodeRegistry registry(&store, {});
+    ASSERT_TRUE(registry.heartbeat(beat("edge-1", NodeRole::Edge, "eu", 1000, 100), 1'000));
+    ASSERT_TRUE(registry.heartbeat(beat("edge-2", NodeRole::Edge, "eu", 1000, 100), 1'000));
+
+    std::unordered_map<std::string, std::size_t> selections;
+    for (int i = 0; i < 6; ++i) {
+        const auto chosen = registry.locate("eu", 1'000);
+        ASSERT_TRUE(chosen.has_value());
+        ++selections[chosen->id];
+    }
+    EXPECT_EQ(selections["edge-1"], 3u);
+    EXPECT_EQ(selections["edge-2"], 3u);
+}
+
+TEST(NodeRegistryTest, LocateBalancesUnsizedEdgesByReportedViewers) {
+    FakeStore store;
+    NodeRegistry registry(&store, {});
+    ASSERT_TRUE(registry.heartbeat(beat("edge-busy", NodeRole::Edge, "eu", 0, 900), 1'000));
+    ASSERT_TRUE(registry.heartbeat(beat("edge-free", NodeRole::Edge, "eu", 0, 100), 1'000));
+
+    const auto chosen = registry.locate("eu", 1'000);
+    ASSERT_TRUE(chosen.has_value());
+    EXPECT_EQ(chosen->id, "edge-free");
+}
+
 // Region is a stronger signal than load: a viewer on another continent gains
 // more from a nearby edge than from a marginally emptier one.
 TEST(NodeRegistryTest, LocatePrefersTheRequestedRegionOverLoad) {

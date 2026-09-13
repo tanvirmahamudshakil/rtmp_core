@@ -72,9 +72,15 @@ sub vcl_recv {
         return (synth(403, "Forbidden"));
     }
 
-    # Delivery objects are shared across all viewers; a request cookie can
-    # only poison the shared cache key or leak between viewers.
-    unset req.http.Cookie;
+    # A fresh playlist has no shared-cache marker yet. Let the origin mint its
+    # private 302/session response without storing a hit-for-miss object under
+    # the same queryless hash used by the redirected shared playlist. Preserve
+    # the identity cookie on this one pass so a returning player keeps its
+    # session; the cookie is removed from every shared object below.
+    if (req.url ~ "\.m3u8(?:\?.*)?$" &&
+        req.url !~ "[?&]viewer_cache=1(?:&|$)") {
+        return (pass);
+    }
 
     # Normalise segment URLs to their immutable identity: a .ts is uniquely
     # named and never varies by query, so dropping the query string collapses
@@ -91,6 +97,10 @@ sub vcl_recv {
         return (pass);
     }
 
+    # Delivery objects are shared across all viewers; a request cookie can
+    # only poison the shared response or leak between viewers.
+    unset req.http.Cookie;
+
     # Never forward a client-supplied edge token; this layer sets its own.
     unset req.http.X-Edge-Token;
 
@@ -98,7 +108,17 @@ sub vcl_recv {
 }
 
 sub vcl_hash {
-    hash_data(req.url);
+    # Keep the original query in VSL so viewer_estimator can count the
+    # per-player `viewer_session` on cache HITs, but use the same sessionless
+    # object identity as the origin cache. Previously every viewer's
+    # `viewer_session=...` produced a separate edge object, defeating cache
+    # sharing and request coalescing on the machine that serves the audience.
+    # Blocking LL-HLS requests already returned (pass) in vcl_recv above.
+    if (req.url ~ "\.(m3u8|ts)(?:\?.*)?$") {
+        hash_data(regsub(req.url, "\?.*$", ""));
+    } else {
+        hash_data(req.url);
+    }
     if (req.http.host) {
         hash_data(req.http.host);
     } else {

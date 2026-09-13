@@ -163,7 +163,9 @@ between them.
 3. prefer the requested region;
 4. prefer an edge over an origin (sending viewers to the box that also ingests
    and packages is exactly what the edge tier exists to prevent);
-5. among equals, take the lowest `active_viewers / capacity_viewers`.
+5. among sized nodes, take the lowest `active_viewers / capacity_viewers`;
+   when every candidate is unsized, take the lowest raw `active_viewers`;
+6. round-robin exact ties, so a join burst spreads before the next heartbeat.
 
 It answers `503 no_node_available` when nothing can take a viewer, which is
 what an external load balancer or redirector needs to see. A node silent for

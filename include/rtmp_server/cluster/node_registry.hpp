@@ -169,6 +169,10 @@ private:
     // here too, out of the heartbeat's reach, and re-merged into the row on
     // every heartbeat and every read.
     std::unordered_map<std::string, bool> forced_draining_;
+    // Heartbeats arrive in coarse intervals. Without a tie-break cursor, a
+    // burst that lands between heartbeats sends every equally-loaded viewer
+    // to whichever unordered_map entry happens to be visited first.
+    mutable std::uint64_t placement_cursor_ = 0;
 };
 
 } // namespace rtmp_server::cluster

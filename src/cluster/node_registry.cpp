@@ -243,7 +243,8 @@ std::optional<NodeStatus> NodeRegistry::least_loaded(NodeRole role, std::int64_t
 std::optional<NodeStatus> NodeRegistry::locate(std::string_view region_hint,
                                                std::int64_t now_unix) const {
     std::lock_guard<std::mutex> lock(mutex_);
-    std::optional<NodeStatus> best;
+    std::vector<NodeStatus> eligible;
+    eligible.reserve(nodes_.size());
     for (const auto& [id, row] : nodes_) {
         const auto candidate = status_of_locked(row, now_unix);
         if (!candidate.healthy || candidate.draining) continue;
@@ -251,35 +252,83 @@ std::optional<NodeStatus> NodeRegistry::locate(std::string_view region_hint,
         // viewers at all; neither is a delivery destination.
         if (candidate.role != NodeRole::Edge && candidate.role != NodeRole::Origin) continue;
         // A node reporting itself at or past its sized ceiling is full. An
-        // unsized node (capacity 0, load 1.0) is not excluded by this: its load
-        // simply loses every comparison.
+        // unsized node remains eligible, but loses to a sized node below.
         if (candidate.capacity_viewers != 0 &&
             candidate.active_viewers >= candidate.capacity_viewers) {
             continue;
         }
-        if (!best) {
-            best = candidate;
-            continue;
+        eligible.push_back(candidate);
+    }
+    if (eligible.empty()) return std::nullopt;
+
+    // Region affinity is preferred when at least one node in that region can
+    // serve. Otherwise retain all nodes and fall back across regions.
+    const bool has_requested_region = !region_hint.empty() &&
+        std::ranges::any_of(eligible, [&](const NodeStatus& node) {
+            return node.region == region_hint;
+        });
+    if (has_requested_region) {
+        std::erase_if(eligible, [&](const NodeStatus& node) {
+            return node.region != region_hint;
+        });
+    }
+
+    // An origin is the fallback, never the preference: sending viewers to the
+    // box that also ingests and packages is what the edge tier exists to avoid.
+    if (std::ranges::any_of(eligible, [](const NodeStatus& node) {
+            return node.role == NodeRole::Edge;
+        })) {
+        std::erase_if(eligible, [](const NodeStatus& node) {
+            return node.role != NodeRole::Edge;
+        });
+    }
+
+    // Prefer nodes with declared capacity, because their load ratios are
+    // meaningful. When every candidate is unsized, active-viewer count is
+    // still a much better signal than treating all of them as load=1.0.
+    const bool has_sized_node = std::ranges::any_of(eligible, [](const NodeStatus& node) {
+        return node.capacity_viewers != 0;
+    });
+    if (has_sized_node) {
+        std::erase_if(eligible, [](const NodeStatus& node) {
+            return node.capacity_viewers == 0;
+        });
+    }
+
+    std::vector<NodeStatus> least_loaded;
+    least_loaded.push_back(eligible.front());
+    for (std::size_t index = 1; index < eligible.size(); ++index) {
+        const auto& candidate = eligible[index];
+        const auto& current = least_loaded.front();
+        int comparison = 0;
+        if (has_sized_node) {
+            // Compare active/capacity exactly instead of relying on floating
+            // point equality for the round-robin tie set.
+            const auto candidate_ratio = static_cast<std::uint64_t>(candidate.active_viewers) *
+                                         current.capacity_viewers;
+            const auto current_ratio = static_cast<std::uint64_t>(current.active_viewers) *
+                                       candidate.capacity_viewers;
+            comparison = candidate_ratio < current_ratio ? -1 :
+                         candidate_ratio > current_ratio ? 1 : 0;
+        } else {
+            comparison = candidate.active_viewers < current.active_viewers ? -1 :
+                         candidate.active_viewers > current.active_viewers ? 1 : 0;
         }
 
-        const bool candidate_in_region = !region_hint.empty() && candidate.region == region_hint;
-        const bool best_in_region = !region_hint.empty() && best->region == region_hint;
-        if (candidate_in_region != best_in_region) {
-            if (candidate_in_region) best = candidate;
-            continue;
+        if (comparison < 0) {
+            least_loaded.clear();
+            least_loaded.push_back(candidate);
+        } else if (comparison == 0) {
+            least_loaded.push_back(candidate);
         }
-        // An origin is the fallback, never the preference: sending viewers to
-        // the box that also ingests and packages is what the edge tier exists
-        // to prevent.
-        const bool candidate_is_edge = candidate.role == NodeRole::Edge;
-        const bool best_is_edge = best->role == NodeRole::Edge;
-        if (candidate_is_edge != best_is_edge) {
-            if (candidate_is_edge) best = candidate;
-            continue;
-        }
-        if (candidate.load < best->load) best = candidate;
     }
-    return best;
+
+    // Heartbeat-based load necessarily lags by a few seconds. Round-robin
+    // exact ties so a connection burst is spread immediately rather than
+    // pinned to one node until its next heartbeat.
+    std::ranges::sort(least_loaded, {}, &NodeStatus::id);
+    const auto selected = placement_cursor_++ % least_loaded.size();
+    return least_loaded[selected];
 }
 
 } // namespace rtmp_server::cluster
